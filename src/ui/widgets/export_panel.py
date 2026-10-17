@@ -500,8 +500,8 @@ class ExportPanelWidget(QWidget):
             config.nvenc_bitrate = f"{self.spin_nvenc_bitrate.value()}M"
             config.nvenc_cq = self.spin_nvenc_cq.value()
 
-        # Variant generation count: 3 for all variants, 1 for active only
-        config.generate_variants = 3 if self.combo_variant_target.currentIndex() == 1 else 1
+        # Variants are always generated during analysis (cheap) so they can be compared in the
+        # Edit step; the "variant target" combo only chooses what Export writes.
 
     def load_from_config(self, config: PipelineConfig) -> None:
         """Populate Export panel controls from PipelineConfig."""
@@ -537,10 +537,6 @@ class ExportPanelWidget(QWidget):
         if hasattr(config, "nvenc_cq") and config.nvenc_cq:
             self.spin_nvenc_cq.setValue(int(config.nvenc_cq))
 
-        if getattr(config, "generate_variants", 3) >= 3:
-            self.combo_variant_target.setCurrentIndex(1)
-        else:
-            self.combo_variant_target.setCurrentIndex(0)
 
     def get_capcut_draft_dir(self) -> Path | None:
         """Return user selected CapCut draft directory if specified and valid."""

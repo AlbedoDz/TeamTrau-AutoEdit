@@ -98,19 +98,45 @@ class StudioMainWindow(QMainWindow):
 
     @property
     def config(self) -> PipelineConfig:
-        """Assemble and return active PipelineConfig from UI components and preferences."""
+        """Assemble and return active PipelineConfig from UI components and preferences.
+
+        NOTE: this builds a fresh object on every access - mutate a local ``_build_config()``
+        result (never ``self.config``) when the change must persist.
+        """
+        return self._build_config()
+
+    def _build_config(self) -> PipelineConfig:
+        """Single source of truth for turning UI state into a PipelineConfig.
+
+        Precedence (later wins): canvas preset -> Preferences (global defaults) ->
+        Export panel -> workflow mode side effects -> Inspector (per-project edit controls).
+        Settings that exist in two panels are reconciled explicitly:
+        - workflow mode: the Inspector's combo is authoritative (it offers Rough Cut);
+        - cloud/AI features (VLM tagging) and audio fix need BOTH panels enabled.
+        """
         preset_name = (
             self.preset_combo.currentData()
             if hasattr(self, "preset_combo") and self.preset_combo.currentData()
             else DEFAULT_PRESET_NAME
         )
         cfg = PipelineConfig.from_preset(preset_name)
-        if hasattr(self, "inspector_panel"):
-            self.inspector_panel.apply_to_config(cfg)
-        if hasattr(self, "export_panel"):
-            self.export_panel.apply_to_config(cfg)
-        if hasattr(self, "preferences_dialog"):
-            self.preferences_dialog.apply_to_config(cfg)
+        prefs = getattr(self, "preferences_dialog", None)
+        export = getattr(self, "export_panel", None)
+        insp = getattr(self, "inspector_panel", None)
+
+        if prefs is not None:
+            prefs.apply_to_config(cfg)
+        prefs_vlm, prefs_audio_fix = cfg.enable_vlm_tagging, cfg.enable_audio_fix
+        if export is not None:
+            export.apply_to_config(cfg)
+        export_audio_fix = cfg.enable_audio_fix
+        if insp is not None:
+            mode = insp.combo_workflow.currentData() or "standard"
+            cfg.apply_workflow_mode(mode)  # restores the mode's own side effects
+            insp.apply_to_config(cfg)
+            if prefs is not None:
+                cfg.enable_vlm_tagging = cfg.enable_vlm_tagging and prefs_vlm
+        cfg.enable_audio_fix = prefs_audio_fix and export_audio_fix
         return cfg
 
     def _init_components(self) -> None:
@@ -662,17 +688,21 @@ class StudioMainWindow(QMainWindow):
 
     @Slot(object)
     def _on_preset_recommended(self, preset: Any) -> None:
-        """Apply recommended genre preset to application configuration."""
-        if hasattr(preset, "apply"):
-            preset.apply(self.config)
-            if hasattr(preset, "preferred_render_preset"):
-                idx = self.preset_combo.findData(preset.preferred_render_preset)
-                if idx >= 0:
-                    self.preset_combo.setCurrentIndex(idx)
-            self.inspector_panel.load_from_config(self.config)
-            self.preferences_dialog.load_from_config(self.config)
-            self.status_bar.showMessage(f"AI Preset Applied: {getattr(preset, 'display_name', '')}", 4000)
-            self._append_console(f"[AI PRESET] Applied: {getattr(preset, 'major_genre', '')} ➔ {getattr(preset, 'display_name', '')}")
+        """Apply recommended genre preset to the UI (and thus to every later job config)."""
+        if not hasattr(preset, "apply"):
+            return
+        # Presets mutate a config; keep that ONE object and push it back into the panels.
+        cfg = self._build_config()
+        preset.apply(cfg)
+        if hasattr(preset, "preferred_render_preset"):
+            idx = self.preset_combo.findData(preset.preferred_render_preset)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+        self.inspector_panel.load_from_config(cfg)
+        self.preferences_dialog.load_from_config(cfg)
+        self.export_panel.load_from_config(cfg)
+        self.status_bar.showMessage(f"AI Preset Applied: {getattr(preset, 'display_name', '')}", 4000)
+        self._append_console(f"[AI PRESET] Applied: {getattr(preset, 'major_genre', '')} ➔ {getattr(preset, 'display_name', '')}")
 
     @Slot(str, object)
     def _on_timeline_variant_switched(self, variant_name: str, variant: Any) -> None:
@@ -1075,7 +1105,7 @@ class StudioMainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.lbl_stage.setText("Status: Starting...")
 
-        cfg = PipelineConfig.from_preset(preset_name)
+        cfg = self._build_config()
         callbacks = self.bridge.to_job_callbacks()
 
         input_dirs = self.media_browser.get_input_dirs()
@@ -1095,11 +1125,6 @@ class StudioMainWindow(QMainWindow):
 
         self._append_console(f"Soundtrack Audio: {soundtrack}")
         self._append_console(f"Deliverable Path: {output_dir}")
-
-        # Apply settings from Inspector Panel & Export Panel & Preferences
-        self.inspector_panel.apply_to_config(cfg)
-        self.export_panel.apply_to_config(cfg)
-        self.preferences_dialog.apply_to_config(cfg)
 
         self.export_panel.set_output_dir(output_dir)
 
@@ -1161,7 +1186,7 @@ class StudioMainWindow(QMainWindow):
             return
 
         output_dir = self.media_browser.get_output_dir()
-        cfg = self.config
+        cfg = self._build_config()
         self.export_panel.set_output_dir(output_dir)
         self.export_panel.reset_render_monitor()
         self.progress_bar.setValue(0)
@@ -1325,10 +1350,7 @@ class StudioMainWindow(QMainWindow):
 
     def _do_save(self, path: Path) -> bool:
         """Serialize current workspace state into .tteproj JSON file."""
-        cfg = PipelineConfig.from_preset(self.preset_combo.currentData())
-        self.inspector_panel.apply_to_config(cfg)
-        self.export_panel.apply_to_config(cfg)
-        self.preferences_dialog.apply_to_config(cfg)
+        cfg = self._build_config()
 
         # 1. Timeline clips on canvas
         timeline_clips_data = []

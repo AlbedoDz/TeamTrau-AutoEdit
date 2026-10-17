@@ -267,14 +267,17 @@ def test_export_panel_variant_selection(qapp, tmp_path):
     panel.combo_variant_target.setCurrentIndex(1)
     assert panel.get_export_options()["variant_export_scope"] == "all"
 
+    # The export scope only decides what Export writes; analysis always builds all variants.
     cfg = PipelineConfig()
+    panel.combo_variant_target.setCurrentIndex(0)
     panel.apply_to_config(cfg)
     assert cfg.generate_variants == 3
 
-    # Test load_from_config
-    cfg2 = PipelineConfig(generate_variants=1)
-    panel.load_from_config(cfg2)
-    assert panel.combo_variant_target.currentIndex() == 0
+    # Loading a config must not flip the user's export scope.
+    panel.combo_variant_target.setCurrentIndex(1)
+    panel.load_from_config(PipelineConfig(generate_variants=1))
+    assert panel.combo_variant_target.currentIndex() == 1
+    panel.combo_variant_target.setCurrentIndex(0)
 
     # Test set_deliverables with variants
     var_a = TimelineVariant(
