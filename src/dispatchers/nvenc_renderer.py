@@ -816,7 +816,9 @@ class NvencRenderer:
 
         cmd += ["-map", "0:v"]
         if mixed is not None:
-            graph = f"{mixed};[amix]{limiter}[aout]"
+            # sidechaincompress/amix occasionally drop the last ~0.17 s under CPU load (seen in
+            # test_narration_workflow_ducking_graph_renders), so pin the mix to the exact length.
+            graph = f"{mixed};[amix]apad=whole_dur={dur},atrim=duration={dur},{limiter}[aout]"
             audio_codec = ["-c:a", "pcm_s24le"] if pro else ["-c:a", "aac", "-b:a", str(self.config.master_audio_bitrate)]
             cmd += ["-filter_complex", graph, "-map", "[aout]", *audio_codec]
             if s is not None:
