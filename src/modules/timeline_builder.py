@@ -375,6 +375,13 @@ class TimelineBuilder:
         exported_premiere = (
             write(premiere_xml_path, "fcp_xml", "Premiere Pro XML") if "premiere" in wanted else None
         )
+        if exported_premiere is not None:
+            try:
+                from src.modules.premiere_xml_fix import finalize_premiere_xml
+
+                finalize_premiere_xml(exported_premiere)  # real channel/size info for Link Media
+            except Exception as exc:
+                logger.warning("Premiere XML channel fix-up skipped (%s)", exc)
 
         # 3. DaVinci Resolve / Final Cut FCPXML 1.8 (own writer; OTIO has no FCPXML adapter here)
         exported_resolve = None
