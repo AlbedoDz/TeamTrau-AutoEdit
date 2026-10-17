@@ -244,12 +244,12 @@ def test_scene_grid_inspector_selection(qapp, sample_scenes):
     assert "KEY MOMENT" in widget.lbl_insp_vlm.text()
     assert "9:16 Crop Window" in widget.lbl_insp_crop.text()
     assert widget.btn_toggle_include.isEnabled()
-    assert widget.btn_toggle_include.text() == "Exclude Scene"
+    assert "Exclude Scene" in widget.btn_toggle_include.text()
 
     # Click toggle button from inspector
     widget.btn_toggle_include.click()
     assert not widget.is_scene_included(0)
-    assert widget.btn_toggle_include.text() == "Include Scene"
+    assert "Include Scene" in widget.btn_toggle_include.text()
 
 
 def test_scene_grid_add_scene_and_clear(qapp, sample_scenes):
@@ -329,4 +329,44 @@ def test_main_window_scene_grid_integration(qapp, sample_scenes, monkeypatch):
 
     window._set_dirty(False)
     window.close()
+
+
+def test_scene_grid_vlm_tagging_and_update(qapp, sample_scenes):
+    """Verify update_or_add_scene and VLM semantic tagging updates table and inspector."""
+    import copy
+
+    from src.core.types import SceneVLMAnalysis
+
+    widget = SceneGridWidget()
+    # scene2 initially has vlm_analysis = None
+    untagged_scene = sample_scenes[1]
+    widget.add_scene(untagged_scene)
+    assert widget.table.rowCount() == 1
+    assert "Unannotated" in widget.table.item(0, 8).text()
+
+    # Verify inspector displays not tagged
+    widget.table.selectRow(0)
+    assert "Not tagged by VLM" in widget.lbl_insp_vlm.text()
+
+    # Simulate VLM tagging and update
+    vlm = SceneVLMAnalysis(
+        scene_index=0,
+        description="Fast action car chase sequence",
+        tags=["action", "car", "speed"],
+        mood="energetic",
+        suggested_pacing="fast",
+        is_key_moment=True,
+    )
+    tagged_scene = copy.deepcopy(untagged_scene)
+    tagged_scene.vlm_analysis = vlm
+
+    widget.update_or_add_scene(tagged_scene)
+    assert widget.table.rowCount() == 1  # Updated in place, no duplication
+    assert "energetic" in widget.table.item(0, 8).text()
+    assert "[KEY]" in widget.table.item(0, 8).text()
+
+    widget.table.selectRow(0)
+    assert "Fast action car chase" in widget.lbl_insp_vlm.text()
+    assert "energetic" in widget.lbl_insp_vlm.text()
+
 

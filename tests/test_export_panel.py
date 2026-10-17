@@ -253,3 +253,61 @@ def test_main_window_export_panel_integration(qapp, tmp_path, monkeypatch):
     assert call_kwargs["no_render"] is False
 
     window.close()
+
+
+def test_export_panel_variant_selection(qapp, tmp_path):
+    """Verify variant target selector maps to config and renders variant labels."""
+    from src.core.types import TimelineVariant
+
+    panel = ExportPanelWidget()
+    assert panel.combo_variant_target.currentIndex() == 0
+    assert panel.get_export_options()["variant_export_scope"] == "active"
+
+    panel.combo_variant_target.setCurrentIndex(1)
+    assert panel.get_export_options()["variant_export_scope"] == "all"
+
+    cfg = PipelineConfig()
+    panel.apply_to_config(cfg)
+    assert cfg.generate_variants == 3
+
+    # Test load_from_config
+    cfg2 = PipelineConfig(generate_variants=1)
+    panel.load_from_config(cfg2)
+    assert panel.combo_variant_target.currentIndex() == 0
+
+    # Test set_deliverables with variants
+    var_a = TimelineVariant(
+        name="beat_driven",
+        display_name="Variant 1: Beat-Driven",
+        total_duration=10.0,
+        clip_count=4,
+    )
+    var_b = TimelineVariant(
+        name="cinematic",
+        display_name="Variant 2: Cinematic",
+        total_duration=15.0,
+        clip_count=3,
+    )
+    result = PipelineExecutionResult(
+        success=True,
+        total_duration=10.0,
+        clip_count=4,
+        scenes_detected=4,
+        audio_bpm=128.0,
+        sections_detected=2,
+        fcpxml_path=None,
+        premiere_xml_path=None,
+        otio_path=None,
+        capcut_draft_path=None,
+        render_path=None,
+        encoder_used=None,
+        resolve_status=None,
+        timeline_variants={"beat_driven": var_a, "cinematic": var_b},
+        active_variant_name="beat_driven",
+    )
+    panel.show()
+    panel.set_deliverables(result)
+    assert not panel.lbl_deliv_variants.isHidden()
+    assert "Beat-Driven" in panel.lbl_deliv_variants.text()
+    assert "Cinematic" in panel.lbl_deliv_variants.text()
+

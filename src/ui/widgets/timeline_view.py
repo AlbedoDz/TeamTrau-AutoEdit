@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.types import ScoredScene, SongSection, SongSectionType
+from src.core.types import ScoredScene, SongSection, SongSectionType, TimelineVariant
 from src.modules.audio_analyzer import AudioAnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -446,9 +446,13 @@ class TimelineViewWidget(QWidget):
     playhead_changed = Signal(float)
     clip_selected = Signal(object)
     section_selected = Signal(object)
+    variant_switched = Signal(str, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._variants: dict[str, TimelineVariant] = {}
+        self._active_variant_key: str | None = None
+        self._variant_buttons: dict[str, QPushButton] = {}
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -479,9 +483,10 @@ class TimelineViewWidget(QWidget):
 
         # Zoom Controls
         ctrl_layout.addWidget(QLabel("Zoom:"))
-        self.btn_zoom_out = QPushButton("-", self)
-        self.btn_zoom_out.setFixedSize(28, 28)
+        self.btn_zoom_out = QPushButton("🔍-", self)
+        self.btn_zoom_out.setFixedSize(32, 28)
         self.btn_zoom_out.setObjectName("secondaryButton")
+        self.btn_zoom_out.setToolTip("Zoom Out Timeline (Ctrl+-)")
         self.btn_zoom_out.clicked.connect(self._on_zoom_out)
         ctrl_layout.addWidget(self.btn_zoom_out)
 
@@ -489,21 +494,44 @@ class TimelineViewWidget(QWidget):
         self.slider_zoom.setRange(5, 120)
         self.slider_zoom.setValue(30)
         self.slider_zoom.setFixedWidth(120)
+        self.slider_zoom.setToolTip("Timeline Zoom Slider (Pixels per Second)")
         self.slider_zoom.valueChanged.connect(self._on_zoom_slider_changed)
         ctrl_layout.addWidget(self.slider_zoom)
 
-        self.btn_zoom_in = QPushButton("+", self)
-        self.btn_zoom_in.setFixedSize(28, 28)
+        self.btn_zoom_in = QPushButton("🔍+", self)
+        self.btn_zoom_in.setFixedSize(32, 28)
         self.btn_zoom_in.setObjectName("secondaryButton")
+        self.btn_zoom_in.setToolTip("Zoom In Timeline (Ctrl++)")
         self.btn_zoom_in.clicked.connect(self._on_zoom_in)
         ctrl_layout.addWidget(self.btn_zoom_in)
 
-        self.btn_fit = QPushButton("Fit", self)
+        self.btn_fit = QPushButton("↔ Fit", self)
         self.btn_fit.setObjectName("secondaryButton")
+        self.btn_fit.setToolTip("Fit Entire Timeline in View (Shift+Z)")
         self.btn_fit.clicked.connect(self.fit_to_window)
         ctrl_layout.addWidget(self.btn_fit)
 
         layout.addWidget(ctrl_group)
+
+        # 1.5. Variant Switcher Bar (Phase 4)
+        self.variant_bar = QFrame(self)
+        self.variant_bar.setStyleSheet(
+            "background-color: #18181b; border: 1px solid #27272a; border-radius: 4px;"
+        )
+        self.variant_bar_layout = QHBoxLayout(self.variant_bar)
+        self.variant_bar_layout.setContentsMargins(8, 4, 8, 4)
+        self.variant_bar_layout.setSpacing(8)
+
+        lbl_var_header = QLabel("🎬 Sequence Variations:", self)
+        lbl_var_header.setStyleSheet("color: #e4e4e7; font-weight: bold; font-size: 11px;")
+        self.variant_bar_layout.addWidget(lbl_var_header)
+
+        self.variant_buttons_layout = QHBoxLayout()
+        self.variant_buttons_layout.setSpacing(6)
+        self.variant_bar_layout.addLayout(self.variant_buttons_layout)
+        self.variant_bar_layout.addStretch()
+        self.variant_bar.setVisible(False)
+        layout.addWidget(self.variant_bar)
 
         # 2. Scrollable Canvas Area
         self.scroll_area = QScrollArea(self)
@@ -530,6 +558,78 @@ class TimelineViewWidget(QWidget):
         self.lbl_selected_info.setStyleSheet("color: #a1a1aa;")
         info_layout.addWidget(self.lbl_selected_info)
         layout.addWidget(self.info_panel)
+
+    def set_variants(
+        self,
+        variants: dict[str, TimelineVariant],
+        active_key: str | None = None,
+    ) -> None:
+        """Populate variant switcher tabs and activate default variant."""
+        self._variants = variants
+        self._variant_buttons.clear()
+
+        # Clear existing buttons in variant_buttons_layout
+        while self.variant_buttons_layout.count() > 0:
+            item = self.variant_buttons_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not variants:
+            self.variant_bar.setVisible(False)
+            return
+
+        for k, v in variants.items():
+            btn = QPushButton(f"{v.display_name} ({v.total_duration:.1f}s)", self)
+            btn.setObjectName("secondaryButton")
+            btn.setToolTip(v.description)
+            btn.clicked.connect(lambda _, key=k: self.switch_variant(key))
+            self.variant_buttons_layout.addWidget(btn)
+            self._variant_buttons[k] = btn
+
+        self.variant_bar.setVisible(len(variants) >= 1)
+
+        target = active_key if active_key in variants else list(variants.keys())[0]
+        self.switch_variant(target, emit_signal=False)
+
+    def switch_variant(self, variant_key: str, emit_signal: bool = True) -> None:
+        """Switch active narrative variant, updating buttons, canvas, and emitting signal."""
+        if variant_key not in self._variants:
+            return
+
+        self._active_variant_key = variant_key
+        var = self._variants[variant_key]
+
+        # Update button visual states
+        for k, btn in self._variant_buttons.items():
+            if k == variant_key:
+                btn.setObjectName("primaryButton")
+                btn.setStyleSheet(
+                    "background-color: #0284c7; color: #ffffff; font-weight: bold; padding: 4px 10px; border-radius: 4px;"
+                )
+            else:
+                btn.setObjectName("secondaryButton")
+                btn.setStyleSheet(
+                    "background-color: #27272a; color: #a1a1aa; font-weight: normal; padding: 4px 10px; border-radius: 4px;"
+                )
+
+        # Reload timeline canvas with variant scenes
+        if var.sequence_scenes:
+            self.load_timeline_data(
+                var.sequence_scenes,
+                audio_result=self.canvas.audio_analysis,
+                include_teaser=(var.name != "cinematic"),
+            )
+
+        if emit_signal:
+            self.variant_switched.emit(variant_key, var)
+
+    def get_variants(self) -> dict[str, TimelineVariant]:
+        """Return currently loaded timeline variants dictionary."""
+        return dict(self._variants)
+
+    def get_active_variant_key(self) -> str | None:
+        """Return key of active narrative variant."""
+        return self._active_variant_key
 
     # -------------------------------------------------------------------------
     # Public Data Loading API

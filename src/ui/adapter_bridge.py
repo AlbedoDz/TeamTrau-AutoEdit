@@ -12,6 +12,7 @@ class BackendSignalBridge(QObject):
     stage_changed = Signal(str, int, int)
     progress_updated = Signal(float, float, str)
     scene_discovered = Signal(object)
+    scenes_tagged = Signal(list)
     log_received = Signal(str, str)
     job_finished = Signal(object)
 
@@ -27,6 +28,9 @@ class BackendSignalBridge(QObject):
         def _on_scene(scene: ScoredScene) -> None:
             self.scene_discovered.emit(scene)
 
+        def _on_tagged(scenes: list[ScoredScene]) -> None:
+            self.scenes_tagged.emit(scenes)
+
         def _on_log(level: str, message: str) -> None:
             self.log_received.emit(level, message)
 
@@ -34,6 +38,7 @@ class BackendSignalBridge(QObject):
             on_stage_changed=_on_stage,
             on_progress=_on_prog,
             on_scene_discovered=_on_scene,
+            on_scenes_tagged=_on_tagged,
             on_log=_on_log,
         )
 

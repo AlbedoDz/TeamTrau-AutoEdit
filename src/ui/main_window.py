@@ -8,7 +8,7 @@ import logging
 import threading
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from src.ui.widgets.agent_console_dialog import AgentConsoleDialog
@@ -72,6 +72,8 @@ class StudioMainWindow(QMainWindow):
         self._clipboard_clip: TimelineClipItem | None = None
         self._current_job: JobHandle | None = None
         self._agent_console_dialog: AgentConsoleDialog | None = None
+        self._in_point: float | None = None
+        self._out_point: float | None = None
 
         self._init_window()
         self._init_components()
@@ -384,7 +386,7 @@ class StudioMainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # AI Engine status badge
-        self.btn_ai_badge = QPushButton(self)
+        self.btn_ai_badge = QPushButton("🟢 AI Engine: Ready", self)
         self.btn_ai_badge.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_ai_badge.setToolTip("Click to configure AI Provider & Model")
         self.btn_ai_badge.clicked.connect(self._on_open_preferences_dialog)
@@ -419,15 +421,17 @@ class StudioMainWindow(QMainWindow):
         toolbar.addWidget(spacer)
 
         # Stop Button
-        self.btn_stop = QPushButton("Stop", self)
+        self.btn_stop = QPushButton("⏹ Stop", self)
         self.btn_stop.setObjectName("dangerButton")
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip("Cancel active pipeline execution")
         self.btn_stop.clicked.connect(self._on_stop_pipeline)
         toolbar.addWidget(self.btn_stop)
 
         # Primary Run / Export Button
-        self.btn_run = QPushButton("⚡ Export / Render", self)
+        self.btn_run = QPushButton("🚀 Export / Render", self)
         self.btn_run.setObjectName("primaryButton")
+        self.btn_run.setToolTip("Open Export & Render Dialog (Ctrl+E)")
         self.btn_run.clicked.connect(self._on_open_export_dialog)
         toolbar.addWidget(self.btn_run)
 
@@ -597,13 +601,24 @@ class StudioMainWindow(QMainWindow):
         self.bridge.stage_changed.connect(self._on_stage_changed)
         self.bridge.progress_updated.connect(self._on_progress_updated)
         self.bridge.scene_discovered.connect(self._on_scene_discovered)
+        self.bridge.scenes_tagged.connect(self._on_scenes_tagged)
         self.bridge.log_received.connect(self._on_log_received)
         self.bridge.job_finished.connect(self._on_job_finished)
 
         # Bidirectional Player <-> Timeline playhead sync
         self.player_widget.time_changed.connect(self._on_player_time_changed)
         self.player_widget.jump_cut_requested.connect(self._on_shortcut_jump_cut)
+        self.player_widget.theater_mode_toggled.connect(self._on_toggle_theater_mode)
+        self.player_widget.snapshot_saved.connect(self._on_snapshot_saved)
         self.timeline_view.canvas.playhead_moved.connect(self._on_timeline_playhead_changed)
+
+        # Media Library & Scene Review -> Player Viewport preview sync
+        self.media_browser.video_selected.connect(self._on_source_video_selected)
+        self.media_browser.preset_recommended.connect(self._on_preset_recommended)
+        self.scene_grid.scene_selected.connect(self._on_scene_selected_for_preview)
+
+        # Timeline variant switcher -> Monitor live sequence playback
+        self.timeline_view.variant_switched.connect(self._on_timeline_variant_switched)
 
         # Inspector actions
         self.inspector_panel.analyze_optimize_clicked.connect(self._on_start_pipeline)
@@ -619,7 +634,33 @@ class StudioMainWindow(QMainWindow):
     @Slot(float)
     def _on_timeline_playhead_changed(self, time_sec: float) -> None:
         """Update monitor viewport timecode when timeline is scrubbed."""
+        self.player_widget.switch_to_timeline_mode()
         self.player_widget.set_time(time_sec)
+
+    @Slot(object)
+    def _on_preset_recommended(self, preset: Any) -> None:
+        """Apply recommended genre preset to application configuration."""
+        if hasattr(preset, "apply"):
+            preset.apply(self.config)
+            if hasattr(preset, "preferred_render_preset"):
+                idx = self.preset_combo.findData(preset.preferred_render_preset)
+                if idx >= 0:
+                    self.preset_combo.setCurrentIndex(idx)
+            self.inspector_panel.load_from_config(self.config)
+            self.preferences_dialog.load_from_config(self.config)
+            self.status_bar.showMessage(f"AI Preset Applied: {getattr(preset, 'display_name', '')}", 4000)
+            self._append_console(f"[AI PRESET] Applied: {getattr(preset, 'major_genre', '')} ➔ {getattr(preset, 'display_name', '')}")
+
+    @Slot(str, object)
+    def _on_timeline_variant_switched(self, variant_name: str, variant: Any) -> None:
+        """Update Program Monitor live sequence preview when a different variant is clicked."""
+        scenes = getattr(variant, "sequence_scenes", [])
+        dur = getattr(variant, "total_duration", 0.0)
+        if scenes:
+            self.player_widget.load_timeline_sequence(scenes, total_duration=dur)
+            disp_name = getattr(variant, "display_name", variant_name)
+            self.status_bar.showMessage(f"Active Sequence: {disp_name}", 3000)
+            self._append_console(f"[VARIANT] Switched to: {disp_name}")
 
     @Slot(int)
     def _on_preset_changed(self, index: int) -> None:
@@ -705,6 +746,45 @@ class StudioMainWindow(QMainWindow):
         model = config.vlm_model or "qwen2.5:7b"
         self._append_console(f"[SETTINGS] Applied AI provider: {prov}, model: {model}")
 
+    @Slot(object)
+    def _on_source_video_selected(self, video_path: Path) -> None:
+        """Load selected source footage into Program Monitor for instant live preview."""
+        if video_path and Path(video_path).is_file():
+            ok = self.player_widget.load_source_video(video_path)
+            if ok:
+                self.status_bar.showMessage(f"Previewing source: {video_path.name}", 3000)
+
+    @Slot(object)
+    def _on_scene_selected_for_preview(self, scene: ScoredScene | None) -> None:
+        """Load selected scene cut into Program Monitor for inspection."""
+        if scene is not None and getattr(scene, "scene", None) and scene.scene.clip_path.is_file():
+            ok = self.player_widget.load_source_video(
+                scene.scene.clip_path,
+                start_time=scene.scene.start_time,
+                end_time=scene.scene.end_time,
+            )
+            if ok:
+                self.status_bar.showMessage(
+                    f"Previewing scene: {scene.scene.clip_path.name} ({scene.scene.start_time:.1f}s - {scene.scene.end_time:.1f}s)",
+                    3000,
+                )
+
+    @Slot(bool)
+    def _on_toggle_theater_mode(self, enabled: bool) -> None:
+        """Toggle full viewport cinema presentation mode."""
+        self.tab_widget.setVisible(not enabled)
+        self.inspector_panel.setVisible(not enabled)
+        self.status_bar.showMessage(
+            "Theater Cinema Viewport Active (F11 to toggle)" if enabled else "Standard Studio Layout Restored",
+            3000,
+        )
+
+    @Slot(str)
+    def _on_snapshot_saved(self, path: str) -> None:
+        """Log keyframe snapshot export confirmation."""
+        self.status_bar.showMessage(f"Snapshot exported to: {path}", 4000)
+        self._append_console(f"[SNAPSHOT] Keyframe exported: {path}")
+
     # --- Shortcut Handlers ---
 
     @Slot(int)
@@ -743,17 +823,21 @@ class StudioMainWindow(QMainWindow):
     @Slot()
     def _on_shortcut_mark_in(self) -> None:
         tc = self.player_widget.current_time
+        self._in_point = tc
         self.status_bar.showMessage(f"Marked IN point at {tc:.2f}s", 3000)
         self._append_console(f"[IN POINT] Set at {tc:.2f}s")
 
     @Slot()
     def _on_shortcut_mark_out(self) -> None:
         tc = self.player_widget.current_time
+        self._out_point = tc
         self.status_bar.showMessage(f"Marked OUT point at {tc:.2f}s", 3000)
         self._append_console(f"[OUT POINT] Set at {tc:.2f}s")
 
     @Slot()
     def _on_shortcut_clear_in_out(self) -> None:
+        self._in_point = None
+        self._out_point = None
         self.status_bar.showMessage("Cleared IN / OUT range", 3000)
         self._append_console("[IN/OUT] Range cleared")
 
@@ -802,6 +886,12 @@ class StudioMainWindow(QMainWindow):
             f"Score: {scene.composite_score:.2f}{vlm_str}"
         )
 
+    @Slot(list)
+    def _on_scenes_tagged(self, scenes: list[ScoredScene]) -> None:
+        """Update scene grid with VLM tagged annotations received from Stage 5."""
+        self.scene_grid.set_scenes(scenes)
+        self._append_console(f"  [VLM] Updated {len(scenes)} scenes with semantic AI analysis.")
+
     @Slot(str, str)
     def _on_log_received(self, level: str, message: str) -> None:
         self._append_console(f"[{level.upper()}] {message}")
@@ -831,8 +921,22 @@ class StudioMainWindow(QMainWindow):
 
             self.player_widget.set_duration(result.total_duration)
 
-            scenes = self.scene_grid.get_included_scenes() or self.scene_grid.get_all_scenes()
+            # Multi-Variant Timeline synchronization
+            if getattr(result, "timeline_variants", None):
+                active_key = result.active_variant_name or "beat_driven"
+                self.timeline_view.set_variants(result.timeline_variants, active_key=active_key)
+                active_variant = result.timeline_variants.get(active_key)
+                if active_variant and active_variant.sequence_scenes:
+                    self.player_widget.load_timeline_sequence(
+                        active_variant.sequence_scenes, total_duration=active_variant.total_duration
+                    )
+            else:
+                scenes = self.scene_grid.get_included_scenes() or self.scene_grid.get_all_scenes()
+                if scenes:
+                    self.player_widget.load_timeline_sequence(scenes, total_duration=result.total_duration)
+
             soundtrack = self.media_browser.get_soundtrack_path()
+            scenes = self.scene_grid.get_included_scenes() or self.scene_grid.get_all_scenes()
             if scenes and soundtrack and soundtrack.exists():
                 try:
                     audio_res = self.adapter.quick_analyze_audio(soundtrack)
@@ -891,11 +995,21 @@ class StudioMainWindow(QMainWindow):
         cfg = PipelineConfig.from_preset(preset_name)
         callbacks = self.bridge.to_job_callbacks()
 
-        input_dir = self.media_browser.get_input_dir() or self.media_browser.get_video_files()[0].parent
+        input_dirs = self.media_browser.get_input_dirs()
+        input_target: Path | list[Path]
+        if input_dirs and len(input_dirs) > 1:
+            input_target = input_dirs
+            self._append_console(f"Source Directories ({len(input_dirs)} folders): {', '.join(d.name for d in input_dirs)}")
+        elif input_dirs and len(input_dirs) == 1:
+            input_target = input_dirs[0]
+            self._append_console(f"Source Directory: {input_target}")
+        else:
+            input_target = self.media_browser.get_input_dir() or self.media_browser.get_video_files()[0].parent
+            self._append_console(f"Source Directory: {input_target}")
+
         soundtrack = self.media_browser.get_soundtrack_path()
         output_dir = self.media_browser.get_output_dir()
 
-        self._append_console(f"Source Directory: {input_dir}")
         self._append_console(f"Soundtrack Audio: {soundtrack}")
         self._append_console(f"Deliverable Path: {output_dir}")
 
@@ -913,7 +1027,7 @@ class StudioMainWindow(QMainWindow):
         dry_run_resolve = self.export_panel.is_dry_run_resolve()
 
         self._current_job = self.adapter.submit_job(
-            input_dir=input_dir,
+            input_dir=input_target,
             soundtrack=soundtrack,
             output_dir=output_dir,
             config=cfg,
@@ -1026,6 +1140,9 @@ class StudioMainWindow(QMainWindow):
         self.media_browser.clear_all()
         self.scene_grid.clear_scenes()
         self.timeline_view.clear_timeline()
+        self.player_widget.canvas.set_frame_pixmap(None)
+        self.player_widget._mode = "idle"
+        self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")
         self.export_panel.reset_render_monitor()
         self.console.clear()
         self.undo_stack.clear()
@@ -1062,6 +1179,7 @@ class StudioMainWindow(QMainWindow):
         self.export_panel.apply_to_config(cfg)
         self.preferences_dialog.apply_to_config(cfg)
 
+        # 1. Timeline clips on canvas
         timeline_clips_data = []
         for c in self.timeline_view.canvas.clips:
             timeline_clips_data.append({
@@ -1079,21 +1197,75 @@ class StudioMainWindow(QMainWindow):
                 "is_teaser": c.is_teaser,
             })
 
+        # 2. Scored scenes & curation inclusion state
+        scored_scenes_data = []
+        included_indices = []
+        for idx, s in enumerate(self.scene_grid.get_all_scenes()):
+            is_inc = self.scene_grid.is_scene_included(idx)
+            if is_inc:
+                included_indices.append(idx)
+            scored_scenes_data.append(self.project_manager.serialize_scored_scene(s, is_included=is_inc))
+
+        # 3. Audio analysis & song structure
+        audio_analysis_data = {}
+        if getattr(self.timeline_view.canvas, "audio_analysis", None):
+            audio_analysis_data = self.project_manager.serialize_audio_analysis(
+                self.timeline_view.canvas.audio_analysis
+            )
+
+        # 4. Multi-variant timeline synthesis
+        variants_data = {}
+        loaded_variants = self.timeline_view.get_variants()
+        for v_key, var in loaded_variants.items():
+            variants_data[v_key] = self.project_manager.serialize_timeline_variant(var)
+        active_var = self.timeline_view.get_active_variant_key()
+
+        # 5. Media ingestion & camera roles
+        input_dirs = [str(d) for d in self.media_browser.get_input_dirs()]
+        clip_roles = {str(p): role for p, role in self.media_browser.get_clip_roles().items()}
+
+        # 6. Deliverables
+        deliverables_data = {}
+        last_res = getattr(self.export_panel, "_last_result", None)
+        if last_res and last_res.success:
+            deliverables_data = {
+                "fcpxml_path": str(last_res.fcpxml_path) if last_res.fcpxml_path else None,
+                "premiere_xml_path": str(last_res.premiere_xml_path) if last_res.premiere_xml_path else None,
+                "otio_path": str(last_res.otio_path) if last_res.otio_path else None,
+                "capcut_draft_path": str(last_res.capcut_draft_path) if last_res.capcut_draft_path else None,
+                "render_path": str(last_res.render_path) if last_res.render_path else None,
+                "encoder_used": last_res.encoder_used,
+                "total_duration": last_res.total_duration,
+                "clip_count": last_res.clip_count,
+                "scenes_detected": last_res.scenes_detected,
+            }
+
         project_data = ProjectData(
             project_name=self.edit_project_name.text().strip(),
             input_dir=str(self.media_browser.get_input_dir()) if self.media_browser.get_input_dir() else None,
+            input_dirs=input_dirs,
+            clip_roles=clip_roles,
             soundtrack_path=str(self.media_browser.get_soundtrack_path()) if self.media_browser.get_soundtrack_path() else None,
             output_dir=str(self.media_browser.get_output_dir()) if self.media_browser.get_output_dir() else None,
             preset_name=self.preset_combo.currentData(),
             config=self.project_manager.serialize_pipeline_config(cfg),
+            in_point=getattr(self, "_in_point", None),
+            out_point=getattr(self, "_out_point", None),
+            playhead_time=getattr(self.player_widget, "current_time", 0.0),
             timeline_clips=timeline_clips_data,
+            scored_scenes=scored_scenes_data,
+            included_scene_indices=included_indices,
+            audio_analysis=audio_analysis_data,
+            timeline_variants=variants_data,
+            active_variant_name=active_var,
+            deliverables=deliverables_data,
         )
 
         ok = self.project_manager.save_project(path, project_data)
         if ok:
             self._set_dirty(False)
             self._update_recent_menu()
-            self._append_console(f"Project saved: {path}")
+            self._append_console(f"Project saved: {path} (Scenes: {len(scored_scenes_data)}, Variants: {len(variants_data)})")
             self.status_bar.showMessage(f"Project saved to {path.name}", 4000)
         return ok
 
@@ -1139,8 +1311,16 @@ class StudioMainWindow(QMainWindow):
             if idx >= 0:
                 self.preset_combo.setCurrentIndex(idx)
 
-        if data.input_dir and Path(data.input_dir).exists():
+        # 1. Restore Media Ingestion & Camera Roles
+        if data.input_dirs:
+            valid_dirs = [Path(d) for d in data.input_dirs if Path(d).is_dir()]
+            if valid_dirs:
+                self.media_browser.set_input_dirs(valid_dirs)
+        elif data.input_dir and Path(data.input_dir).exists():
             self.media_browser.set_input_dir(data.input_dir)
+
+        if data.clip_roles:
+            self.media_browser.set_clip_roles(data.clip_roles)
 
         if data.soundtrack_path and Path(data.soundtrack_path).exists():
             self.media_browser.set_soundtrack_path(data.soundtrack_path)
@@ -1149,6 +1329,7 @@ class StudioMainWindow(QMainWindow):
             self.media_browser.set_output_dir(data.output_dir)
             self.export_panel.set_output_dir(Path(data.output_dir))
 
+        # 2. Restore Pipeline & UI Configuration
         if data.config:
             cfg = self.project_manager.deserialize_pipeline_config(data.config)
             self.inspector_panel.load_from_config(cfg)
@@ -1157,7 +1338,43 @@ class StudioMainWindow(QMainWindow):
             self.preferences_dialog.apply_to_config(self.preferences_dialog.config)
             self._update_ai_badge()
 
-        if data.timeline_clips:
+        # 3. Restore Scored Scenes & Review Grid
+        restored_scenes = []
+        if data.scored_scenes:
+            for sd in data.scored_scenes:
+                scene, _ = self.project_manager.deserialize_scored_scene(sd)
+                restored_scenes.append(scene)
+            self.scene_grid.set_scenes(restored_scenes)
+            for idx, sd in enumerate(data.scored_scenes):
+                if not sd.get("included", True):
+                    self.scene_grid.set_scene_included(idx, False)
+
+        # 4. Restore Audio Analysis & Song Structure
+        restored_audio = None
+        if data.audio_analysis:
+            restored_audio = self.project_manager.deserialize_audio_analysis(data.audio_analysis)
+
+        # 5. Restore Timeline Variants
+        restored_variants = {}
+        if data.timeline_variants:
+            for vk, vd in data.timeline_variants.items():
+                restored_variants[vk] = self.project_manager.deserialize_timeline_variant(vd)
+            self.timeline_view.set_variants(
+                restored_variants, active_key=data.active_variant_name or "beat_driven"
+            )
+
+        # 6. Restore Timeline Tracks & Clips
+        if restored_scenes and (restored_audio or self.media_browser.get_soundtrack_path()):
+            soundtrack = self.media_browser.get_soundtrack_path()
+            audio_for_tl = restored_audio
+            if audio_for_tl is None and soundtrack and soundtrack.exists():
+                try:
+                    audio_for_tl = self.adapter.quick_analyze_audio(soundtrack)
+                except Exception as exc:
+                    logger.debug("Quick analyze audio failed on load: %s", exc)
+            if audio_for_tl:
+                self.timeline_view.load_timeline_data(restored_scenes, audio_for_tl)
+        elif data.timeline_clips:
             restored_clips = []
             for cd in data.timeline_clips:
                 clip = TimelineClipItem(
@@ -1182,11 +1399,57 @@ class StudioMainWindow(QMainWindow):
             self.timeline_view.canvas.update()
             self.timeline_view._update_timecode_label()
 
+        # 7. Restore Sequence Playback in Program Monitor Viewport
+        active_var_obj = restored_variants.get(data.active_variant_name or "beat_driven")
+        if active_var_obj and active_var_obj.sequence_scenes:
+            self.player_widget.load_timeline_sequence(
+                active_var_obj.sequence_scenes, total_duration=active_var_obj.total_duration
+            )
+        elif restored_scenes:
+            inc_scenes = self.scene_grid.get_included_scenes() or restored_scenes
+            tot_dur = max(
+                (c.end_time for c in self.timeline_view.canvas.clips),
+                default=sum(s.scene.duration for s in inc_scenes)
+            )
+            self.player_widget.load_timeline_sequence(inc_scenes, total_duration=tot_dur)
+
+        # 8. Restore Playhead and In/Out Points
+        if data.playhead_time > 0.0:
+            self.player_widget.seek_time(data.playhead_time)
+            self.timeline_view.set_playhead_time(data.playhead_time)
+
+        self._in_point = data.in_point
+        self._out_point = data.out_point
+
+        # 9. Restore Deliverables
+        if data.deliverables:
+            bpm_val = float(data.audio_analysis.get("tempo_bpm", 120.0)) if data.audio_analysis else 120.0
+            sec_cnt = len(data.audio_analysis.get("sections", [])) if data.audio_analysis else 0
+            deliv_res = PipelineExecutionResult(
+                success=True,
+                total_duration=float(data.deliverables.get("total_duration", 0.0)),
+                clip_count=int(data.deliverables.get("clip_count", 0)),
+                scenes_detected=int(data.deliverables.get("scenes_detected", len(restored_scenes))),
+                audio_bpm=bpm_val,
+                sections_detected=sec_cnt,
+                fcpxml_path=Path(data.deliverables["fcpxml_path"]) if data.deliverables.get("fcpxml_path") else None,
+                premiere_xml_path=Path(data.deliverables["premiere_xml_path"]) if data.deliverables.get("premiere_xml_path") else None,
+                otio_path=Path(data.deliverables["otio_path"]) if data.deliverables.get("otio_path") else None,
+                capcut_draft_path=Path(data.deliverables["capcut_draft_path"]) if data.deliverables.get("capcut_draft_path") else None,
+                render_path=Path(data.deliverables["render_path"]) if data.deliverables.get("render_path") else None,
+                encoder_used=data.deliverables.get("encoder_used"),
+                resolve_status=None,
+                scored_scenes=restored_scenes,
+                timeline_variants=restored_variants,
+                active_variant_name=data.active_variant_name,
+            )
+            self.export_panel.set_deliverables(deliv_res)
+
         self.undo_stack.clear()
         self._set_dirty(False)
         self._update_recent_menu()
-        self._update_workflow_stepper(3 if data.timeline_clips else (2 if data.input_dir else 1))
-        self._append_console(f"Opened project: {path}")
+        self._update_workflow_stepper(3 if (data.timeline_clips or restored_scenes) else (2 if data.input_dir else 1))
+        self._append_console(f"Opened project: {path} (Scenes: {len(restored_scenes)}, Variants: {len(restored_variants)})")
         self.status_bar.showMessage(f"Loaded project {data.project_name}", 4000)
         return True
 
@@ -1283,6 +1546,9 @@ class StudioMainWindow(QMainWindow):
         cleared = IngestDetector(cfg).clear_cache()
         self.scene_grid.clear_scenes()
         self.timeline_view.clear_timeline()
+        self.player_widget.canvas.set_frame_pixmap(None)
+        self.player_widget._mode = "idle"
+        self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")
         self.export_panel.reset_render_monitor()
         self._set_dirty(True)
         self._append_console(f"Cleared {cleared} cache files.")

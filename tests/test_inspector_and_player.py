@@ -239,3 +239,93 @@ def test_pipeline_concurrency_guard(qapp, monkeypatch):
     assert window.btn_stop.isEnabled() is False
 
     window.close()
+
+
+def test_player_widget_live_video_preview(qapp, tmp_path):
+    """Verify PlayerWidget loads and renders real video frames from source media."""
+    import cv2
+    import numpy as np
+
+    v_path = tmp_path / "test_preview_source.mp4"
+    w, h, fps = 640, 360, 30.0
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(v_path), fourcc, fps, (w, h))
+    for f in range(30):
+        frame = np.full((h, w, 3), (f * 8, 100, 200), dtype=np.uint8)
+        out.write(frame)
+    out.release()
+
+    player = PlayerWidget()
+    ok = player.load_source_video(v_path)
+    assert ok is True
+    assert player._mode == "source"
+    assert player.canvas.current_pixmap is not None
+    assert not player.canvas.current_pixmap.isNull()
+
+    # Seek and verify frame update
+    player.seek_time(0.5)
+    assert abs(player.current_time - 0.5) < 1e-4
+    assert player.canvas.current_pixmap is not None
+
+    # Zoom mode changes
+    player.canvas.set_zoom("50%")
+    assert player.canvas.zoom_mode == "50%"
+    player.canvas.set_zoom("fit")
+    assert player.canvas.zoom_mode == "fit"
+
+    # Theater mode toggle
+    events = []
+    player.theater_mode_toggled.connect(lambda state: events.append(state))
+    player._on_toggle_theater_mode()
+    assert len(events) == 1
+    assert events[0] is True
+    assert "Normal" in player.btn_fullscreen.text()
+
+    player.close()
+
+
+def test_player_widget_timeline_sequence_preview(qapp, tmp_path):
+    """Verify PlayerWidget renders across multiple scene cuts on master timeline."""
+    import cv2
+    import numpy as np
+
+    from src.core.types import SceneCut, ScoredScene
+
+    clip_paths = []
+    for idx, col in enumerate([(255, 0, 0), (0, 255, 0)], start=1):
+        p = tmp_path / f"clip_{idx}.mp4"
+        out = cv2.VideoWriter(str(p), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (320, 240))
+        for _ in range(30):
+            frame = np.full((240, 320, 3), col, dtype=np.uint8)
+            out.write(frame)
+        out.release()
+        clip_paths.append(p)
+
+    scene1 = ScoredScene(
+        scene=SceneCut(clip_path=clip_paths[0], start_frame=0, end_frame=30, start_time=0.0, end_time=1.0, duration=1.0),
+        sharpness_score=80.0,
+        aesthetic_score=0.8,
+        composite_score=0.8,
+    )
+    scene2 = ScoredScene(
+        scene=SceneCut(clip_path=clip_paths[1], start_frame=0, end_frame=30, start_time=0.0, end_time=1.0, duration=1.0),
+        sharpness_score=85.0,
+        aesthetic_score=0.85,
+        composite_score=0.85,
+    )
+
+    player = PlayerWidget()
+    player.load_timeline_sequence([scene1, scene2], total_duration=2.0)
+    assert player._mode == "timeline"
+    assert player.duration == 2.0
+    assert player.canvas.current_pixmap is not None
+
+    # Scrub to Clip 1
+    player.seek_time(0.4)
+    assert player.canvas.current_pixmap is not None
+
+    # Scrub to Clip 2
+    player.seek_time(1.5)
+    assert player.canvas.current_pixmap is not None
+
+    player.close()

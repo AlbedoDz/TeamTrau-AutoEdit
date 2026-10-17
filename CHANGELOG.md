@@ -2,6 +2,28 @@
 
 ---
 
+## [Push 5] — 2026-10-17
+**feat: Phase 6 multi-variant synthesizer, genre recommender, security guardrails**
+
+### Security & Environment
+- Thêm bảo mật `.gitignore`: chặn `.env`, `.env.*`, `*.pem`, `*.key`, `token.json`, `credentials.json`, `secrets.json`.
+- Thêm `.env.example` template sạch không lộ API key.
+
+### Core Modules Mới
+- `src/core/ontology.py`: Video semantic ontology, scene taxonomy, pacing attributes.
+- `src/core/genre_presets.py`: Presets đạo diễn 6 phong cách (cinematic, montage, docu, vlog, tech, trailer).
+- `src/modules/genre_recommender.py`: Gợi ý genre tự động theo phân tích footage và soundtrack.
+- `src/modules/variant_synthesizer.py`: Tổng hợp đa biến thể timeline (A/B/C testing).
+
+### UI & Pipeline Enhancements
+- Tích hợp đa folder ingest và filter scenes theo folder nguồn (`src/modules/ingest_detector.py`, `src/ui/widgets/media_browser.py`).
+- Cập nhật GUI Project Manager, Timeline View, Export Panel hỗ trợ rendering đa biến thể song song.
+
+### Tests
+- 208/208 test pass 100% (+4 test files mới: `test_genre_presets`, `test_genre_recommender`, `test_multifolder_ingest`, `test_variant_synthesizer`).
+
+---
+
 ## [Push 4] `44b4f7b` — 2026-10-17
 **feat: TeamTrau-AutoEdit v1 - automated video editing pipeline**
 

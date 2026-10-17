@@ -19,6 +19,16 @@ build/
 venv/
 env/
 
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+secrets.json
+
 # Cache
 .cache/
 *.cache

@@ -59,13 +59,15 @@ class ExportDialog(QDialog):
         btn_bar = QHBoxLayout()
         btn_bar.addStretch()
 
-        self.btn_close = QPushButton("Close", self)
+        self.btn_close = QPushButton("❌ Close", self)
+        self.btn_close.setToolTip("Close Export Dialog")
         self.btn_close.clicked.connect(self.accept)
         btn_bar.addWidget(self.btn_close)
 
-        self.btn_run_export = QPushButton("⚡ Start Export / Render", self)
+        self.btn_run_export = QPushButton("🚀 Start Export / Render", self)
         self.btn_run_export.setObjectName("primaryButton")
         self.btn_run_export.setFixedHeight(32)
+        self.btn_run_export.setToolTip("Begin rendering master video and exporting NLE drafts")
         self.btn_run_export.clicked.connect(self._on_start_clicked)
         btn_bar.addWidget(self.btn_run_export)
 

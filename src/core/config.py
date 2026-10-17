@@ -218,9 +218,10 @@ class PipelineConfig(BaseModel):
     enable_deduplication: bool = Field(default=True)
     duplicate_hash_threshold: int = Field(default=6)
 
-    # Retention Teaser Hook
+    # Retention Teaser Hook & Multi-Variant Synthesis
     enable_teaser: bool = Field(default=True)
     teaser_duration: float = Field(default=6.0)
+    generate_variants: int = Field(default=3, ge=1, le=3)
 
     # AI Smart 9:16 Re-framing & Backdrop Blur
     enable_smart_reframing: bool = Field(default=True)
@@ -259,7 +260,7 @@ class PipelineConfig(BaseModel):
     capcut_draft_dir: Path | None = Field(default=None)
 
     # LLM / VLM Context Integration (Phase 5)
-    enable_vlm_tagging: bool = Field(default=False)
+    enable_vlm_tagging: bool = Field(default=True)
     vlm_provider: str = Field(default="auto")
     vlm_base_url: str | None = Field(default=None)
     vlm_api_key: str | None = Field(default=None)

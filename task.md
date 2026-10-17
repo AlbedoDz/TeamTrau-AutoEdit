@@ -156,7 +156,47 @@
       - `AgentConsoleDialog` (`src/ui/widgets/agent_console_dialog.py`): interactive co-pilot console with real-time thought/tool/result streaming and quick chips.
       - `StudioMainWindow` topbar button ("🤖 AI Co-Pilot") and menubar `AI Agent` menu.
     - [x] Full regression test suite: 189/189 tests passing (`pytest`), 0 ruff errors.
-
+- [x] Phase 11: VLM Analysis & Semantic Scene Tagging Pipeline Verification
+  - [x] Fixed root cause 1: `enable_vlm_tagging` in `PipelineConfig` defaulted to `False` and was unexposed; defaulted to `True` and exposed in `PreferencesDialog` and `InspectorPanelWidget`.
+  - [x] Fixed root cause 2: `VLMAssistant.tag_scored_scenes` lacked keyframe frames when called from pipeline; implemented automatic `VLMAssistant.extract_keyframe(clip_path, timestamp_sec)` via OpenCV.
+  - [x] Fixed root cause 3: Stage 5 in `service.py` did not notify GUI or populate result with tagged scenes; added `on_scenes_tagged` callback to `JobCallbacks`, emitted via `BackendSignalBridge.scenes_tagged`, and stored in `PipelineExecutionResult.scored_scenes`.
+  - [x] Fixed root cause 4: Added "🤖 VLM Tag All" on-demand trigger and in-place row updating (`update_or_add_scene`) in `SceneGridWidget`.
+- [x] Phase 12: Live Video Viewport Engine & UI Button Polish
+  - [x] Implemented real OpenCV-backed live video player in `PlayerWidget` and `MonitorCanvas` (`src/ui/widgets/player_widget.py`) supporting both Source Clip mode and Master Timeline Sequence mode with frame seeking and sequential playback.
+  - [x] Connected row selection & double-click in `MediaBrowserWidget` (`video_selected` signal) and `SceneGridWidget` (`scene_selected` signal) to instant Program Monitor preview.
+  - [x] Connected timeline scrub and pipeline execution output to automatic master sequence preview with seamless multi-clip cut switching.
+  - [x] Added working snapshot export (`📷 Snapshot`) and cinema theater viewport mode (`⛶ Theater`).
+  - [x] Optimized and standardized buttons across all widgets: added descriptive icons, labels, and tooltips, eliminating cryptic buttons (e.g. `...`, duplicate `▶`, unlabeled widgets).
+  - [x] Full regression test suite: 194/194 tests passing (`pytest`), 0 ruff errors.
+- [x] Phase 13: Multi-Genre Preset Matrix, Multi-Folder Ingest & Multi-Variant Timeline Synthesis Engine
+  - [x] Component 1: Multi-Folder Ingestion & Camera Role Taxonomy
+    - Created `src/core/ontology.py` (`CameraRole`, `MediaFolderEntry`, `infer_camera_role`, `get_role_display_name`).
+    - Extended `VideoMetadata` and `ScoredScene` with `camera_role` and `source_folder`.
+    - Enhanced `MediaBrowserWidget` with multi-folder queue (`[➕ Add Folder...]`), 9-column table, per-clip Camera Role dropdown, and auto-inference.
+  - [x] Component 2: Preset Ontology Matrix (4 Major Genres & 23 Sub-genres)
+    - Created `src/core/genre_presets.py` containing full matrix (Action & Sports, Travel & Lifestyle, Commercial & Social, Documentary & Narrative) with `apply()` method to dynamically configure `PipelineConfig`.
+  - [x] Component 3: Smart Pre-Recommendation Engine
+    - Created `src/modules/genre_recommender.py` combining DSP Librosa audio feature extraction (BPM, spectral contrast, RMS energy variance, song sections) and local LLM/heuristic classification.
+    - Added AI recommendation banner to `MediaBrowserWidget` with 1-click `[✨ Apply Preset]` button syncing `PipelineConfig`, `InspectorPanelWidget`, and `PreferencesDialog`.
+  - [x] Component 4: Multi-Variant Timeline Synthesis Engine
+    - Created `src/modules/variant_synthesizer.py` generating up to 3 distinct narrative cuts (`beat_driven`, `cinematic`, `social_teaser`).
+    - Delegated OpenTimelineIO timeline generation, FCPXML, Premiere XML, CapCut Desktop draft, and OTIO exports.
+    - Updated `StudioBackendAdapter` to accept multi-folder inputs and execute Stage 6 multi-variant synthesis.
+    - Added interactive `variant_bar` in `TimelineViewWidget` with live Program Monitor sequence preview switching.
+    - Added variant target scope selector and deliverables display in `ExportPanelWidget`.
+  - [x] Full regression test suite: 207/207 tests passing (`pytest`), 0 ruff errors.
+- [x] Phase 14: Comprehensive Workspace Session Persistence (`.tteproj` v2.0.0)
+  - [x] Expanded `ProjectData` (`src/ui/controllers/project_manager.py`) with complete session state:
+    - Multi-folder inputs (`input_dirs`) and per-clip camera roles (`clip_roles`).
+    - Full scored scenes (`scored_scenes`) with Tenengrad sharpness, PyTorch aesthetic, composite score, motion energy, 9:16 crop window (`CropWindow`), VLM semantic tagging (`SceneVLMAnalysis`), and curation inclusion states.
+    - Audio rhythm structure (`audio_analysis`) with BPM, duration, downbeats (`BeatMarker`), and song sections (`SongSection` INTRO, BUILDUP, DROP, OUTRO).
+    - Multi-variant synthesis cuts (`timeline_variants`) with OTIO, FCPXML, Premiere XML, CapCut draft paths, sequence scenes, and active variant.
+    - Program Monitor playhead position (`playhead_time`), IN point (`in_point`), OUT point (`out_point`).
+    - Deliverables record (`deliverables`) preserving master render and NLE drafts.
+  - [x] Added static serialization & deserialization helpers in `ProjectManager` for `ScoredScene`, `AudioAnalysisResult`, and `TimelineVariant`.
+  - [x] Upgraded `StudioMainWindow._do_save` and `StudioMainWindow._do_open` (`src/ui/main_window.py`) to serialize and restore all workspace sub-widgets completely without re-running analysis or neural scoring.
+  - [x] Added `set_input_dirs` and `set_clip_roles` to `MediaBrowserWidget`, `get_variants` and `get_active_variant_key` to `TimelineViewWidget`.
+  - [x] Verified full session roundtrip via unit tests (`tests/test_project_manager.py` and `tests/test_nle_menus_and_workflow.py`).
 
 
 

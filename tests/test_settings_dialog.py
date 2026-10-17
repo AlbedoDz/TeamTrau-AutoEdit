@@ -98,9 +98,11 @@ def test_preferences_dialog_config_bidirectional_sync(qapp):
     cfg.subtitle_cpl = 22
     cfg.export_subtitles_srt = False
     cfg.burn_hardsubs = True
+    cfg.enable_vlm_tagging = True
 
     # Load from config into dialog
     dialog.load_from_config(cfg)
+    assert dialog.chk_enable_vlm.isChecked() is True
     assert dialog.edit_base_url.text() == "https://custom.endpoint/v1"
     assert dialog.edit_api_key.text() == "sk-secret-test-key"
     assert dialog.combo_model.currentText() == "deepseek/deepseek-chat"
@@ -120,6 +122,7 @@ def test_preferences_dialog_config_bidirectional_sync(qapp):
     target_cfg = PipelineConfig()
     dialog.apply_to_config(target_cfg)
 
+    assert target_cfg.enable_vlm_tagging is True
     assert target_cfg.vlm_base_url == "https://custom.endpoint/v1"
     assert target_cfg.vlm_api_key == "sk-secret-test-key"
     assert target_cfg.vlm_model == "deepseek/deepseek-chat"

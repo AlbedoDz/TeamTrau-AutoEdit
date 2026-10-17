@@ -91,22 +91,28 @@ class PreferencesDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
-        self.btn_cancel = QPushButton("Cancel", self)
+        self.btn_cancel = QPushButton("❌ Cancel", self)
+        self.btn_cancel.setToolTip("Discard changes and close")
         self.btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(self.btn_cancel)
 
-        self.btn_save = QPushButton("Save & Apply", self)
+        self.btn_save = QPushButton("💾 Save & Apply", self)
         self.btn_save.setObjectName("primaryButton")
+        self.btn_save.setToolTip("Save preferences to disk and apply to active session")
         self.btn_save.clicked.connect(self._on_save_and_apply)
         btn_layout.addWidget(self.btn_save)
 
         layout.addLayout(btn_layout)
 
     def _init_tab_ai(self) -> None:
-        """Tab 1: AI & LLM Engine Hub."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(12)
+
+        self.chk_enable_vlm = QCheckBox("Enable VLM Semantic Scene Tagging & Key Moment Analysis", tab)
+        self.chk_enable_vlm.setChecked(True)
+        self.chk_enable_vlm.setStyleSheet("font-weight: bold; color: #38bdf8;")
+        layout.addWidget(self.chk_enable_vlm)
 
         # Provider Selection Group
         grp_provider = QGroupBox("AI Provider & Architecture", tab)
@@ -526,6 +532,7 @@ class PreferencesDialog(QDialog):
     def apply_to_config(self, config: PipelineConfig) -> None:
         """Transfer preferences dialog values into target PipelineConfig."""
         # AI Tab
+        config.enable_vlm_tagging = self.chk_enable_vlm.isChecked()
         config.vlm_provider = self.get_provider_key()
         config.vlm_base_url = self.edit_base_url.text().strip() or None
         config.vlm_api_key = self.edit_api_key.text().strip() or None
@@ -562,6 +569,7 @@ class PreferencesDialog(QDialog):
     def load_from_config(self, config: PipelineConfig) -> None:
         """Populate preferences dialog controls from PipelineConfig."""
         # AI Tab
+        self.chk_enable_vlm.setChecked(getattr(config, "enable_vlm_tagging", True))
         prov = (config.vlm_provider or "ollama").lower()
         if prov == "openrouter":
             self.rb_openrouter.setChecked(True)
@@ -621,6 +629,7 @@ class PreferencesDialog(QDialog):
         target_path = config_path or DEFAULT_CONFIG_PATH
         target_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
+            "enable_vlm_tagging": self.chk_enable_vlm.isChecked(),
             "vlm_provider": self.get_provider_key(),
             "vlm_base_url": self.edit_base_url.text().strip(),
             "vlm_api_key": self.edit_api_key.text().strip(),
@@ -655,6 +664,8 @@ class PreferencesDialog(QDialog):
             return False
         try:
             raw = json.loads(target_path.read_text(encoding="utf-8"))
+            if "enable_vlm_tagging" in raw:
+                self.chk_enable_vlm.setChecked(bool(raw["enable_vlm_tagging"]))
             if "vlm_provider" in raw:
                 prov = raw["vlm_provider"]
                 if prov == "openrouter":

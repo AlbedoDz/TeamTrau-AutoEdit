@@ -134,8 +134,9 @@ class ExportPanelWidget(QWidget):
         self.edit_capcut_dir.textChanged.connect(lambda: self.export_options_changed.emit())
         row_capcut_dir.addWidget(self.edit_capcut_dir, stretch=1)
 
-        btn_browse_capcut = QPushButton("Browse...", group_nle)
+        btn_browse_capcut = QPushButton("📁 Browse...", group_nle)
         btn_browse_capcut.setObjectName("secondaryButton")
+        btn_browse_capcut.setToolTip("Select CapCut draft destination folder")
         btn_browse_capcut.clicked.connect(self._browse_capcut_dir)
         row_capcut_dir.addWidget(btn_browse_capcut)
         layout_nle.addLayout(row_capcut_dir)
@@ -150,6 +151,18 @@ class ExportPanelWidget(QWidget):
         self.chk_dry_run_resolve.setChecked(False)
         self.chk_dry_run_resolve.setEnabled(False)
         layout_nle.addWidget(self.chk_dry_run_resolve)
+
+        # Variant Export Scope
+        row_variant = QHBoxLayout()
+        row_variant.addWidget(QLabel("Timeline Variant Target:"))
+        self.combo_variant_target = QComboBox(group_nle)
+        self.combo_variant_target.addItems([
+            "Active Workspace Variant (Current Cut)",
+            "Batch Export All Generated Variations (1-3 Variations)",
+        ])
+        self.combo_variant_target.currentIndexChanged.connect(lambda: self.export_options_changed.emit())
+        row_variant.addWidget(self.combo_variant_target, stretch=1)
+        layout_nle.addLayout(row_variant)
 
         layout.addWidget(group_nle)
 
@@ -243,8 +256,9 @@ class ExportPanelWidget(QWidget):
         self.edit_watermark_path.textChanged.connect(lambda: self.export_options_changed.emit())
         row_wm_path.addWidget(self.edit_watermark_path, stretch=1)
 
-        self.btn_browse_wm = QPushButton("Browse...", group_workflow)
+        self.btn_browse_wm = QPushButton("📁 Browse...", group_workflow)
         self.btn_browse_wm.setObjectName("secondaryButton")
+        self.btn_browse_wm.setToolTip("Select PNG watermark logo file")
         self.btn_browse_wm.setEnabled(False)
         self.btn_browse_wm.clicked.connect(self._browse_watermark)
         row_wm_path.addWidget(self.btn_browse_wm)
@@ -343,22 +357,31 @@ class ExportPanelWidget(QWidget):
         self.lbl_deliv_master.setStyleSheet("color: #38bdf8;")
         box_layout.addWidget(self.lbl_deliv_master)
 
+        self.lbl_deliv_variants = QLabel("", self.box_deliverables)
+        self.lbl_deliv_variants.setStyleSheet("color: #a78bfa; font-weight: 500;")
+        self.lbl_deliv_variants.setVisible(False)
+        box_layout.addWidget(self.lbl_deliv_variants)
+
         layout_deliv.addWidget(self.box_deliverables)
 
         # Action Buttons Row
         row_actions = QHBoxLayout()
-        self.btn_open_folder = QPushButton("Open Deliverable Folder", group_deliverables)
+        self.btn_open_folder = QPushButton("📂 Open Deliverable Folder", group_deliverables)
         self.btn_open_folder.setObjectName("secondaryButton")
+        self.btn_open_folder.setToolTip("Open rendered output folder in File Explorer")
         self.btn_open_folder.clicked.connect(self._on_open_deliverable_folder)
         row_actions.addWidget(self.btn_open_folder)
 
-        self.btn_play_master = QPushButton("Play Master Video", group_deliverables)
+        self.btn_play_master = QPushButton("▶️ Play Master Video", group_deliverables)
+        self.btn_play_master.setObjectName("secondaryButton")
+        self.btn_play_master.setToolTip("Play master rendered video with system media player")
         self.btn_play_master.setEnabled(False)
         self.btn_play_master.clicked.connect(self._on_play_master_video)
         row_actions.addWidget(self.btn_play_master)
 
-        self.btn_open_capcut = QPushButton("Open CapCut Draft", group_deliverables)
+        self.btn_open_capcut = QPushButton("✂️ Open CapCut Draft", group_deliverables)
         self.btn_open_capcut.setObjectName("secondaryButton")
+        self.btn_open_capcut.setToolTip("Open CapCut draft directory in File Explorer")
         self.btn_open_capcut.setEnabled(False)
         self.btn_open_capcut.clicked.connect(self._on_open_capcut_draft)
         row_actions.addWidget(self.btn_open_capcut)
@@ -402,6 +425,7 @@ class ExportPanelWidget(QWidget):
             "watermark_path": self.edit_watermark_path.text().strip() or None,
             "watermark_position": self.combo_wm_pos.currentText(),
             "watermark_opacity": self.spin_wm_opacity.value(),
+            "variant_export_scope": "all" if self.combo_variant_target.currentIndex() == 1 else "active",
         }
 
     def apply_to_config(self, config: PipelineConfig) -> None:
@@ -427,6 +451,9 @@ class ExportPanelWidget(QWidget):
         config.watermark_position = self.combo_wm_pos.currentText()  # type: ignore
         config.watermark_opacity = self.spin_wm_opacity.value()
 
+        # Variant generation count: 3 for all variants, 1 for active only
+        config.generate_variants = 3 if self.combo_variant_target.currentIndex() == 1 else 1
+
     def load_from_config(self, config: PipelineConfig) -> None:
         """Populate Export panel controls from PipelineConfig."""
         if config.workflow_mode == "build_timelapse":
@@ -451,6 +478,11 @@ class ExportPanelWidget(QWidget):
         if wm_pos_idx >= 0:
             self.combo_wm_pos.setCurrentIndex(wm_pos_idx)
         self.spin_wm_opacity.setValue(config.watermark_opacity)
+
+        if getattr(config, "generate_variants", 3) >= 3:
+            self.combo_variant_target.setCurrentIndex(1)
+        else:
+            self.combo_variant_target.setCurrentIndex(0)
 
     def get_capcut_draft_dir(self) -> Path | None:
         """Return user selected CapCut draft directory if specified and valid."""
@@ -538,7 +570,15 @@ class ExportPanelWidget(QWidget):
                 self.lbl_deliv_master.setText("Master MP4: (Render skipped by user)")
             else:
                 self.lbl_deliv_master.setText("Master MP4: (Not rendered)")
+
+            if getattr(result, "timeline_variants", None):
+                var_names = [v.display_name for v in result.timeline_variants.values()]
+                self.lbl_deliv_variants.setText(f"Timeline Variants ({len(var_names)}): <b>{' | '.join(var_names)}</b>")
+                self.lbl_deliv_variants.setVisible(True)
+            else:
+                self.lbl_deliv_variants.setVisible(False)
         else:
+            self.lbl_deliv_variants.setVisible(False)
             self.lbl_gauge_status.setText("Status: Failed")
             self.lbl_gauge_status.setStyleSheet("font-weight: bold; color: #f87171;")
             self.lbl_render_message.setText(f"Error: {result.error_message or 'Unknown failure'}")

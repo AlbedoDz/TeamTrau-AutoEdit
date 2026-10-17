@@ -41,6 +41,7 @@ class JobCallbacks:
     on_stage_changed: Callable[[str, int, int], None] | None = None
     on_progress: Callable[[float, float, str], None] | None = None
     on_scene_discovered: Callable[[ScoredScene], None] | None = None
+    on_scenes_tagged: Callable[[list[ScoredScene]], None] | None = None
     on_log: Callable[[str, str], None] | None = None
 
 
@@ -189,7 +190,7 @@ class StudioBackendAdapter:
 
     def submit_job(
         self,
-        input_dir: Path,
+        input_dir: Path | list[Path],
         soundtrack: Path,
         output_dir: Path,
         config: PipelineConfig,
@@ -259,7 +260,7 @@ class StudioBackendAdapter:
 
     def _execute_pipeline(
         self,
-        input_dir: Path,
+        input_dir: Path | list[Path],
         soundtrack: Path,
         output_dir: Path,
         config: PipelineConfig,
@@ -293,15 +294,38 @@ class StudioBackendAdapter:
                 callbacks.on_progress(stage_pct, total_pct, message)
 
         # -------------------------------------------------------------
-        # Stage 1: Ingestion & Shot Detection
+        # Stage 1: Ingestion & Shot Detection (Multi-Source Capable)
         # -------------------------------------------------------------
         _notify_stage("Ingesting & Detecting Scenes", 1)
         video_exts = {".mp4", ".mov", ".mkv", ".m4v"}
-        raw_files = [
-            f
-            for f in input_dir.iterdir()
-            if f.is_file() and f.suffix.lower() in video_exts
-        ]
+        collected_files: list[Path] = []
+        if isinstance(input_dir, list):
+            for item in input_dir:
+                p = Path(item)
+                if p.is_dir():
+                    collected_files.extend(
+                        [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in video_exts]
+                    )
+                elif p.is_file() and p.suffix.lower() in video_exts:
+                    collected_files.append(p)
+        else:
+            p = Path(input_dir)
+            if p.is_dir():
+                collected_files = [
+                    f for f in p.iterdir() if f.is_file() and f.suffix.lower() in video_exts
+                ]
+            elif p.is_file() and p.suffix.lower() in video_exts:
+                collected_files = [p]
+
+        # Deduplicate while preserving order
+        seen_paths = set()
+        raw_files: list[Path] = []
+        for f in collected_files:
+            rf = f.resolve()
+            if rf not in seen_paths:
+                seen_paths.add(rf)
+                raw_files.append(f)
+
         if not raw_files:
             raise FileNotFoundError(f"No video files found in {input_dir}")
 
@@ -439,9 +463,8 @@ class StudioBackendAdapter:
             _notify_progress(60.0, 5, f"Tagging scenes with VLM ({config.vlm_provider})...")
             vlm_engine = VLMAssistant(config)
             ranked_scenes = vlm_engine.tag_scored_scenes(ranked_scenes)
-            if callbacks and callbacks.on_scene_discovered:
-                for sc in ranked_scenes:
-                    callbacks.on_scene_discovered(sc)
+            if callbacks and callbacks.on_scenes_tagged:
+                callbacks.on_scenes_tagged(ranked_scenes)
 
         _notify_progress(100.0, 5, "Speech dialogue and semantic analysis completed")
 
@@ -478,7 +501,28 @@ class StudioBackendAdapter:
         export_res = timeline_engine.export_all(
             master_timeline, output_dir, base_name="timeline"
         )
-        _notify_progress(100.0, 6, f"Exported {export_res.clip_count} clips successfully")
+        _notify_progress(80.0, 6, f"Exported {export_res.clip_count} clips successfully")
+
+        # Multi-Variant Timeline Synthesis (1-3 Variations)
+        variants = {}
+        try:
+            from src.modules.variant_synthesizer import MultiVariantTimelineSynthesizer
+
+            variant_synth = MultiVariantTimelineSynthesizer(config)
+            variant_cnt = getattr(config, "generate_variants", 3)
+            variants = variant_synth.synthesize_variants(
+                scored_scenes=ranked_scenes,
+                beats=audio_res.beats,
+                soundtrack_path=active_soundtrack,
+                song_sections=audio_res.sections,
+                variant_count=variant_cnt,
+                output_dir=output_dir / "variants",
+            )
+            logger.info("Synthesized %d creative timeline variants.", len(variants))
+        except Exception as var_err:
+            logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
+
+        _notify_progress(100.0, 6, f"Multi-variant synthesis ready ({len(variants)} cuts)")
 
         # DaVinci Resolve Dispatcher (if requested)
         resolve_info = None
@@ -575,4 +619,6 @@ class StudioBackendAdapter:
             dialogue_sentences=len(transcribed_sentences),
             error_message=None,
             scored_scenes=ranked_scenes,
+            timeline_variants=variants,
+            active_variant_name="beat_driven" if "beat_driven" in variants else None,
         )

@@ -135,3 +135,158 @@ def test_project_manager_pipeline_config_serde():
     assert restored.watermark_enabled is True
     assert restored.watermark_path == Path("logos/brand.png")
     assert restored.target_duration == 120.0
+
+
+def test_project_manager_full_session_persistence(tmp_path: Path):
+    """Verify serialization and deserialization of complete session state with all analysis and scoring."""
+    from src.core.types import (
+        BeatMarker,
+        CropWindow,
+        SceneCut,
+        SceneVLMAnalysis,
+        ScoredScene,
+        SongSection,
+        SongSectionType,
+        TimelineVariant,
+    )
+    from src.modules.audio_analyzer import AudioAnalysisResult
+
+    mgr = ProjectManager()
+
+    # 1. Scored scene with crop window and VLM tags
+    cut = SceneCut(
+        clip_path=tmp_path / "drone_01.mp4",
+        start_time=0.0,
+        end_time=5.0,
+        start_frame=0,
+        end_frame=150,
+        duration=5.0,
+    )
+    cw = CropWindow(x=100, y=0, width=1080, height=1920, confidence=0.95, tracking_subject="vehicle")
+    vlm = SceneVLMAnalysis(
+        scene_index=1,
+        description="Epic mountain sunset landscape aerial",
+        tags=["mountain", "sunset", "drone", "scenic"],
+        mood="cinematic",
+        suggested_pacing="slow",
+        is_key_moment=True,
+        confidence=0.98,
+    )
+    scene = ScoredScene(
+        scene=cut,
+        sharpness_score=94.5,
+        aesthetic_score=0.88,
+        composite_score=0.91,
+        motion_energy=0.35,
+        speed=1.0,
+        crop_window=cw,
+        vlm_analysis=vlm,
+        camera_role="drone",
+        metadata={"included": True, "custom_tag": "hero_shot"},
+    )
+
+    # 2. Audio analysis
+    beat = BeatMarker(timestamp=1.25, frame_idx=37, strength=0.92, is_downbeat=True)
+    sec = SongSection(
+        section_type=SongSectionType.DROP,
+        start_time=15.0,
+        end_time=30.0,
+        duration=15.0,
+        avg_energy=0.85,
+        chroma_profile=[0.1] * 12,
+        is_climax=True,
+    )
+    audio_res = AudioAnalysisResult(
+        tempo_bpm=128.0,
+        duration=45.0,
+        sample_rate=48000,
+        cut_timestamps=[0.0, 1.25, 2.5, 5.0],
+        beats=[beat],
+        sections=[sec],
+    )
+
+    # 3. Timeline variant
+    var = TimelineVariant(
+        name="cinematic",
+        display_name="Variant 2: Cinematic",
+        description="Slow scenic pacing",
+        target_pacing="slow",
+        clip_count=1,
+        total_duration=5.0,
+        fcpxml_path=tmp_path / "cinematic.fcpxml",
+        sequence_scenes=[scene],
+    )
+
+    # Assemble complete ProjectData
+    proj_data = ProjectData(
+        project_name="Commercial Master 4K",
+        version="2.0.0",
+        input_dir=str(tmp_path / "raw_cam_a"),
+        input_dirs=[str(tmp_path / "raw_cam_a"), str(tmp_path / "raw_drone")],
+        clip_roles={str(tmp_path / "drone_01.mp4"): "drone"},
+        soundtrack_path=str(tmp_path / "bgm.wav"),
+        output_dir=str(tmp_path / "exports"),
+        preset_name="4k30",
+        config={"enable_vlm_tagging": True, "generate_variants": 3},
+        in_point=1.0,
+        out_point=40.0,
+        playhead_time=15.5,
+        scored_scenes=[mgr.serialize_scored_scene(scene, is_included=True)],
+        audio_analysis=mgr.serialize_audio_analysis(audio_res),
+        timeline_variants={"cinematic": mgr.serialize_timeline_variant(var)},
+        active_variant_name="cinematic",
+        deliverables={"render_path": str(tmp_path / "master.mp4"), "total_duration": 45.0},
+    )
+
+    save_file = tmp_path / "session_full.tteproj"
+    ok = mgr.save_project(save_file, proj_data)
+    assert ok is True
+    assert save_file.exists()
+
+    # Load back and verify complete state fidelity
+    loaded = mgr.load_project(save_file)
+    assert loaded is not None
+    assert loaded.project_name == "Commercial Master 4K"
+    assert loaded.version == "2.0.0"
+    assert len(loaded.input_dirs) == 2
+    assert loaded.clip_roles[str(tmp_path / "drone_01.mp4")] == "drone"
+    assert loaded.playhead_time == 15.5
+    assert loaded.in_point == 1.0
+    assert loaded.out_point == 40.0
+
+    # Deserialize scored scene
+    assert len(loaded.scored_scenes) == 1
+    restored_scene, inc = mgr.deserialize_scored_scene(loaded.scored_scenes[0])
+    assert inc is True
+    assert restored_scene.scene.clip_path == tmp_path / "drone_01.mp4"
+    assert restored_scene.sharpness_score == 94.5
+    assert restored_scene.aesthetic_score == 0.88
+    assert restored_scene.composite_score == 0.91
+    assert restored_scene.camera_role == "drone"
+    assert restored_scene.crop_window is not None
+    assert restored_scene.crop_window.width == 1080
+    assert restored_scene.crop_window.tracking_subject == "vehicle"
+    assert restored_scene.vlm_analysis is not None
+    assert restored_scene.vlm_analysis.mood == "cinematic"
+    assert restored_scene.vlm_analysis.tags == ["mountain", "sunset", "drone", "scenic"]
+    assert restored_scene.vlm_analysis.is_key_moment is True
+
+    # Deserialize audio analysis
+    restored_audio = mgr.deserialize_audio_analysis(loaded.audio_analysis)
+    assert restored_audio.tempo_bpm == 128.0
+    assert restored_audio.sample_rate == 48000
+    assert len(restored_audio.beats) == 1
+    assert restored_audio.beats[0].is_downbeat is True
+    assert len(restored_audio.sections) == 1
+    assert restored_audio.sections[0].section_type == SongSectionType.DROP
+    assert restored_audio.sections[0].is_climax is True
+
+    # Deserialize variant
+    assert "cinematic" in loaded.timeline_variants
+    restored_var = mgr.deserialize_timeline_variant(loaded.timeline_variants["cinematic"])
+    assert restored_var.name == "cinematic"
+    assert restored_var.display_name == "Variant 2: Cinematic"
+    assert restored_var.target_pacing == "slow"
+    assert len(restored_var.sequence_scenes) == 1
+    assert restored_var.sequence_scenes[0].scene.clip_path == tmp_path / "drone_01.mp4"
+

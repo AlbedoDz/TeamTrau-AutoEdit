@@ -141,18 +141,21 @@ class SceneGridWidget(QWidget):
         row_top.addWidget(self.lbl_stats)
         row_top.addStretch()
 
-        self.btn_include_all = QPushButton("Include All", self)
+        self.btn_include_all = QPushButton("✅ Include All", self)
         self.btn_include_all.setObjectName("secondaryButton")
+        self.btn_include_all.setToolTip("Include all detected scenes in sequence")
         self.btn_include_all.clicked.connect(self.include_all)
         row_top.addWidget(self.btn_include_all)
 
-        self.btn_exclude_all = QPushButton("Exclude All", self)
+        self.btn_exclude_all = QPushButton("🚫 Exclude All", self)
         self.btn_exclude_all.setObjectName("secondaryButton")
+        self.btn_exclude_all.setToolTip("Exclude all scenes from sequence")
         self.btn_exclude_all.clicked.connect(self.exclude_all)
         row_top.addWidget(self.btn_exclude_all)
 
-        self.btn_exclude_dead_air = QPushButton("Exclude Dead-Air", self)
+        self.btn_exclude_dead_air = QPushButton("⚡ Exclude Dead-Air", self)
         self.btn_exclude_dead_air.setObjectName("secondaryButton")
+        self.btn_exclude_dead_air.setToolTip("Automatically exclude silent or frozen footage")
         self.btn_exclude_dead_air.clicked.connect(self.exclude_dead_air_scenes)
         row_top.addWidget(self.btn_exclude_dead_air)
 
@@ -187,8 +190,9 @@ class SceneGridWidget(QWidget):
         self.chk_only_included.toggled.connect(self.filter_scenes)
         row_filters.addWidget(self.chk_only_included)
 
-        self.btn_reset_filter = QPushButton("Reset Filters", self)
+        self.btn_reset_filter = QPushButton("🔄 Reset Filters", self)
         self.btn_reset_filter.setObjectName("secondaryButton")
+        self.btn_reset_filter.setToolTip("Reset search query and score filters")
         self.btn_reset_filter.clicked.connect(self.reset_filters)
         row_filters.addWidget(self.btn_reset_filter)
 
@@ -812,7 +816,10 @@ class SceneGridWidget(QWidget):
         # Toggle button
         is_inc = self.is_scene_included(idx)
         self.btn_toggle_include.setEnabled(True)
-        self.btn_toggle_include.setText("Exclude Scene" if is_inc else "Include Scene")
+        self.btn_toggle_include.setText("❌ Exclude Scene" if is_inc else "✅ Include Scene")
+        self.btn_toggle_include.setToolTip(
+            "Exclude this scene cut from timeline assembly" if is_inc else "Include this scene cut in timeline assembly"
+        )
         if is_inc:
             self.btn_toggle_include.setObjectName("dangerButton")
         else:

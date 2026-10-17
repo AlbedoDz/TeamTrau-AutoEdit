@@ -131,11 +131,12 @@ def test_media_browser_metadata_probed_slot(qapp, sample_media_dir):
     widget._on_metadata_probed(meta)
 
     # clip1 row
-    assert widget.table.item(0, 2).text() == "3840x2160"
-    assert widget.table.item(0, 3).text() == "60.0"
-    assert widget.table.item(0, 4).text() == "8.50s"
-    assert widget.table.item(0, 5).text() == "510"
-    assert widget.table.item(0, 6).text() == "hevc"
+    assert widget.table.cellWidget(0, 2) is not None
+    assert widget.table.item(0, 3).text() == "3840x2160"
+    assert widget.table.item(0, 4).text() == "60.0"
+    assert widget.table.item(0, 5).text() == "8.50s"
+    assert widget.table.item(0, 6).text() == "510"
+    assert widget.table.item(0, 7).text() == "hevc"
     assert "8.5s" in widget.lbl_status.text()
 
 
@@ -171,3 +172,22 @@ def test_media_browser_drag_and_drop_folder(qapp, sample_media_dir):
 
     assert widget.get_input_dir() == footage
     assert len(widget.get_video_files()) == 2
+
+
+def test_media_browser_video_selected_signal(qapp, sample_media_dir):
+    """Verify selecting a row emits video_selected with corresponding Path."""
+    widget = MediaBrowserWidget()
+    widget.set_input_dir(sample_media_dir["footage_dir"])
+    assert len(widget.get_video_files()) == 2
+
+    selected = []
+    widget.video_selected.connect(lambda p: selected.append(p))
+
+    # Select row 0
+    widget.table.selectRow(0)
+    assert len(selected) >= 1
+    assert selected[-1] in widget.get_video_files()
+
+    # Double click row 1
+    widget.table.cellDoubleClicked.emit(1, 0)
+    assert selected[-1] == widget.get_video_files()[1]

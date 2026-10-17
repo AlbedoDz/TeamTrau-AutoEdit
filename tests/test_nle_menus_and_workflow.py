@@ -138,11 +138,51 @@ def test_scene_toggle_undo_redo(isolated_studio):
 
 
 def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
-    """Verify saving a project to .tteproj, updating recent menu, and loading it back."""
+    """Verify saving a complete project session to .tteproj and fully restoring workspace state."""
+    from src.core.types import (
+        BeatMarker,
+        SceneCut,
+        ScoredScene,
+        SongSection,
+        SongSectionType,
+        TimelineVariant,
+    )
+    from src.modules.audio_analyzer import AudioAnalysisResult
+
     window, _ = isolated_studio
 
     window.edit_project_name.setText("Summer Travel Vlog")
     window.media_browser.edit_input_dir.setText(str(tmp_path))
+
+    # Setup scored scene in review grid
+    cut = SceneCut(tmp_path / "clip_a.mp4", 0.0, 4.0, 0, 120, 4.0)
+    scored = ScoredScene(cut, sharpness_score=88.0, aesthetic_score=0.85, composite_score=0.86, camera_role="drone")
+    window.scene_grid.set_scenes([scored])
+
+    # Setup audio analysis and variant on timeline
+    audio_res = AudioAnalysisResult(
+        tempo_bpm=124.0,
+        duration=30.0,
+        sample_rate=44100,
+        cut_timestamps=[0.0, 2.0, 4.0],
+        beats=[BeatMarker(2.0, 60, 0.9, True)],
+        sections=[SongSection(SongSectionType.INTRO, 0.0, 10.0, 10.0, 0.4)],
+    )
+    window.timeline_view.canvas.audio_analysis = audio_res
+
+    var = TimelineVariant(
+        name="beat_driven",
+        display_name="Variant 1: Beat-Driven",
+        total_duration=4.0,
+        clip_count=1,
+        sequence_scenes=[scored],
+    )
+    window.timeline_view.set_variants({"beat_driven": var}, active_key="beat_driven")
+
+    # Mark in / out and playhead
+    window.player_widget.current_time = 2.5
+    window._in_point = 1.0
+    window._out_point = 3.5
 
     save_path = tmp_path / "vlog.tteproj"
     ok = window._do_save(save_path)
@@ -155,12 +195,25 @@ def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
     window._on_new_project()
     assert window.edit_project_name.text() == "Untitled Project"
     assert window.project_manager.current_project_path is None
+    assert len(window.scene_grid.get_all_scenes()) == 0
 
     # Load back
     loaded = window._do_open(save_path)
     assert loaded is True
     assert window.edit_project_name.text() == "Summer Travel Vlog"
     assert window.project_manager.current_project_path == save_path.resolve()
+
+    # Verify complete session state restored
+    assert len(window.scene_grid.get_all_scenes()) == 1
+    assert window.scene_grid.get_all_scenes()[0].scene.clip_path == tmp_path / "clip_a.mp4"
+    assert window.scene_grid.get_all_scenes()[0].camera_role == "drone"
+    assert window._in_point == 1.0
+    assert window._out_point == 3.5
+    assert abs(window.player_widget.current_time - 2.5) < 0.1
+    assert "beat_driven" in window.timeline_view.get_variants()
+    assert window.timeline_view.get_active_variant_key() == "beat_driven"
+    assert window.timeline_view.canvas.audio_analysis is not None
+    assert window.timeline_view.canvas.audio_analysis.tempo_bpm == 124.0
 
 
 def test_kaizen_workflow_stepper_and_quick_buttons(isolated_studio):

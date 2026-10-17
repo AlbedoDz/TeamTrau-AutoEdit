@@ -238,6 +238,25 @@ class VLMAssistant:
                 frame=raw_frame,
             )
 
+    def query_text(self, prompt: str) -> str | None:
+        """Query text completion from configured OpenAI/Ollama client."""
+        if not self.client:
+            return None
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a professional video editor AI."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.config.vlm_temperature,
+                response_format={"type": "json_object"},
+            )
+            return response.choices[0].message.content
+        except Exception as exc:
+            logger.warning("VLM assistant text query failed: %s", exc)
+            return None
+
     def _heuristic_fallback(
         self,
         scene_index: int,

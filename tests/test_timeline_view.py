@@ -8,7 +8,14 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QMessageBox
 
-from src.core.types import BeatMarker, SceneCut, ScoredScene, SongSection, SongSectionType
+from src.core.types import (
+    BeatMarker,
+    SceneCut,
+    ScoredScene,
+    SongSection,
+    SongSectionType,
+    TimelineVariant,
+)
 from src.modules.audio_analyzer import AudioAnalysisResult
 from src.ui.app import create_app
 from src.ui.main_window import StudioMainWindow
@@ -235,3 +242,45 @@ def test_main_window_timeline_view_integration(qapp, sample_timeline_assets, mon
 
     window._set_dirty(False)
     window.close()
+
+
+def test_timeline_view_variants_switcher(qapp, sample_timeline_assets):
+    """Verify set_variants renders buttons and allows switching between narrative variations."""
+    widget = TimelineViewWidget()
+    scenes = sample_timeline_assets["scenes"]
+
+    v1 = TimelineVariant(
+        name="beat_driven",
+        display_name="Variant 1: Beat-Driven",
+        description="Fast downbeat cuts",
+        target_pacing="fast",
+        clip_count=3,
+        total_duration=12.0,
+        sequence_scenes=scenes,
+    )
+    v2 = TimelineVariant(
+        name="cinematic",
+        display_name="Variant 2: Cinematic",
+        description="Slow aesthetic cuts",
+        target_pacing="cinematic",
+        clip_count=2,
+        total_duration=18.0,
+        sequence_scenes=scenes[:2],
+    )
+
+    received_signals = []
+    widget.variant_switched.connect(lambda k, v: received_signals.append((k, v)))
+
+    widget.show()
+    widget.set_variants({"beat_driven": v1, "cinematic": v2}, active_key="beat_driven")
+    assert not widget.variant_bar.isHidden()
+    assert len(widget._variant_buttons) == 2
+    assert widget._active_variant_key == "beat_driven"
+
+    # Switch to cinematic
+    widget.switch_variant("cinematic")
+    assert widget._active_variant_key == "cinematic"
+    assert len(received_signals) == 1
+    assert received_signals[0][0] == "cinematic"
+    assert received_signals[0][1].name == "cinematic"
+

@@ -27,8 +27,13 @@ class IngestDetector:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
 
-    def probe_video(self, video_path: Path) -> VideoMetadata:
-        """Extract frame dimensions, framerate, and duration from video file."""
+    def probe_video(
+        self,
+        video_path: Path,
+        camera_role: str | None = None,
+        source_folder: Path | None = None,
+    ) -> VideoMetadata:
+        """Extract frame dimensions, framerate, duration, and camera role from video file."""
         if not video_path.is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
@@ -47,6 +52,10 @@ class IngestDetector:
 
         duration = total_frames / fps if fps > 0 else 0.0
 
+        from src.core.ontology import infer_camera_role
+
+        inferred_role = camera_role or infer_camera_role(source_folder or video_path).value
+
         return VideoMetadata(
             path=video_path,
             width=width,
@@ -55,6 +64,8 @@ class IngestDetector:
             duration=duration,
             total_frames=total_frames,
             codec="raw",
+            camera_role=inferred_role,
+            source_folder=source_folder or video_path.parent,
         )
 
     def detect_scenes(self, video_path: Path) -> list[SceneCut]:

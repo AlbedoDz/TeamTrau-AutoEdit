@@ -17,6 +17,8 @@ class VideoMetadata:
     duration: float
     total_frames: int
     codec: str = "unknown"
+    camera_role: str = "cam_a"
+    source_folder: Path | None = None
 
     @property
     def aspect_ratio(self) -> float:
@@ -196,7 +198,27 @@ class ScoredScene:
     speed: float = 1.0
     crop_window: CropWindow | None = None
     vlm_analysis: SceneVLMAnalysis | None = None
+    camera_role: str = "cam_a"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TimelineVariant:
+    """Distinct narrative timeline cut generated from the same source footage."""
+
+    name: str
+    display_name: str
+    description: str = ""
+    target_pacing: str = "moderate"
+    clip_count: int = 0
+    total_duration: float = 0.0
+    otio_timeline: Any = None
+    fcpxml_path: Path | None = None
+    premiere_xml_path: Path | None = None
+    otio_path: Path | None = None
+    capcut_draft_path: Path | None = None
+    render_path: Path | None = None
+    sequence_scenes: list["ScoredScene"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -265,3 +287,6 @@ class PipelineExecutionResult:
     dialogue_sentences: int = 0
     error_message: str | None = None
     scored_scenes: list[ScoredScene] = field(default_factory=list)
+    timeline_variants: dict[str, TimelineVariant] = field(default_factory=dict)
+    active_variant_name: str | None = None
+
