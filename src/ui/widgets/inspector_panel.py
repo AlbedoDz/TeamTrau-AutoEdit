@@ -24,9 +24,57 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import PipelineConfig
-from src.core.types import WatermarkPosition, WorkflowMode
+from src.core.genre_presets import GENRE_PRESETS, list_presets_by_major_genre
+from src.core.types import CadenceProfile, WatermarkPosition, WorkflowMode
 
 logger = logging.getLogger(__name__)
+
+# Rough cut decodes every frame: ~25 s of processing per minute of 1080p footage (heavier for 4K).
+ROUGH_CUT_SEC_PER_FOOTAGE_MIN = 25.0
+
+STAGE_KEYS: tuple[str, ...] = ("rough_cut", "sequence", "all")
+_STAGE_TOOLTIPS: dict[str, str] = {
+    "rough_cut": (
+        "Step 1 (optional): scan the footage and cut away shaky, blurry and wobbly parts.\n"
+        "Needs footage only - no music. Review the golden takes in 'Scene Quality & Review' afterwards."
+    ),
+    "sequence": (
+        "Step 2: build the beat-matched edit from the reviewed takes (re-uses them, no re-scan).\n"
+        "Press it again after changing Genre / Cadence for a quick re-edit. Needs a soundtrack."
+    ),
+    "all": (
+        "One click: Rough Cut (when 'Rough cut pruning' is ticked) then Auto-Edit Sequence.\n"
+        "Use this when you do not need to review the takes first."
+    ),
+}
+
+CADENCE_LABELS: dict[str, str] = {
+    CadenceProfile.FAST_SYNCOPATED.value: "Fast & syncopated (1/2-2 bars)",
+    CadenceProfile.BALANCED_NARRATIVE.value: "Balanced narrative (1-4 bars)",
+    CadenceProfile.LINGERING_CINEMATIC.value: "Lingering cinematic (2-8 bars)",
+    CadenceProfile.VIRAL_BURST.value: "Viral burst (1/2-1 bar)",
+}
+
+
+def estimate_rough_cut_minutes(footage_sec: float) -> float:
+    """Expected rough cut processing time in minutes for ``footage_sec`` of footage."""
+    return max(0.0, footage_sec) / 60.0 * ROUGH_CUT_SEC_PER_FOOTAGE_MIN / 60.0
+
+
+def rough_cut_estimate_text(footage_sec: float, probed: int, total: int) -> str:
+    """Label under the stage buttons: "Rough cut: est. ~N min" (with probing progress when partial)."""
+    if total <= 0:
+        return "Rough cut: add footage for a time estimate"
+    minutes = estimate_rough_cut_minutes(footage_sec)
+    if minutes < 1.0:
+        est = "est. < 1 min"
+    elif minutes < 10.0:
+        est = f"est. ~{minutes:.1f} min"
+    else:
+        est = f"est. ~{round(minutes)} min"
+    if probed < total:
+        return f"Rough cut: {est} (probing footage {probed}/{total} clips...)"
+    return f"Rough cut: {est}"
 
 
 class InspectorPanelWidget(QWidget):
@@ -35,9 +83,12 @@ class InspectorPanelWidget(QWidget):
     speed-ramping, watermark branding, and teaser hook assembly.
     """
 
-    analyze_optimize_clicked = Signal()
+    analyze_optimize_clicked = Signal()  # "Auto Run All" (kept name: existing wiring / tests)
+    run_rough_cut_clicked = Signal()
+    run_sequence_clicked = Signal()
     open_preferences_clicked = Signal()
     config_changed = Signal()
+    genre_changed = Signal(str)  # preset key, "" for Auto
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -82,6 +133,52 @@ class InspectorPanelWidget(QWidget):
         form_wf.addRow("Preset:", self.combo_workflow)
 
         layout.addWidget(grp_workflow)
+
+        # 1b. Rhythm: genre, cadence profile and long-shot handling
+        grp_rhythm = QGroupBox("Rhythm", content)
+        form_rhythm = QFormLayout(grp_rhythm)
+        form_rhythm.setSpacing(6)
+
+        self.combo_genre = QComboBox(grp_rhythm)
+        self.combo_genre.addItem("Auto (no genre preset)", "")
+        for major, presets in list_presets_by_major_genre().items():
+            self.combo_genre.addItem(f"-- {major} --", None)
+            header_item = self.combo_genre.model().item(self.combo_genre.count() - 1)  # type: ignore[attr-defined]
+            if header_item is not None:
+                header_item.setEnabled(False)
+            for preset in presets:
+                self.combo_genre.addItem(f"   {preset.display_name}", preset.key)
+        self.combo_genre.setToolTip("Genre preset: pacing, cadence and look. Applied to the panels when picked.")
+        self.combo_genre.currentIndexChanged.connect(self._on_genre_index_changed)
+        form_rhythm.addRow("Genre:", self.combo_genre)
+
+        self.combo_cadence = QComboBox(grp_rhythm)
+        self.combo_cadence.addItem("Auto (from genre)", "auto")
+        for value, label in CADENCE_LABELS.items():
+            self.combo_cadence.addItem(label, value)
+        self.combo_cadence.setToolTip("How fast shots turn over, in musical bars. Auto follows the genre.")
+        self.combo_cadence.activated.connect(lambda _i: self.config_changed.emit())  # user picks only
+        form_rhythm.addRow("Cadence:", self.combo_cadence)
+
+        self.spin_long_shot = QDoubleSpinBox(grp_rhythm)
+        self.spin_long_shot.setRange(4.0, 60.0)
+        self.spin_long_shot.setSingleStep(1.0)
+        self.spin_long_shot.setValue(12.0)
+        self.spin_long_shot.setSuffix(" s")
+        self.spin_long_shot.setToolTip(
+            "Keep long shots: takes at least this long get a longer slot and a best-moment sub-window"
+        )
+        form_rhythm.addRow("Keep long shots (>=):", self.spin_long_shot)
+
+        self.spin_max_scene = QDoubleSpinBox(grp_rhythm)
+        self.spin_max_scene.setRange(4.0, 60.0)
+        self.spin_max_scene.setSingleStep(1.0)
+        self.spin_max_scene.setValue(16.0)
+        self.spin_max_scene.setSuffix(" s")
+        self.spin_max_scene.setToolTip("Longest stretch of one scene used in a single slot")
+        form_rhythm.addRow("Max scene length:", self.spin_max_scene)
+
+        layout.addWidget(grp_rhythm)
 
         # Defect Cleaning Controls (Rough Cut)
         self.grp_defect_pruning = QGroupBox("Defect Cleaning Controls", content)
@@ -306,19 +403,91 @@ class InspectorPanelWidget(QWidget):
         scroll.setWidget(content)
         main_layout.addWidget(scroll, stretch=1)
 
-        # Bottom Action Buttons
-        self.btn_analyze = QPushButton("⚡ Analyze & Optimize", self)
+        # Bottom action cluster: 1. Rough Cut, 2. Sequence, Auto Run All
+        self.chk_rough_cut_pruning = QCheckBox("Rough cut pruning (run before sequence)", self)
+        self.chk_rough_cut_pruning.setChecked(True)  # GUI default ON (backend default is off)
+        self.chk_rough_cut_pruning.setToolTip(
+            "Auto Run All: first remove shaky / blurry / wobbly parts (adds the rough cut time below)"
+        )
+        main_layout.addWidget(self.chk_rough_cut_pruning)
+
+        self.lbl_rough_estimate = QLabel(rough_cut_estimate_text(0.0, 0, 0), self)
+        self.lbl_rough_estimate.setStyleSheet("color: #a1a1aa; font-size: 11px;")
+        self.lbl_rough_estimate.setWordWrap(True)
+        main_layout.addWidget(self.lbl_rough_estimate)
+
+        self.btn_rough_cut = QPushButton("🔨 1. Run Rough Cut", self)
+        self.btn_rough_cut.setObjectName("secondaryButton")
+        self.btn_rough_cut.setFixedHeight(30)
+        self.btn_rough_cut.clicked.connect(self.run_rough_cut_clicked)
+        main_layout.addWidget(self.btn_rough_cut)
+
+        self.btn_sequence = QPushButton("✨ 2. Auto-Edit Sequence", self)
+        self.btn_sequence.setObjectName("secondaryButton")
+        self.btn_sequence.setFixedHeight(30)
+        self.btn_sequence.clicked.connect(self.run_sequence_clicked)
+        main_layout.addWidget(self.btn_sequence)
+
+        # Primary action. The attribute keeps its historic name (``btn_analyze``).
+        self.btn_analyze = QPushButton("⚡ Auto Run All", self)
         self.btn_analyze.setObjectName("primaryButton")
-        self.btn_analyze.setFixedHeight(34)
-        self.btn_analyze.setToolTip("Run automated scene detection and rhythm sync pipeline")
+        self.btn_analyze.setFixedHeight(36)
         self.btn_analyze.clicked.connect(self.analyze_optimize_clicked)
         main_layout.addWidget(self.btn_analyze)
+
+        self._stage_buttons: dict[str, QPushButton] = {
+            "rough_cut": self.btn_rough_cut,
+            "sequence": self.btn_sequence,
+            "all": self.btn_analyze,
+        }
+        self.set_stage_states({k: (True, "") for k in STAGE_KEYS}, busy=False)
 
         self.btn_prefs = QPushButton("⚙️ Preferences / AI Settings...", self)
         self.btn_prefs.setFixedHeight(28)
         self.btn_prefs.setToolTip("Open system preferences and AI model configuration")
         self.btn_prefs.clicked.connect(self.open_preferences_clicked)
         main_layout.addWidget(self.btn_prefs)
+
+    def set_stage_states(self, states: dict[str, tuple[bool, str]], busy: bool) -> None:
+        """Enable / disable the three stage buttons.
+
+        ``states[key] = (runnable, reason)``: ``reason`` explains a disabled button in its tooltip.
+        While a job runs (``busy``) every stage button is disabled (no duplicate runs).
+        """
+        for key, btn in self._stage_buttons.items():
+            ok, reason = states.get(key, (True, ""))
+            btn.setEnabled(bool(ok) and not busy)
+            tip = _STAGE_TOOLTIPS[key]
+            if busy:
+                tip += "\n(Busy: a job is running - press Stop to cancel it.)"
+            elif not ok and reason:
+                tip += f"\nNot available: {reason}"
+            btn.setToolTip(tip)
+
+    def set_rough_cut_estimate(self, footage_sec: float, probed: int, total: int) -> None:
+        """Update the "est. ~N min" label from the footage durations probed so far."""
+        self.lbl_rough_estimate.setText(rough_cut_estimate_text(footage_sec, probed, total))
+
+    def selected_genre_key(self) -> str:
+        """Preset key of the chosen genre, "" for Auto."""
+        return str(self.combo_genre.currentData() or "")
+
+    def set_genre(self, key: str, emit: bool = False) -> None:
+        """Select a genre programmatically (``emit`` False: no ``genre_changed`` / panel reload)."""
+        idx = self.combo_genre.findData(key or "")
+        if idx < 0:
+            idx = 0
+        if emit:
+            self.combo_genre.setCurrentIndex(idx)
+            return
+        self.combo_genre.blockSignals(True)
+        self.combo_genre.setCurrentIndex(idx)
+        self.combo_genre.blockSignals(False)
+
+    @Slot(int)
+    def _on_genre_index_changed(self, index: int) -> None:
+        self.genre_changed.emit(self.selected_genre_key())
+        self.config_changed.emit()
 
     @Slot(int)
     def _on_duration_slider_changed(self, value: int) -> None:
@@ -398,6 +567,19 @@ class InspectorPanelWidget(QWidget):
         config.enable_ken_burns = self.chk_ken_burns.isChecked()
         config.ken_burns_scale_factor = float(self.spin_ken_burns_zoom.value())
 
+        # Rhythm / staged workflow
+        config.run_rough_cut_in_all = self.chk_rough_cut_pruning.isChecked()
+        config.extended_shot_threshold_sec = float(self.spin_long_shot.value())
+        config.max_scene_len_sec = float(self.spin_max_scene.value())
+        cadence = self.combo_cadence.currentData() or "auto"
+        genre = GENRE_PRESETS.get(self.selected_genre_key())
+        if cadence != "auto":
+            config.cadence_profile = str(cadence)
+            config.cadence_multiples = None
+        elif genre is not None:
+            config.cadence_profile = genre.cadence_profile
+            config.cadence_multiples = list(genre.target_bar_multiples)
+
         # Rough Cut Defect Pruning
         config.enable_head_tail_trim = self.chk_prune_wobble.isChecked()
         config.enable_shake_pruning = self.chk_prune_shake.isChecked()
@@ -452,6 +634,20 @@ class InspectorPanelWidget(QWidget):
         self.chk_ken_burns.setChecked(getattr(config, "enable_ken_burns", True))
         self.spin_ken_burns_zoom.setValue(float(getattr(config, "ken_burns_scale_factor", 1.08)))
         self.chk_ai_color.setChecked(getattr(config, "enable_vlm_tagging", True))
+
+        # Rhythm / staged workflow
+        self.chk_rough_cut_pruning.setChecked(bool(getattr(config, "run_rough_cut_in_all", False)))
+        self.spin_long_shot.setValue(float(getattr(config, "extended_shot_threshold_sec", 12.0)))
+        self.spin_max_scene.setValue(float(getattr(config, "max_scene_len_sec", 16.0)))
+        profile = str(getattr(config, "cadence_profile", "balanced_narrative"))
+        multiples = getattr(config, "cadence_multiples", None)
+        genre = GENRE_PRESETS.get(self.selected_genre_key())
+        follows_genre = genre is not None and profile == genre.cadence_profile and (
+            multiples is None or list(multiples) == list(genre.target_bar_multiples)
+        )
+        is_default = genre is None and profile == "balanced_narrative" and multiples is None
+        cad_idx = 0 if (follows_genre or is_default) else self.combo_cadence.findData(profile)
+        self.combo_cadence.setCurrentIndex(max(cad_idx, 0))
 
         # Rough Cut Defect Pruning
         self.chk_prune_wobble.setChecked(getattr(config, "enable_head_tail_trim", True))

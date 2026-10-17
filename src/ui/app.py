@@ -55,6 +55,7 @@ def run_studio_app(dry_run: bool = False) -> int:
         window.close()
         return 0
 
+    window.enable_ui_state_persistence()
     window.show()
     return app.exec()
 

@@ -6,6 +6,7 @@ motion energy, dead-air indicators, and manual scene inclusion/exclusion control
 
 import logging
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -13,6 +14,7 @@ from PySide6.QtCore import QMetaObject, QObject, QRect, QRunnable, Qt, QThreadPo
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
@@ -32,6 +34,87 @@ from PySide6.QtWidgets import (
 from src.core.types import ScoredScene
 
 logger = logging.getLogger(__name__)
+
+
+_DEFECT_LABELS: dict[str, str] = {
+    "HEAD_TAIL_WOBBLE": "Wobble",
+    "CAMERA_SHAKE": "Shake",
+    "WHIP_PAN": "Whip-Pan",
+    "GROUND_CARRYING": "Carrying",
+    "DEFOCUS_BLUR": "Defocus",
+    "LENS_OCCLUSION": "Occlusion",
+    "EXPOSURE_CLIPPING": "Exposure",
+    "FLICKER": "Flicker",
+    "AUDIO_RUMBLE": "Rumble",
+    "MICRO_TAKE": "Micro-Take",
+}
+
+# Badge kinds in display order (also the filter combo's data values).
+BADGE_KINDS: tuple[str, ...] = ("golden", "trimmed", "long", "dead_air", "excluded")
+_BADGE_FILTER_LABELS: dict[str, str] = {
+    "golden": "🟢 Golden Take",
+    "trimmed": "🟡 Trimmed",
+    "long": "🟣 Long Shot",
+    "dead_air": "Dead-Air",
+    "excluded": "🔴 Excluded",
+}
+LONG_SHOT_BADGE_SEC = 15.0
+
+
+@dataclass(frozen=True)
+class SceneBadge:
+    """One status badge of a scene row (``kind`` is one of BADGE_KINDS)."""
+
+    kind: str
+    text: str
+    tooltip: str = ""
+
+
+def defect_label(defect_type: str) -> str:
+    """Human label of a stored defect type ("HEAD_TAIL_WOBBLE" -> "Wobble")."""
+    key = str(defect_type).upper()
+    return _DEFECT_LABELS.get(key, key.replace("_", " ").title())
+
+
+def scene_badges(scene: ScoredScene, included: bool = True) -> list[SceneBadge]:
+    """Status badges for ``scene`` derived from its metadata (``golden`` block, long-shot flag).
+
+    Pure function: golden / trimmed / long-shot come from the rough cut, dead-air from the ingest
+    detector, excluded from the review checkbox.
+    """
+    meta = scene.metadata or {}
+    golden = meta.get("golden")
+    badges: list[SceneBadge] = []
+    if isinstance(golden, dict):
+        badges.append(SceneBadge("golden", "🟢 Golden Take", "Clean take kept by the rough cut"))
+        defects = [d for d in golden.get("defects", []) if isinstance(d, dict)]
+        trimmed = float(golden.get("trimmed_sec", 0.0) or 0.0)
+        if defects or trimmed > 0.05:
+            lines = [
+                f"{defect_label(str(d.get('type', '')))} "
+                f"{float(d.get('start', 0.0)):.2f}-{float(d.get('end', 0.0)):.2f}s"
+                + (f": {d['description']}" if d.get("description") else "")
+                for d in defects
+            ]
+            if defects:
+                head = defect_label(str(defects[0].get("type", "")))
+                if len(defects) > 1:
+                    head += f" +{len(defects) - 1}"
+            else:
+                head = "Trimmed"
+            tip = f"Removed {trimmed:.1f}s of defects" + ("\n" + "\n".join(lines) if lines else "")
+            if golden.get("requires_deflicker"):
+                tip += "\nNeeds de-flicker"
+            badges.append(SceneBadge("trimmed", f"🟡 Trimmed: {head} {trimmed:.1f}s", tip))
+    if meta.get("is_long_shot"):
+        dur = float(scene.scene.duration)
+        text = "🟣 Long Shot >15s" if dur >= LONG_SHOT_BADGE_SEC else f"🟣 Long Shot {dur:.0f}s"
+        badges.append(SceneBadge("long", text, f"Long take ({dur:.1f}s): the cadence engine picks the best sub-window"))
+    if bool(meta.get("has_dead_air") or meta.get("is_dead_air") or False):
+        badges.append(SceneBadge("dead_air", "Dead-Air", "Silent or frozen footage"))
+    if not included:
+        badges.append(SceneBadge("excluded", "🔴 Excluded", "Left out of the edit (re-include with the checkbox)"))
+    return badges
 
 
 class ThumbnailWorkerSignals(QObject):
@@ -190,6 +273,15 @@ class SceneGridWidget(QWidget):
         self.chk_only_included.toggled.connect(self.filter_scenes)
         row_filters.addWidget(self.chk_only_included)
 
+        row_filters.addWidget(QLabel("Badge:"))
+        self.combo_badge_filter = QComboBox(self)
+        self.combo_badge_filter.addItem("All", "")
+        for kind in BADGE_KINDS:
+            self.combo_badge_filter.addItem(_BADGE_FILTER_LABELS[kind], kind)
+        self.combo_badge_filter.setToolTip("Show only scenes carrying this status badge")
+        self.combo_badge_filter.currentIndexChanged.connect(self.filter_scenes)
+        row_filters.addWidget(self.combo_badge_filter)
+
         self.btn_reset_filter = QPushButton("🔄 Reset Filters", self)
         self.btn_reset_filter.setObjectName("secondaryButton")
         self.btn_reset_filter.setToolTip("Reset search query and score filters")
@@ -225,7 +317,7 @@ class SceneGridWidget(QWidget):
         self.table.setColumnWidth(4, 75)
         self.table.setColumnWidth(5, 75)
         self.table.setColumnWidth(6, 75)
-        self.table.setColumnWidth(7, 85)
+        self.table.setColumnWidth(7, 150)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.verticalHeader().setDefaultSectionSize(60)
@@ -322,7 +414,10 @@ class SceneGridWidget(QWidget):
     def set_scenes(self, scenes: list[ScoredScene]) -> None:
         """Replace all scenes and asynchronously extract preview thumbnails."""
         self._scenes = list(scenes)
-        self._excluded_indices.clear()
+        # Curation travels with the scene (rough cut / saved project): metadata["included"] is False -> unchecked.
+        self._excluded_indices = {
+            i for i, sc in enumerate(self._scenes) if (sc.metadata or {}).get("included", True) is False
+        }
         self._thumbnails.clear()
         self._selected_index = None
 
@@ -522,6 +617,7 @@ class SceneGridWidget(QWidget):
         self.spin_min_score.setValue(0.0)
         self.chk_hide_dead_air.setChecked(False)
         self.chk_only_included.setChecked(False)
+        self.combo_badge_filter.setCurrentIndex(0)
         self.filter_scenes()
 
     @Slot()
@@ -531,6 +627,7 @@ class SceneGridWidget(QWidget):
         min_score = self.spin_min_score.value()
         hide_dead_air = self.chk_hide_dead_air.isChecked()
         only_included = self.chk_only_included.isChecked()
+        badge_kind = self.combo_badge_filter.currentData() or ""
 
         for row, scene in enumerate(self._scenes):
             # 1. Score threshold filter
@@ -547,6 +644,11 @@ class SceneGridWidget(QWidget):
             # 3. Inclusion status filter
             is_included = row not in self._excluded_indices
             if only_included and not is_included:
+                self.table.setRowHidden(row, True)
+                continue
+
+            # 3b. Badge filter
+            if badge_kind and badge_kind not in {b.kind for b in self.badges_for(row)}:
                 self.table.setRowHidden(row, True)
                 continue
 
@@ -639,13 +741,11 @@ class SceneGridWidget(QWidget):
         self.table.setItem(row, 6, item_motion)
 
         # Col 7: Status / Dead-Air
-        is_dead = self._is_dead_air(scene)
-        status_text = "Dead-Air" if is_dead else "Active"
-        item_status = QTableWidgetItem(status_text)
+        item_status = QTableWidgetItem()
         item_status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        item_status.setForeground(QColor("#f87171") if is_dead else QColor("#4ade80"))
         item_status.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         self.table.setItem(row, 7, item_status)
+        self._refresh_status_item(row, scene)
 
         # Col 8: VLM Semantic Tags
         vlm_summary = ""
@@ -661,6 +761,42 @@ class SceneGridWidget(QWidget):
         item_vlm = QTableWidgetItem(vlm_summary)
         item_vlm.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         self.table.setItem(row, 8, item_vlm)
+
+    def badges_for(self, row: int) -> list[SceneBadge]:
+        """Status badges of the scene at ``row`` (golden / trimmed / long shot / dead-air / excluded)."""
+        if not (0 <= row < len(self._scenes)):
+            return []
+        return scene_badges(self._scenes[row], included=row not in self._excluded_indices)
+
+    def _refresh_status_item(self, row: int, scene: ScoredScene | None = None) -> None:
+        """Re-render the Status cell: plain Active, or the badge stack when there are badges."""
+        item = self.table.item(row, 7)
+        if item is None or not (0 <= row < len(self._scenes)):
+            return
+        scene = scene or self._scenes[row]
+        badges = scene_badges(scene, included=row not in self._excluded_indices)
+        if not badges:
+            item.setText("Active")
+            item.setForeground(QColor("#4ade80"))
+            item.setToolTip("")
+            return
+        item.setText("\n".join(b.text for b in badges))
+        item.setToolTip("\n\n".join(f"{b.text}\n{b.tooltip}" if b.tooltip else b.text for b in badges))
+        kinds = {b.kind for b in badges}
+        if "excluded" in kinds or "dead_air" in kinds:
+            item.setForeground(QColor("#f87171"))
+        elif "trimmed" in kinds:
+            item.setForeground(QColor("#facc15"))
+        elif "long" in kinds:
+            item.setForeground(QColor("#c084fc"))
+        else:
+            item.setForeground(QColor("#4ade80"))
+
+    def _refresh_all_status_items(self) -> None:
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            self._refresh_status_item(row)
+        self.table.blockSignals(False)
 
     def _request_thumbnails(self) -> None:
         """Dispatch thumbnail generation tasks to global threadpool."""
@@ -850,6 +986,8 @@ class SceneGridWidget(QWidget):
         self.lbl_stats.setText(
             f"Scenes: {total} total | {included} included ({inc_duration:.1f}s) | {excluded} excluded"
         )
+        if hasattr(self, "table"):
+            self._refresh_all_status_items()
 
     @staticmethod
     def _is_dead_air(scene: ScoredScene) -> bool:

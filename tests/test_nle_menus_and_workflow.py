@@ -231,22 +231,27 @@ def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
 
 
 def test_kaizen_workflow_stepper_and_quick_buttons(isolated_studio):
-    """Verify Media -> Edit -> Deliver workflow indicator updates through lifecycle."""
+    """Verify Ingest -> Rough Cut -> Sequence -> Deliver workflow indicator updates through lifecycle."""
     window, _ = isolated_studio
 
-    # Step 1: Media active
+    # Step 1: Ingest active
     window._update_workflow_stepper(1)
-    assert "● 1. Media" in window.lbl_workflow_steps.text()
+    assert "● 1. Ingest" in window.lbl_workflow_steps.text()
 
-    # Step 2: Analysis finished -> Edit active
+    # Step 2: Rough cut finished -> Rough Cut active
     window._update_workflow_stepper(2)
-    assert "✔ 1. Media" in window.lbl_workflow_steps.text()
-    assert "● 2. Edit" in window.lbl_workflow_steps.text()
+    assert "✔ 1. Ingest" in window.lbl_workflow_steps.text()
+    assert "● 2. Rough Cut" in window.lbl_workflow_steps.text()
 
-    # Step 3: Export -> Deliver active
+    # Step 3: Sequence built -> Sequence active
     window._update_workflow_stepper(3)
-    assert "✔ 2. Edit" in window.lbl_workflow_steps.text()
-    assert "● 3. Deliver" in window.lbl_workflow_steps.text()
+    assert "✔ 2. Rough Cut" in window.lbl_workflow_steps.text()
+    assert "● 3. Sequence" in window.lbl_workflow_steps.text()
+
+    # Step 4: Export -> Deliver active
+    window._update_workflow_stepper(4)
+    assert "✔ 3. Sequence" in window.lbl_workflow_steps.text()
+    assert "● 4. Deliver" in window.lbl_workflow_steps.text()
 
     # Quick Topbar buttons
     assert window.btn_quick_open.text() == "📁 Open"

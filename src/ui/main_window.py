@@ -36,8 +36,10 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import DEFAULT_PRESET_NAME, PRESETS, PipelineConfig, check_cuda_available
-from src.core.project_io import deliver_settings_to_dict, edit_timeline_to_dict
+from src.core.genre_presets import GENRE_PRESETS
+from src.core.project_io import audio_state_to_dict, deliver_settings_to_dict, edit_timeline_to_dict
 from src.core.service import JobHandle, StudioBackendAdapter
+from src.core.stage_options import apply_genre_pacing
 from src.core.types import (
     DeliverResult,
     DeliverSettings,
@@ -55,7 +57,11 @@ from src.ui.controllers import (
     SceneToggleCommand,
     ShortcutManager,
 )
-from src.ui.controllers.project_manager import PROJECT_FILE_FILTER
+from src.ui.controllers.project_manager import (
+    DEFAULT_RECENT_PROJECTS_PATH,
+    PIPELINE_STAGES,
+    PROJECT_FILE_FILTER,
+)
 from src.ui.widgets.agent_console_dialog import AgentConsoleDialog
 from src.ui.widgets.export_dialog import ExportDialog
 from src.ui.widgets.export_panel import ExportPanelWidget, preset_label
@@ -64,9 +70,14 @@ from src.ui.widgets.media_browser import MediaBrowserWidget
 from src.ui.widgets.player_widget import PlayerWidget
 from src.ui.widgets.scene_grid import SceneGridWidget
 from src.ui.widgets.settings_dialog import PreferencesDialog
-from src.ui.widgets.timeline_view import TimelineClipItem, TimelineViewWidget
+from src.ui.widgets.timeline_view import TimelineClipItem, TimelineViewWidget, sort_variant_keys
 
 logger = logging.getLogger(__name__)
+
+# Workflow stepper (Phase 23): the four steps and the labels used in the progress banner.
+STEP_NAMES: tuple[str, ...] = ("1. Ingest", "2. Rough Cut", "3. Sequence", "4. Deliver")
+STAGE_LABELS: dict[str, str] = {"rough_cut": "Rough Cut", "sequence": "Sequence", "all": "Auto Run"}
+ROUGH_CUT_READY_MESSAGE = "Rough cut ready — review takes, then press Auto-Edit Sequence"
 
 
 class StudioMainWindow(QMainWindow):
@@ -87,6 +98,13 @@ class StudioMainWindow(QMainWindow):
         # The timeline view holds the user's live edits; Export reads them from there.
         self._edit_timelines: dict[str, EditTimeline] = {}
         self._active_timeline_key: str = "master"
+        # Staged workflow (Phase 23): where the project stands, the real soundtrack analysis and the
+        # stage of the job that is running.
+        self._pipeline_stage: str = "ingest"
+        self._audio_state: Any = None
+        self._running_stage: str | None = None
+        self._pending_existing: dict[str, EditTimeline] = {}
+        self._persist_ui_state: bool = False
 
         self._init_window()
         self._init_components()
@@ -97,6 +115,7 @@ class StudioMainWindow(QMainWindow):
         self._init_shortcuts()
         self._connect_signals()
         self._update_export_enabled()
+        self._refresh_stage_controls()
 
     def _init_window(self) -> None:
         """Configure window geometry, title, and initial attributes."""
@@ -142,6 +161,9 @@ class StudioMainWindow(QMainWindow):
             mode = insp.combo_workflow.currentData() or "standard"
             cfg.apply_workflow_mode(mode)  # restores the mode's own side effects
             insp.apply_to_config(cfg)
+            genre = insp.selected_genre_key()
+            if genre:  # pacing knobs no panel shows come from the chosen genre
+                apply_genre_pacing(cfg, genre)
             if prefs is not None:
                 cfg.enable_vlm_tagging = cfg.enable_vlm_tagging and prefs_vlm
         cfg.enable_audio_fix = prefs_audio_fix and export_audio_fix
@@ -152,10 +174,12 @@ class StudioMainWindow(QMainWindow):
         # 1. Media Browser
         self.media_browser = MediaBrowserWidget(backend_adapter=self.adapter, parent=self)
         self.media_browser.media_changed.connect(self._on_media_changed)
+        self.media_browser.footage_probed.connect(self._refresh_stage_controls)
 
         # 2. Scene Quality & Review
         self.scene_grid = SceneGridWidget(self)
         self.scene_grid.scene_toggled.connect(self._on_scene_toggled_by_user)
+        self.scene_grid.scenes_changed.connect(self._refresh_stage_controls)
 
         # 3. Multi-Track Timeline
         self.timeline_view = TimelineViewWidget(self)
@@ -685,7 +709,11 @@ class StudioMainWindow(QMainWindow):
         self.timeline_view.timeline_edited.connect(self._on_timeline_edited)
 
         # Inspector actions
-        self.inspector_panel.analyze_optimize_clicked.connect(self._on_start_pipeline)
+        self.inspector_panel.run_rough_cut_clicked.connect(self._on_run_rough_cut)
+        self.inspector_panel.run_sequence_clicked.connect(self._on_run_sequence)
+        self.inspector_panel.analyze_optimize_clicked.connect(self._on_run_full_auto)
+        self.inspector_panel.genre_changed.connect(self._on_genre_selected)
+        self.inspector_panel.combo_workflow.currentIndexChanged.connect(lambda _i: self._refresh_stage_controls())
         self.inspector_panel.open_preferences_clicked.connect(self._on_open_preferences_dialog)
 
     # --- Inter-Component Synchronization Slots ---
@@ -709,6 +737,7 @@ class StudioMainWindow(QMainWindow):
         # Presets mutate a config; keep that ONE object and push it back into the panels.
         cfg = self._build_config()
         preset.apply(cfg)
+        self.inspector_panel.set_genre(str(getattr(preset, "key", "")), emit=False)
         if hasattr(preset, "preferred_render_preset"):
             idx = self.preset_combo.findData(preset.preferred_render_preset)
             if idx >= 0:
@@ -718,6 +747,30 @@ class StudioMainWindow(QMainWindow):
         self.export_panel.load_from_config(cfg)
         self.status_bar.showMessage(f"AI Preset Applied: {getattr(preset, 'display_name', '')}", 4000)
         self._append_console(f"[AI PRESET] Applied: {getattr(preset, 'major_genre', '')} ➔ {getattr(preset, 'display_name', '')}")
+
+    @Slot(str)
+    def _on_genre_selected(self, key: str) -> None:
+        """Genre combo changed: ONE config is built, the genre's preset applied, the panels reloaded.
+
+        The canvas (ratio / resolution / fps) is kept; only pacing, cadence and look follow the genre.
+        Press "2. Auto-Edit Sequence" afterwards for a quick re-edit (no re-ingest).
+        """
+        self._set_dirty(True)
+        preset = GENRE_PRESETS.get(key)
+        if preset is not None:
+            cfg = self._build_config()
+            canvas = (cfg.preset_name, cfg.canvas_width, cfg.canvas_height, cfg.fps)
+            preset.apply(cfg)
+            cfg.preset_name, cfg.canvas_width, cfg.canvas_height, cfg.fps = canvas
+            self.inspector_panel.load_from_config(cfg)
+            self.preferences_dialog.load_from_config(cfg)
+            self.export_panel.load_from_config(cfg)
+            self.status_bar.showMessage(f"Genre: {preset.display_name} ({preset.cadence_profile})", 4000)
+            self._append_console(f"[GENRE] {preset.major_genre.value} ➔ {preset.display_name} ({preset.cadence_profile})")
+        else:
+            self.status_bar.showMessage("Genre: Auto (no preset)", 3000)
+        if self._edit_timelines:
+            self.lbl_message.setText("Genre changed - press 2. Auto-Edit Sequence to re-edit with the new rhythm")
 
     @Slot(str, object)
     def _on_timeline_variant_switched(self, variant_name: str, variant: Any) -> None:
@@ -758,7 +811,7 @@ class StudioMainWindow(QMainWindow):
     def _on_open_export_dialog(self) -> None:
         """Display Export Modal Dialog (only once an edit timeline exists)."""
         if not self._has_edit_timeline():
-            self.status_bar.showMessage("Nothing to export yet - run Analyze & Optimize first", 4000)
+            self.status_bar.showMessage("Nothing to export yet - run Rough Cut or Auto-Edit Sequence first", 4000)
             return
         self.export_panel.set_output_dir(self.media_browser.get_output_dir())
         self._refresh_deliver_panel()
@@ -953,8 +1006,9 @@ class StudioMainWindow(QMainWindow):
 
     @Slot(str, int, int)
     def _on_stage_changed(self, name: str, idx: int, total: int) -> None:
-        self.lbl_stage.setText(f"Stage {idx}/{total}: {name}")
-        self._append_console(f"\n[STAGE {idx}/{total}] {name}")
+        tag = f"[{STAGE_LABELS[self._running_stage]}] " if self._running_stage in STAGE_LABELS else ""
+        self.lbl_stage.setText(f"{tag}Stage {idx}/{total}: {name}")
+        self._append_console(f"\n{tag}[STAGE {idx}/{total}] {name}")
 
     @Slot(float, float, str)
     def _on_progress_updated(self, stage_pct: float, total_pct: float, message: str) -> None:
@@ -986,26 +1040,62 @@ class StudioMainWindow(QMainWindow):
 
     @Slot(object)
     def _on_job_finished(self, result: PipelineExecutionResult) -> None:
-        """Analysis finished: load the edit timelines. Nothing is exported until the user asks."""
+        """A stage finished: load the edit timelines. Nothing is exported until the user asks.
+
+        Rough cut -> golden takes into the review grid, Scene Review tab, ``rough_cut`` timeline active.
+        Sequence / all -> master (+ variants) active, the rough cut is kept when there is one.
+        """
         self.btn_stop.setEnabled(False)
-        if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
-            self.inspector_panel.btn_analyze.setEnabled(True)
         self._current_job = None
+        stage = getattr(result, "stage", None) or self._running_stage or "all"
+        label = STAGE_LABELS.get(stage, "Pipeline")
+        pending, self._pending_existing = self._pending_existing, {}
+        self._running_stage = None
+        self._refresh_stage_controls()
 
         if result.success:
             if result.scored_scenes:
                 self.scene_grid.set_scenes(result.scored_scenes)
-            self.lbl_stage.setText("Status: Timeline ready")
-            self.lbl_message.setText(
-                f"Timeline ready - press Export when you're happy ({result.total_duration:.1f}s, {result.clip_count} clips)"
-            )
-            self.progress_bar.setValue(100)
-            self._append_console("\n=== Analysis complete: Timeline ready ===")
-            self._append_console("Timeline ready - press Export when you're happy.")
+            for warning in getattr(result, "warnings", None) or []:
+                self._append_console(f"[WARN] {warning}")
 
-            self._edit_timelines = dict(result.edit_timelines)
+            new_timelines = dict(result.edit_timelines)
+            if stage == "sequence" and "rough_cut" not in new_timelines and "rough_cut" in pending:
+                new_timelines = {"rough_cut": pending["rough_cut"], **new_timelines}
+            self._edit_timelines = {k: new_timelines[k] for k in sort_variant_keys(new_timelines)}  # rough cut first
+
+            only_rough = bool(self._edit_timelines) and all(t.kind == "rough_cut" for t in self._edit_timelines.values())
+            rough_done = stage == "rough_cut" or only_rough
+            self._pipeline_stage = "rough_cut" if rough_done else "sequence"
+
+            audio = getattr(result, "audio_analysis", None)
+            if audio is not None:
+                self._audio_state = audio
+                self.timeline_view.set_audio_state(audio)
+
+            if rough_done:
+                self.lbl_stage.setText("Status: Rough cut ready")
+                self.lbl_message.setText(ROUGH_CUT_READY_MESSAGE)
+                self._append_console("\n=== Rough cut complete ===")
+                self._append_console(ROUGH_CUT_READY_MESSAGE)
+                self.status_bar.showMessage(ROUGH_CUT_READY_MESSAGE, 8000)
+            else:
+                self.lbl_stage.setText("Status: Timeline ready")
+                self.lbl_message.setText(
+                    f"Timeline ready - press Export when you're happy ({result.total_duration:.1f}s, {result.clip_count} clips)"
+                )
+                self._append_console("\n=== Analysis complete: Timeline ready ===")
+                self._append_console("Timeline ready - press Export when you're happy.")
+                self.status_bar.showMessage("Timeline ready - press Export when you're happy", 8000)
+            self.progress_bar.setValue(100)
+
             if self._edit_timelines:
-                key = "master" if "master" in self._edit_timelines else next(iter(self._edit_timelines))
+                if rough_done and "rough_cut" in self._edit_timelines:
+                    key = "rough_cut"
+                elif "master" in self._edit_timelines:
+                    key = "master"
+                else:
+                    key = next(iter(self._edit_timelines))
                 self._active_timeline_key = key
                 self.timeline_view.set_edit_timelines(
                     self._edit_timelines, active_key=key, tempo_bpm=result.audio_bpm
@@ -1014,30 +1104,31 @@ class StudioMainWindow(QMainWindow):
                 self.player_widget.set_duration(self._edit_timelines[key].duration or result.total_duration)
                 self._adopt_timeline_canvas(self._edit_timelines[key])
                 self._refresh_deliver_panel()
-                self._update_workflow_stepper(2)
+                self._update_workflow_stepper(PIPELINE_STAGES.index(self._pipeline_stage) + 1)
                 self._set_dirty(True)
+                if rough_done:
+                    self.tab_widget.setCurrentWidget(self.scene_grid)
             else:
                 self._append_console("[WARN] Analysis produced no edit timeline - nothing to export.")
-            self.status_bar.showMessage("Timeline ready - press Export when you're happy", 8000)
         elif getattr(result, "cancelled", False):
-            self.lbl_stage.setText("Status: Cancelled")
-            self.lbl_message.setText("Analysis cancelled.")
+            self.lbl_stage.setText(f"Status: {label} cancelled")
+            self.lbl_message.setText(f"{label} cancelled.")
             self.progress_bar.setValue(0)
-            self._append_console("\n[USER] Analysis cancelled.")
+            self._append_console(f"\n[USER] {label} cancelled.")
         else:
             self.lbl_stage.setText("Status: Failed")
             self.lbl_message.setText("Pipeline encountered an error.")
             self._append_console(f"\n[ERROR] Execution failed: {result.error_message}")
         self._update_export_enabled()
+        self._refresh_stage_controls()
 
     @Slot(object)
     def _on_deliver_finished(self, result: DeliverResult) -> None:
         """Export / preview finished: surface deliverables or load the preview proxy."""
         self.btn_stop.setEnabled(False)
-        if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
-            self.inspector_panel.btn_analyze.setEnabled(True)
         self._current_job = None
         self._update_export_enabled()
+        self._refresh_stage_controls()
 
         if getattr(result, "cancelled", False):
             self.lbl_stage.setText("Status: Export cancelled")
@@ -1064,7 +1155,8 @@ class StudioMainWindow(QMainWindow):
 
         self.export_panel.set_deliverables(result)
         self._set_dirty(True)
-        self._update_workflow_stepper(3)
+        self._pipeline_stage = "deliver"
+        self._update_workflow_stepper(4)
         self.lbl_stage.setText("Status: Export complete")
         self.lbl_message.setText("Export finished")
         self.progress_bar.setValue(100)
@@ -1117,49 +1209,139 @@ class StudioMainWindow(QMainWindow):
     def _append_console(self, text: str) -> None:
         self.console.appendPlainText(text)
 
+    # --- Staged workflow: availability, buttons, jobs ---
+
+    def _is_job_running(self) -> bool:
+        return bool(self._current_job and self._current_job.is_running())
+
+    def _stage_availability(self) -> dict[str, tuple[bool, str]]:
+        """(runnable, reason when not) for the three stage buttons.
+
+        * Rough Cut: footage only.
+        * Sequence: a soundtrack AND golden / curated scenes in the review grid or footage to ingest.
+        * Auto Run All: footage + soundtrack (the soundtrack is optional in the standalone rough-cut workflow).
+        """
+        mb = self.media_browser
+        footage_ok, footage_reason = mb.is_valid_setup(workflow_mode="rough_cut")
+        has_music = mb.get_soundtrack_path() is not None
+        music_reason = "Select a soundtrack in Media Assets."
+        wf = self.inspector_panel.combo_workflow.currentData() or "standard"
+
+        sequence: tuple[bool, str]
+        if not has_music:
+            sequence = (False, music_reason)
+        elif self.scene_grid.get_all_scenes():
+            if self.scene_grid.get_included_scenes():
+                sequence = (True, "")
+            else:
+                sequence = (False, "Every scene is excluded - include at least one take.")
+        elif footage_ok:
+            sequence = (True, "")
+        else:
+            sequence = (False, "Run Rough Cut first, or load footage.")
+
+        full: tuple[bool, str]
+        if not footage_ok:
+            full = (False, footage_reason)
+        elif not has_music and wf != "rough_cut":
+            full = (False, music_reason)
+        else:
+            full = (True, "")
+        return {"rough_cut": (footage_ok, footage_reason), "sequence": sequence, "all": full}
+
+    @Slot()
+    def _refresh_stage_controls(self) -> None:
+        """Re-evaluate the stage buttons (media, soundtrack, scenes, running job) and the time estimate."""
+        insp = getattr(self, "inspector_panel", None)
+        if insp is None or not hasattr(self, "scene_grid") or not hasattr(self, "media_browser"):
+            return
+        insp.set_stage_states(self._stage_availability(), busy=self._is_job_running())
+        total_sec, probed, total = self.media_browser.get_footage_probe_summary()
+        insp.set_rough_cut_estimate(total_sec, probed, total)
+
     @Slot()
     def _on_media_changed(self) -> None:
         self.export_panel.set_output_dir(self.media_browser.get_output_dir())
-        if self._current_job and self._current_job.is_running():
+        self._refresh_stage_controls()
+        if self._is_job_running():
             return
-        wf = self.inspector_panel.combo_workflow.currentData() if hasattr(self, "inspector_panel") else "standard"
-        is_ready, msg = self.media_browser.is_valid_setup(workflow_mode=wf or "standard")
-        if is_ready:
-            self.lbl_message.setText("Ready to run editing pipeline")
+        avail = self._stage_availability()
+        names = (("rough_cut", "Rough Cut"), ("sequence", "Auto-Edit Sequence"), ("all", "Auto Run All"))
+        runnable = [label for key, label in names if avail[key][0]]
+        if runnable:
+            self.lbl_message.setText("Ready to run: " + ", ".join(runnable))
         else:
-            self.lbl_message.setText(msg)
+            self.lbl_message.setText(avail["all"][1] or avail["rough_cut"][1])
+
+    @Slot()
+    def _on_run_rough_cut(self) -> None:
+        """1. Rough Cut: footage only, golden takes + a ``rough_cut`` timeline."""
+        self._start_pipeline_job("rough_cut")
+
+    @Slot()
+    def _on_run_sequence(self) -> None:
+        """2. Auto-Edit Sequence: reuses the reviewed scenes in the grid (no re-ingest) when there are any."""
+        self._start_pipeline_job("sequence")
+
+    @Slot()
+    def _on_run_full_auto(self) -> None:
+        """Auto Run All: rough cut (when ticked) then sequence in one go."""
+        self._start_pipeline_job("all")
 
     def _on_start_pipeline(self) -> None:
-        """Trigger asynchronous pipeline execution."""
-        if self._current_job and self._current_job.is_running():
+        """Trigger the full automatic pipeline (kept entry point: delegates to Auto Run All)."""
+        self._start_pipeline_job("all")
+
+    def _start_pipeline_job(self, stage: str) -> None:
+        """Submit an analysis job for ``stage`` (rough_cut | sequence | all). Analysis never exports."""
+        if self._is_job_running():
             QMessageBox.information(
                 self,
                 "Pipeline In Progress",
                 "An editing or rendering job is already actively running. Please wait for completion or click Stop.",
             )
             return
+        if stage not in STAGE_LABELS:
+            raise ValueError(f"Unknown stage '{stage}'")
 
-        wf = self.inspector_panel.combo_workflow.currentData() if hasattr(self, "inspector_panel") else "standard"
-        is_ready, reason = self.media_browser.is_valid_setup(workflow_mode=wf or "standard")
-        if not is_ready:
+        runnable, reason = self._stage_availability()[stage]
+        if not runnable:
             QMessageBox.warning(self, "Incomplete Project Setup", reason)
             return
 
-        preset_name = self.preset_combo.currentData()
-        self.console.clear()
-        self.scene_grid.clear_scenes()
-        self.timeline_view.clear_timeline()
-        self._append_console(f"Initiating pipeline with preset: {preset_name}")
+        label = STAGE_LABELS[stage]
+        cfg = self._build_config()
 
-        self._edit_timelines = {}
+        # Sequence re-uses the reviewed scenes (inclusion flags travel in metadata): no re-ingest.
+        scenes: list[ScoredScene] | None = None
+        existing: dict[str, EditTimeline] | None = None
+        if stage == "sequence" and self.scene_grid.get_all_scenes():
+            scenes = [
+                dataclasses.replace(sc, metadata={**(sc.metadata or {}), "included": self.scene_grid.is_scene_included(i)})
+                for i, sc in enumerate(self.scene_grid.get_all_scenes())
+            ]
+            existing = dict(self.timeline_view.get_edit_timelines() or self._edit_timelines) or None
+
+        preset_name = self.preset_combo.currentData()
+        if scenes is None:
+            self.console.clear()
+            self.scene_grid.clear_scenes()
+            self.timeline_view.clear_timeline()
+            self._edit_timelines = {}
+        self._append_console(f"[{label}] Initiating pipeline with preset: {preset_name}")
+        if scenes is not None:
+            self._append_console(
+                f"[{label}] Re-using {len(scenes)} reviewed scene(s) "
+                f"({sum(1 for sc in scenes if sc.metadata.get('included') is not False)} included) - no re-ingest"
+            )
+
+        self._running_stage = stage
+        self._pending_existing = dict(existing or {})
         self.btn_stop.setEnabled(True)
-        if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
-            self.inspector_panel.btn_analyze.setEnabled(False)
         self._update_export_enabled()
         self.progress_bar.setValue(0)
-        self.lbl_stage.setText("Status: Starting...")
+        self.lbl_stage.setText(f"Status: [{label}] Starting...")
 
-        cfg = self._build_config()
         callbacks = self.bridge.to_job_callbacks()
 
         input_dirs = self.media_browser.get_input_dirs()
@@ -1171,7 +1353,10 @@ class StudioMainWindow(QMainWindow):
             input_target = input_dirs[0]
             self._append_console(f"Source Directory: {input_target}")
         else:
-            input_target = self.media_browser.get_input_dir() or self.media_browser.get_video_files()[0].parent
+            videos = self.media_browser.get_video_files()
+            input_target = self.media_browser.get_input_dir() or (
+                videos[0].parent if videos else self.media_browser.get_output_dir()
+            )
             self._append_console(f"Source Directory: {input_target}")
 
         soundtrack = self.media_browser.get_soundtrack_path()
@@ -1193,8 +1378,12 @@ class StudioMainWindow(QMainWindow):
             run_async=True,
             no_render=True,
             export_nle=False,
+            stage=stage,
+            scenes=scenes,
+            existing_timelines=existing,
         )
         self._current_job = job
+        self._refresh_stage_controls()
 
         def _watch_job() -> None:
             job.wait()
@@ -1290,8 +1479,9 @@ class StudioMainWindow(QMainWindow):
     def _on_stop_pipeline(self) -> None:
         """Cancel ongoing pipeline job."""
         if self._current_job and self._current_job.is_running():
-            self._append_console("\n[USER] Cancellation requested. Halting worker...")
-            self.lbl_message.setText("Cancelling pipeline...")
+            label = STAGE_LABELS.get(self._running_stage or "", "pipeline")
+            self._append_console(f"\n[USER] Cancellation requested ({label}). Halting worker...")
+            self.lbl_message.setText(f"Cancelling {label}...")
             self.btn_stop.setEnabled(False)
             self.adapter.cancel_job(self._current_job.job_id)
 
@@ -1354,10 +1544,11 @@ class StudioMainWindow(QMainWindow):
         self.recent_menu.addAction(clear_action)
 
     def _update_workflow_stepper(self, step: int) -> None:
-        """Update workflow indicator (1: Media, 2: Edit, 3: Deliver)."""
-        names = ["1. Media", "2. Edit", "3. Deliver"]
+        """Update the workflow indicator (1: Ingest, 2: Rough Cut, 3: Sequence, 4: Deliver)."""
+        step = max(1, min(len(STEP_NAMES), int(step)))
+        self._workflow_step = step
         styled_parts = []
-        for i, name in enumerate(names, start=1):
+        for i, name in enumerate(STEP_NAMES, start=1):
             if i < step:
                 styled_parts.append(f"<font color='#4ade80'>✔ {name}</font>")
             elif i == step:
@@ -1381,6 +1572,9 @@ class StudioMainWindow(QMainWindow):
         self.timeline_view.clear_timeline()
         self._edit_timelines = {}
         self._active_timeline_key = "master"
+        self._pipeline_stage = "ingest"
+        self._audio_state = None
+        self.timeline_view.set_audio_state(None)
         self.player_widget.canvas.set_frame_pixmap(None)
         self.player_widget._mode = "idle"
         self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")
@@ -1392,6 +1586,7 @@ class StudioMainWindow(QMainWindow):
         self._set_dirty(False)
         self._update_workflow_stepper(1)
         self._update_export_enabled()
+        self._refresh_stage_controls()
         self._update_ai_badge()
         self._append_console("Created new blank project.")
 
@@ -1519,6 +1714,8 @@ class StudioMainWindow(QMainWindow):
             edit_timelines=edit_timelines_data,
             active_timeline_key=active_tl_key,
             deliver_settings=deliver_settings_data,
+            pipeline_stage=self._pipeline_stage if self._pipeline_stage in PIPELINE_STAGES else "ingest",
+            audio_state=audio_state_to_dict(self._audio_state),
         )
 
         ok = self.project_manager.save_project(path, project_data)
@@ -1611,6 +1808,9 @@ class StudioMainWindow(QMainWindow):
 
         # 5. Restore Edit Timelines (no re-analysis; v2.0 projects are upgraded from variants)
         restored_edit = data.get_edit_timelines()
+        self._audio_state = data.get_audio_state()  # REAL beats / bar grid for the ruler (None for old projects)
+        self.timeline_view.set_audio_state(self._audio_state)
+        self._pipeline_stage = self._derive_pipeline_stage(data, restored_edit)
         restored_variants: dict[str, Any] = {}
         self._edit_timelines = dict(restored_edit)
         if restored_edit:
@@ -1704,12 +1904,68 @@ class StudioMainWindow(QMainWindow):
         self.undo_stack.clear()
         self._set_dirty(False)
         self._update_recent_menu()
-        has_edit = bool(restored_edit or data.timeline_clips)
-        self._update_workflow_stepper(3 if data.deliverables else (2 if has_edit else 1))
+        self._update_workflow_stepper(PIPELINE_STAGES.index(self._pipeline_stage) + 1)
         self._update_export_enabled()
+        self._refresh_stage_controls()
         self._append_console(f"Opened project: {path} (Scenes: {len(restored_scenes)}, Variants: {len(restored_variants)})")
         self.status_bar.showMessage(f"Loaded project {data.project_name}", 4000)
         return True
+
+    @staticmethod
+    def _derive_pipeline_stage(data: ProjectData, edit_timelines: dict[str, EditTimeline]) -> str:
+        """Stage of an opened project: the stored one, else derived from its content (old projects)."""
+        if data.deliverables:
+            return "deliver"
+        if data.pipeline_stage in PIPELINE_STAGES and data.pipeline_stage != "ingest":
+            return data.pipeline_stage
+        if edit_timelines:
+            return "rough_cut" if all(t.kind == "rough_cut" for t in edit_timelines.values()) else "sequence"
+        if data.timeline_clips or data.timeline_variants:
+            return "sequence"
+        return "ingest"
+
+    # --- UI state between sessions (opt-in: only the real app launcher enables it) ---
+
+    @staticmethod
+    def _ui_state_path() -> Path:
+        return DEFAULT_RECENT_PROJECTS_PATH.parent / "ui_state.json"
+
+    def enable_ui_state_persistence(self) -> None:
+        """Restore (and from now on save on close) the last stage settings: pruning, cadence, genre,
+        long-shot limits and which stage tab was last in use. Tests never call this."""
+        self._persist_ui_state = True
+        try:
+            state = json.loads(self._ui_state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(state, dict):
+            return
+        insp = self.inspector_panel
+        insp.set_genre(str(state.get("genre", "")), emit=False)
+        idx = insp.combo_cadence.findData(state.get("cadence", "auto"))
+        insp.combo_cadence.setCurrentIndex(max(idx, 0))
+        insp.chk_rough_cut_pruning.setChecked(bool(state.get("rough_cut_pruning", True)))
+        insp.spin_long_shot.setValue(float(state.get("long_shot_sec", insp.spin_long_shot.value())))
+        insp.spin_max_scene.setValue(float(state.get("max_scene_sec", insp.spin_max_scene.value())))
+        if state.get("last_stage") == "rough_cut":
+            self.tab_widget.setCurrentWidget(self.scene_grid)
+
+    def _save_ui_state(self) -> None:
+        insp = self.inspector_panel
+        state = {
+            "genre": insp.selected_genre_key(),
+            "cadence": insp.combo_cadence.currentData() or "auto",
+            "rough_cut_pruning": insp.chk_rough_cut_pruning.isChecked(),
+            "long_shot_sec": insp.spin_long_shot.value(),
+            "max_scene_sec": insp.spin_max_scene.value(),
+            "last_stage": self._pipeline_stage,
+        }
+        try:
+            path = self._ui_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not save UI state: %s", exc)
 
     @Slot()
     def _on_import_media_folder(self) -> None:
@@ -1805,7 +2061,7 @@ class StudioMainWindow(QMainWindow):
     def _on_apply_scene_curation(self) -> None:
         """Re-fill timeline clips that use excluded scenes (all timelines, beat grid preserved)."""
         if not self._edit_timelines:
-            self.status_bar.showMessage("No timeline yet - run Analyze & Optimize first", 3000)
+            self.status_bar.showMessage("No timeline yet - run Rough Cut or Auto-Edit Sequence first", 3000)
             return
         excluded = self.scene_grid.get_excluded_scenes()
         if not excluded:
@@ -1912,4 +2168,6 @@ class StudioMainWindow(QMainWindow):
             logger.info("Terminating active pipeline job before closing...")
             self.adapter.cancel_job(self._current_job.job_id)
             self._current_job.wait(timeout=2.0)
+        if self._persist_ui_state:
+            self._save_ui_state()
         event.accept()

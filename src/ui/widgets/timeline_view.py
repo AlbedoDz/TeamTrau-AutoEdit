@@ -10,11 +10,23 @@ Provides an interactive visual representation of assembled video and audio seque
 """
 
 import logging
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QFont, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, Signal, Slot
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QHelpEvent,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
@@ -23,6 +35,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +44,7 @@ from src.core.types import (
     BeatMarker,
     EditClip,
     EditTimeline,
+    MusicalBarGrid,
     ScoredScene,
     SongSection,
     SongSectionType,
@@ -48,6 +62,130 @@ def format_timecode(seconds: float) -> str:
     secs = (total_ms % 60000) // 1000
     ms = total_ms % 1000
     return f"{mins:02d}:{secs:02d}.{ms:03d}"
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (unit-tested without a QApplication)
+# ---------------------------------------------------------------------------
+
+# Variant pills: canonical order (rough cut first) and icon names. Unknown keys keep "<name> (<dur>s)".
+VARIANT_PILL_NAMES: dict[str, str] = {
+    "rough_cut": "🔨 Rough Cut",
+    "master": "✨ Master",
+    "beat_driven": "⚡ Beat-Driven",
+    "cinematic": "🎬 Cinematic",
+    "social_teaser": "📱 Social Teaser",
+}
+VARIANT_ORDER: tuple[str, ...] = tuple(VARIANT_PILL_NAMES)
+
+
+def variant_pill_label(key: str, name: str, duration: float) -> str:
+    """Pill text for an edit timeline: icon + friendly name + duration."""
+    return f"{VARIANT_PILL_NAMES.get(key, name)} ({duration:.1f}s)"
+
+
+def sort_variant_keys(keys: Iterable[str]) -> list[str]:
+    """Known variants in canonical order (rough_cut first), unknown ones after, original order kept."""
+    ordered = list(keys)
+    rank = {k: i for i, k in enumerate(VARIANT_ORDER)}
+    return sorted(ordered, key=lambda k: (rank.get(k, len(rank)), ordered.index(k)))
+
+
+@dataclass(frozen=True)
+class BarLine:
+    """One bar line of the ruler. ``level`` = 1 for a plain bar, else the phrase length (2/4/8) it starts."""
+
+    time: float
+    bar_number: int  # 1-based index in the bar grid
+    level: int
+    labelled: bool
+
+
+def _median_interval(times: Sequence[float]) -> float:
+    gaps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
+    return gaps[len(gaps) // 2] if gaps else 0.0
+
+
+def compute_bar_lines(
+    grid: MusicalBarGrid | None,
+    px_per_sec: float,
+    start_t: float,
+    end_t: float,
+    *,
+    min_bar_px: float = 3.0,
+    min_label_bar_px: float = 12.0,
+    min_label_gap_px: float = 28.0,
+) -> list[BarLine]:
+    """Bar / phrase lines for the visible time range ``[start_t, end_t]`` of a ruler.
+
+    Density adapts to zoom: plain bar lines vanish when bars are closer than ``min_bar_px`` (phrase
+    lines remain while they are at least that far apart), and bar numbers are skipped entirely when
+    bars are closer than ``min_label_bar_px``. Numbers go on phrase starts (>= 4 bars, or 2-bar
+    phrases when no longer ones exist), at least ``min_label_gap_px`` apart. Only the visible slice of
+    the grid is touched (bisect), so cost does not grow with track length.
+    """
+    if grid is None or not grid.bar_times or px_per_sec <= 0:
+        return []
+    bars = grid.bar_times
+    bar_len = _median_interval(bars)
+    if bar_len <= 0:
+        return []
+    bar_px = bar_len * px_per_sec
+    level_of: dict[float, int] = {}
+    for lvl, starts in ((2, grid.phrase_2), (4, grid.phrase_4), (8, grid.phrase_8)):
+        for t in starts:
+            level_of[round(t, 3)] = max(level_of.get(round(t, 3), 1), lvl)
+    has_long = any(v >= 4 for v in level_of.values())
+    label_level = 4 if has_long else 2
+
+    lo = max(0, bisect_left(bars, start_t - bar_len) - 1)
+    hi = min(len(bars), bisect_right(bars, end_t + bar_len) + 1)
+    out: list[BarLine] = []
+    last_label_x = -1e18
+    for i in range(lo, hi):
+        t = bars[i]
+        lvl = level_of.get(round(t, 3), 1)
+        if lvl == 1 and bar_px < min_bar_px:
+            continue
+        if lvl > 1 and bar_px * lvl < min_bar_px:
+            continue
+        labelled = False
+        if bar_px >= min_label_bar_px and lvl >= label_level:
+            x = t * px_per_sec
+            if x - last_label_x >= min_label_gap_px:
+                labelled = True
+                last_label_x = x
+        out.append(BarLine(t, i + 1, lvl, labelled))
+    return out
+
+
+def lock_badge_text(snap_error_sec: float | None, fps: float) -> tuple[str, bool] | None:
+    """"downbeat lock ✔ ±N ms" badge text and whether the error is within half a frame.
+
+    ``None`` when the timeline carries no snap error (rough cuts, legacy projects).
+    """
+    if snap_error_sec is None:
+        return None
+    ms = abs(float(snap_error_sec)) * 1000.0
+    half_frame_ms = 500.0 / fps if fps > 0 else 0.0
+    ok = ms <= half_frame_ms + 0.05
+    return (f"downbeat lock {'✔' if ok else '⚠'} ±{ms:.0f} ms", ok)
+
+
+def _fmt_sec(value: float) -> str:
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def clip_sub_window_text(clip: EditClip | None, fps: float) -> str | None:
+    """"sub-window 19.2–27.2 s of 41 s" for a clip that uses only part of its source scene."""
+    if clip is None or clip.scene_start is None or clip.scene_end is None or fps <= 0:
+        return None
+    scene_len = float(clip.scene_end) - float(clip.scene_start)
+    win_len = clip.frames / fps * (clip.speed if clip.speed > 0 else 1.0)
+    if scene_len - win_len <= 0.25:
+        return None
+    a = float(clip.source_in) - float(clip.scene_start)
+    return f"sub-window {_fmt_sec(a)}–{_fmt_sec(a + win_len)} s of {_fmt_sec(scene_len)} s"
 
 
 @dataclass
@@ -90,6 +228,8 @@ class TimelineCanvas(QWidget):
         self.playhead_time: float = 0.0
         self.clips: list[TimelineClipItem] = []
         self.audio_analysis: AudioAnalysisResult | None = None
+        self.bar_grid: MusicalBarGrid | None = None  # bar / phrase lattice drawn on the ruler
+        self.fps: float = 30.0
         self.has_teaser_track: bool = False
         self.selected_clip: TimelineClipItem | None = None
         self.selected_section: SongSection | None = None
@@ -156,6 +296,7 @@ class TimelineCanvas(QWidget):
 
         # 2. Paint Timecode Ruler
         self._paint_ruler(painter, y_ruler, width, visible_start_t, visible_end_t)
+        self._paint_bar_grid(painter, y_ruler, y_a1 + self.A1_HEIGHT, visible_start_t, visible_end_t)
 
         # 3. Paint Track Grid Lines & Separators
         self._paint_track_lanes(painter, y_v2, y_v1, y_a1, width)
@@ -228,6 +369,37 @@ class TimelineCanvas(QWidget):
             time_str = f"{int(curr_t // 60):02d}:{int(curr_t % 60):02d}"
             painter.drawText(QRect(x + 3, y + 2, 45, self.RULER_HEIGHT - 4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, time_str)
             curr_t += step_sec
+
+    def _paint_bar_grid(self, painter: QPainter, y: int, y_bottom: int, start_t: float, end_t: float) -> None:
+        """Bar lines (thin) and 2/4/8-bar phrase lines (heavier) on the ruler; phrase lines >= 4 bars
+        also run faintly through the lanes. Only the visible slice of the grid is walked."""
+        lines = compute_bar_lines(self.bar_grid, self.px_per_sec, start_t, end_t)
+        if not lines:
+            return
+        font = QFont("Consolas", 7)
+        painter.setFont(font)
+        ruler_bottom = y + self.RULER_HEIGHT - 1
+        for ln in lines:
+            x = self.LEFT_MARGIN + int(ln.time * self.px_per_sec)
+            if ln.level >= 8:
+                painter.setPen(QPen(QColor("#e4e4e7"), 2))
+                top = y + 4
+            elif ln.level >= 4:
+                painter.setPen(QPen(QColor("#a1a1aa"), 2))
+                top = y + 8
+            elif ln.level >= 2:
+                painter.setPen(QPen(QColor("#71717a"), 1))
+                top = y + 12
+            else:
+                painter.setPen(QPen(QColor("#3f3f46"), 1))
+                top = y + 17
+            painter.drawLine(x, top, x, ruler_bottom)
+            if ln.level >= 4:
+                painter.setPen(QPen(QColor(255, 255, 255, 22), 1))
+                painter.drawLine(x, ruler_bottom + 1, x, y_bottom)
+            if ln.labelled:
+                painter.setPen(QColor("#fbbf24") if ln.level >= 8 else QColor("#a1a1aa"))
+                painter.drawText(x + 3, y + 10, str(ln.bar_number))
 
     def _paint_track_lanes(self, painter: QPainter, y_v2: int, y_v1: int, y_a1: int, width: int) -> None:
         """Paint horizontal grid lines separating tracks."""
@@ -322,6 +494,11 @@ class TimelineCanvas(QWidget):
                 painter.setPen(QColor("#334155"))
                 painter.drawRect(clip_rect)
 
+            # Sub-window marker: the clip is a slice of a longer scene
+            if clip.edit_clip is not None and clip.edit_clip.scene_start is not None and w > 6:
+                if clip_sub_window_text(clip.edit_clip, self.fps) is not None:
+                    painter.fillRect(QRect(clip_rect.left() + 1, clip_rect.bottom() - 3, clip_rect.width() - 2, 3), QColor("#a855f7"))
+
             # Clip Label & Duration
             painter.setPen(QColor("#f8fafc"))
             dur_str = f"({clip.duration:.1f}s)"
@@ -380,6 +557,22 @@ class TimelineCanvas(QWidget):
                     self.section_clicked.emit(clicked_sec)
                     self.update()
                     return
+
+    def clip_tooltip(self, clip: TimelineClipItem) -> str:
+        """Hover text of a clip: name, duration and (for slices of long scenes) the sub-window."""
+        text = f"{clip.name} ({clip.duration:.2f}s)"
+        sub = clip_sub_window_text(clip.edit_clip, self.fps)
+        return f"{text}\n{sub}" if sub else text
+
+    def event(self, e: QEvent) -> bool:
+        if e.type() == QEvent.Type.ToolTip and isinstance(e, QHelpEvent):
+            clip = self._find_clip_at(float(e.pos().x()), float(e.pos().y()))
+            if clip is not None:
+                QToolTip.showText(e.globalPos(), self.clip_tooltip(clip), self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().event(e)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """Update playhead position while dragging."""
@@ -467,6 +660,8 @@ class TimelineViewWidget(QWidget):
         self._edit_timelines: dict[str, EditTimeline] = {}
         self._edit_base: EditTimeline | None = None
         self._tempo_bpm: float = 0.0
+        # REAL soundtrack analysis (beats, bar grid, sections) from the last sequence run / project.
+        self._audio_state: AudioAnalysisResult | None = None
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -488,6 +683,17 @@ class TimelineViewWidget(QWidget):
         self.lbl_timecode.setFont(font_mono)
         self.lbl_timecode.setStyleSheet("color: #38bdf8;")
         ctrl_layout.addWidget(self.lbl_timecode)
+
+        self.lbl_lock_badge = QLabel("", self)
+        self.lbl_lock_badge.setStyleSheet(
+            "color: #4ade80; font-size: 11px; font-weight: bold; border: 1px solid #14532d; "
+            "border-radius: 8px; padding: 1px 8px;"
+        )
+        self.lbl_lock_badge.setToolTip(
+            "Largest distance between an ideal bar cut and the frame it was snapped to"
+        )
+        self.lbl_lock_badge.setVisible(False)
+        ctrl_layout.addWidget(self.lbl_lock_badge)
         ctrl_layout.addStretch()
 
         # Legend Pills
@@ -664,6 +870,14 @@ class TimelineViewWidget(QWidget):
         target = active_key if active_key in self._edit_timelines else next(iter(self._edit_timelines))
         self.switch_variant(target, emit_signal=False)
 
+    def set_audio_state(self, audio: AudioAnalysisResult | None) -> None:
+        """Real soundtrack analysis used for the A1 beats, sections and the ruler's bar grid.
+
+        Applies to music timelines; call before ``set_edit_timelines``. ``None`` falls back to the
+        beats synthesised from the timeline's cut points.
+        """
+        self._audio_state = audio
+
     def get_edit_timelines(self) -> dict[str, EditTimeline]:
         """Return all edit timelines, with the active one reflecting the user's current edits."""
         out = dict(self._edit_timelines)
@@ -721,6 +935,15 @@ class TimelineViewWidget(QWidget):
             cur_frames += c.frames
 
         canvas.has_teaser_track = any(c.is_teaser for c in timeline.clips)
+        canvas.fps = fps
+        is_music = timeline.kind == "music"
+        real_audio = audio_result is None and is_music and self._audio_state is not None
+        if real_audio:
+            audio_result = self._audio_state
+        canvas.bar_grid = None
+        if is_music:
+            canvas.bar_grid = timeline.bar_grid or getattr(self._audio_state, "bar_grid", None)
+        self._update_lock_badge(timeline)
         if audio_result is None:
             cuts = timeline.cut_points()
             audio_result = AudioAnalysisResult(
@@ -732,11 +955,33 @@ class TimelineViewWidget(QWidget):
                 sections=list(timeline.sections),
             )
         canvas.audio_analysis = audio_result
-        canvas.total_duration = max(timeline.duration, audio_result.duration if audio_result else 0.0)
+        canvas.total_duration = (
+            timeline.duration
+            if real_audio
+            else max(timeline.duration, audio_result.duration if audio_result else 0.0)
+        )
         canvas.playhead_time = 0.0
         self.lbl_selected_info.setText("Select a clip or musical section on the timeline to inspect metadata.")
         self._update_timecode_label()
         canvas._update_geometry_size()
+
+    def _update_lock_badge(self, timeline: EditTimeline | None) -> None:
+        """Show "downbeat lock ✔ ±N ms" for music timelines that carry a snap error."""
+        badge = None
+        if timeline is not None and timeline.kind == "music":
+            badge = lock_badge_text(timeline.cut_snap_error_max_sec, timeline.fps)
+        if badge is None:
+            self.lbl_lock_badge.setVisible(False)
+            self.lbl_lock_badge.setText("")
+            return
+        text, ok = badge
+        self.lbl_lock_badge.setText(text)
+        color, border = ("#4ade80", "#14532d") if ok else ("#facc15", "#713f12")
+        self.lbl_lock_badge.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: bold; border: 1px solid {border}; "
+            "border-radius: 8px; padding: 1px 8px;"
+        )
+        self.lbl_lock_badge.setVisible(True)
 
     def get_edit_timeline(self) -> EditTimeline:
         """Return the CURRENT edit state (after deletes / pastes) as an EditTimeline."""
@@ -772,8 +1017,9 @@ class TimelineViewWidget(QWidget):
             item = self.variant_buttons_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for k, tl in self._edit_timelines.items():
-            btn = QPushButton(f"{tl.name} ({tl.duration:.1f}s)", self)
+        for k in sort_variant_keys(self._edit_timelines):
+            tl = self._edit_timelines[k]
+            btn = QPushButton(variant_pill_label(k, tl.name, tl.duration), self)
             btn.setObjectName("secondaryButton")
             btn.setToolTip(f"Edit timeline: {k}")
             btn.clicked.connect(lambda _, key=k: self.switch_variant(key))
@@ -823,7 +1069,7 @@ class TimelineViewWidget(QWidget):
         key = self._active_variant_key
         if self._edit_base is not None and key in self._variant_buttons and key in self._edit_timelines:
             tl = self.get_edit_timeline()
-            self._variant_buttons[key].setText(f"{tl.name} ({tl.duration:.1f}s)")
+            self._variant_buttons[key].setText(variant_pill_label(key, tl.name, tl.duration))
         self.timeline_edited.emit()
 
     def get_variants(self) -> dict[str, TimelineVariant]:
@@ -930,6 +1176,8 @@ class TimelineViewWidget(QWidget):
         """Reset timeline sequence and audio tracks."""
         self.canvas.clips.clear()
         self.canvas.audio_analysis = None
+        self.canvas.bar_grid = None
+        self._update_lock_badge(None)
         self.canvas.has_teaser_track = False
         self.canvas.total_duration = 0.0
         self.canvas.playhead_time = 0.0

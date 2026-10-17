@@ -103,6 +103,7 @@ def test_analysis_never_renders_or_exports(studio):
     kwargs = adapter.submit_job.call_args.kwargs
     assert kwargs["no_render"] is True
     assert kwargs["export_nle"] is False
+    assert kwargs["stage"] == "all"  # the classic entry point is Auto Run All
     adapter.submit_deliver_job.assert_not_called()
 
 
@@ -120,7 +121,7 @@ def test_export_disabled_until_timeline_exists(studio):
     assert window.action_render_preview.isEnabled() is True
     assert window.export_dialog.btn_run_export.isEnabled() is True
     assert window.project_manager.is_dirty is True
-    assert "2. Edit" in window.lbl_workflow_steps.text()
+    assert "● 3. Sequence" in window.lbl_workflow_steps.text()  # job finished (stage all) -> step 3
     assert "Timeline ready" in window.lbl_message.text()
 
     window._on_new_project()
@@ -204,7 +205,7 @@ def test_deliver_finished_export_reports_deliverables(studio):
     fcpxml.write_text("<fcpxml/>")
     window._on_deliver_finished(DeliverResult(success=True, fcpxml_path=fcpxml, duration=4.0))
     assert "out.fcpxml" in window.export_panel.lbl_deliv_fcpxml.text()
-    assert "3. Deliver" in window.lbl_workflow_steps.text()
+    assert "● 4. Deliver" in window.lbl_workflow_steps.text()  # export finished -> step 4
     # Saving after a Deliver result must not crash (DeliverResult has no clip_count)
     assert window._do_save(tmp_path / "p.tteproj") is True
 

@@ -62,6 +62,7 @@ class MediaBrowserWidget(QWidget):
     media_changed = Signal()
     video_selected = Signal(object)
     preset_recommended = Signal(object)
+    footage_probed = Signal()  # a probe finished: total footage duration changed
 
     def __init__(
         self,
@@ -481,6 +482,7 @@ class MediaBrowserWidget(QWidget):
             self.table.setItem(idx, 6, QTableWidgetItem(str(meta.total_frames)))
             self.table.setItem(idx, 7, QTableWidgetItem(meta.codec))
         self._update_status()
+        self.footage_probed.emit()
 
     @Slot(str, str)
     def _on_probe_failed(self, path_str: str, err: str) -> None:
@@ -547,6 +549,11 @@ class MediaBrowserWidget(QWidget):
     # -------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------
+    def get_footage_probe_summary(self) -> tuple[float, int, int]:
+        """(total probed seconds, probed clip count, total clip count) - cheap, no new probing."""
+        probed = [self._probed_metadata[f].duration for f in self._video_files if f in self._probed_metadata]
+        return float(sum(probed)), len(probed), len(self._video_files)
+
     def get_input_dir(self) -> Path | None:
         text = self.edit_input_dir.text().strip()
         return Path(text) if text and Path(text).is_dir() else None

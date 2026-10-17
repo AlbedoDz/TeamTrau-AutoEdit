@@ -42,3 +42,26 @@ def apply_staged_options(
         cfg.cadence_multiples = None
     if rough_cut is not None:
         cfg.run_rough_cut_in_all = bool(rough_cut)
+
+
+# Pacing knobs of a genre that no GUI panel exposes: the GUI re-applies them from the chosen genre
+# whenever it builds a config (the panel-backed ones - speed ramp, teaser, reframing, ... - are reloaded
+# into their panels when the genre is picked).
+GENRE_PACING_FIELDS: Final[tuple[str, ...]] = (
+    "min_scene_len_sec",
+    "min_beat_interval",
+    "standard_min_beat_interval",
+    "climax_min_beat_interval",
+    "min_speed_multiplier",
+    "action_drop_threshold",
+)
+
+
+def apply_genre_pacing(cfg: PipelineConfig, genre: str) -> None:
+    """Copy only the panel-less pacing fields of preset ``genre`` into ``cfg`` (unknown key: ``ValueError``)."""
+    key = genre.strip()
+    if key not in GENRE_KEYS:
+        raise ValueError(f"Unknown genre '{genre}'. Available: {', '.join(GENRE_KEYS)}")
+    preset = ROUGH_CUT_PRESET if key == ROUGH_CUT_PRESET.key else GENRE_PRESETS[key]
+    for name in GENRE_PACING_FIELDS:
+        setattr(cfg, name, getattr(preset, name))
