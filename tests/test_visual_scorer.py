@@ -127,3 +127,80 @@ def test_deduplicate_scenes():
     assert s2 not in deduped
     assert s3 in deduped
 
+
+
+def _scorer_no_gpu(cfg):
+    s = VisualScorer(cfg)
+    s._torch_model = None  # deterministic OpenCV path
+    return s
+
+
+def test_deduplicate_matches_reference_hamming():
+    import random
+
+    from src.core.types import ScoredScene
+    from src.modules.visual_scorer import hamming_distance
+
+    rng = random.Random(1)
+    cfg = PipelineConfig(duplicate_hash_threshold=6)
+    scorer = _scorer_no_gpu(cfg)
+    scenes = []
+    for i in range(60):
+        h = f"{rng.getrandbits(64):016x}"
+        sc = ScoredScene(SceneCut(Path(f"c{i}.mp4"), 0, 1, 0, 30, 1.0), 1.0, 1.0, 1.0 - i / 100)
+        sc.metadata["dhash"] = h
+        scenes.append(sc)
+    # near-duplicates of the first few
+    for i in range(5):
+        base = int(scenes[i].metadata["dhash"], 16) ^ 5
+        sc = ScoredScene(SceneCut(Path(f"d{i}.mp4"), 0, 1, 0, 30, 1.0), 1.0, 1.0, 0.1)
+        sc.metadata["dhash"] = f"{base:016x}"
+        scenes.append(sc)
+
+    expected = []
+    for cand in scenes:
+        if not any(hamming_distance(cand.metadata["dhash"], k.metadata["dhash"]) <= 6 for k in expected):
+            expected.append(cand)
+    assert scorer.deduplicate_scenes(scenes) == expected
+
+
+def test_batch_aesthetic_matches_single_on_cpu_path():
+    scorer = _scorer_no_gpu(PipelineConfig())
+    imgs = [np.random.randint(0, 255, (90, 160, 3), dtype=np.uint8) for _ in range(5)]
+    assert scorer._compute_aesthetic_batch(imgs) == [scorer._compute_aesthetic_opencv(i) for i in imgs]
+    assert scorer._compute_aesthetic_batch([]) == []
+
+
+def test_scores_come_from_keyframe_store_and_disk_cache(tmp_path):
+    from src.modules import keyframe_cache as kc
+
+    clip = tmp_path / "clip.mp4"
+    out = cv2.VideoWriter(str(clip), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (640, 360))
+    rng = np.random.default_rng(0)
+    for _ in range(90):
+        out.write(rng.integers(0, 255, (360, 640, 3), dtype=np.uint8))
+    out.release()
+
+    cfg = PipelineConfig(cache_dir=tmp_path / "cache", enable_deduplication=False)
+    scene = SceneCut(clip, 0.0, 3.0, 0, 90, 3.0)
+    store = kc.extract_keyframes(kc.build_requests([scene], cfg), cfg)
+
+    first = _scorer_no_gpu(cfg).score_and_rank_scenes([scene], keyframes=store)
+    assert first[0].metadata["keyframes_sampled"] == cfg.keyframes_per_scene
+
+    # Second pass: results must come from disk, so neither frames nor decoding are touched.
+    second_scorer = _scorer_no_gpu(cfg)
+
+    def boom(*a, **k):
+        raise AssertionError("frames were read despite a cache hit")
+
+    second_scorer._extract_keyframes = boom  # type: ignore[method-assign]
+    second = second_scorer.score_and_rank_scenes([scene], keyframes=kc.KeyframeStore())
+    assert second[0].sharpness_score == first[0].sharpness_score
+    assert second[0].metadata["dhash"] == first[0].metadata["dhash"]
+
+    # enable_cache=False must bypass the stored entry.
+    nocache = _scorer_no_gpu(cfg.model_copy(update={"enable_cache": False}))
+    nocache._extract_keyframes = lambda *a, **k: []  # type: ignore[method-assign]
+    res = nocache.score_and_rank_scenes([scene], keyframes=kc.KeyframeStore())
+    assert res[0].sharpness_score == 0.0

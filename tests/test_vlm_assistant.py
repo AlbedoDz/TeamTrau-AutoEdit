@@ -171,3 +171,31 @@ def test_vlm_mock_openai_client_api_error_fallback():
     assert analysis.mood == "calm"
     assert "low_key" in analysis.tags
     assert analysis.confidence == 0.60
+
+
+def test_vlm_real_answers_cached_and_keyframes_used(tmp_path: Path):
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"not-a-video")
+    cfg = PipelineConfig(enable_vlm_tagging=True, vlm_provider="heuristic", cache_dir=tmp_path / "c")
+    vlm = VLMAssistant(cfg)
+    vlm.client = MagicMock()  # pretend a real endpoint is configured
+    vlm.provider = "custom"
+    reply = MagicMock()
+    reply.choices = [MagicMock()]
+    reply.choices[0].message.content = '{"description": "a dog", "tags": ["Dog"], "mood": "joyful",' \
+        ' "suggested_pacing": "fast", "is_key_moment": false}'
+    vlm.client.chat.completions.create.return_value = reply
+
+    def scenes():
+        return [ScoredScene(SceneCut(clip, 0.0, 2.0, 0, 60, 2.0), 0.5, 0.5, 0.5)]
+
+    frame = np.full((90, 160, 3), 100, dtype=np.uint8)
+    out = vlm.tag_scored_scenes(scenes(), keyframes={0: frame})
+    assert out[0].metadata["vlm_tags"] == ["dog"]
+    assert vlm.client.chat.completions.create.call_count == 1
+
+    vlm.client.chat.completions.create.reset_mock()
+    again = vlm.tag_scored_scenes(scenes(), keyframes={0: frame})
+    assert vlm.client.chat.completions.create.call_count == 0  # served from disk cache
+    assert again[0].metadata["vlm_tags"] == ["dog"]
+    assert again[0].metadata["vlm_mood"] == "joyful"

@@ -126,3 +126,27 @@ def test_concat_command_mixes_soundtrack_and_copies_video():
     graph = cmd[cmd.index("-filter_complex") + 1]
     assert "amix=inputs=2" in graph
     assert cmd[cmd.index("-f", cmd.index("-t")) + 1] == "mp4"
+
+
+def test_default_nvenc_preset_is_p5_and_p7_selectable():
+    assert PipelineConfig().nvenc_preset == "p5"
+    _, args = NvencRenderer(PipelineConfig(nvenc_preset="p7")).encoder_args(use_nvenc=True)
+    assert args[args.index("-preset") + 1] == "p7"
+
+
+def _one_segment(sample_scenes):
+    cfg = PipelineConfig(fps=30.0, enable_teaser=False)
+    seg = NvencRenderer(cfg).build_segments(sample_scenes, [0.0, 2.0])[0]
+    return cfg, seg
+
+
+def test_hwdecode_flag_only_on_nvenc_path(sample_scenes):
+    cfg, seg = _one_segment(sample_scenes)
+    r = NvencRenderer(cfg)
+    hw = r.build_segment_command("ffmpeg", seg, Path("o.mkv"), True, False, hwdecode=True)
+    assert hw[hw.index("-hwaccel") + 1] == "cuda"
+    # Frames must stay in system memory: CPU filters (zoompan/overlay/...) rely on it.
+    assert "-hwaccel_output_format" not in hw
+    assert hw.index("-hwaccel") < hw.index("-i")
+    assert "-hwaccel" not in r.build_segment_command("ffmpeg", seg, Path("o.mkv"), True, False)
+    assert "-hwaccel" not in r.build_segment_command("ffmpeg", seg, Path("o.mkv"), False, False, hwdecode=True)

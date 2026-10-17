@@ -278,8 +278,9 @@ class PipelineConfig(BaseModel):
     mcp_port: int = Field(default=8000)
 
     # NVENC Render Settings
-    nvenc_preset: str = Field(default="p7")
+    nvenc_preset: str = Field(default="p5")  # p7 = slowest/best; p5 is ~2x faster at near-identical quality
     nvenc_cq: int = Field(default=18)
+    nvenc_hwdecode: bool = Field(default=True)  # NVDEC (-hwaccel cuda); frames stay in system memory
     nvenc_bitrate: str = Field(default="60M")
     nvenc_maxrate: str = Field(default="80M")
     nvenc_bufsize: str = Field(default="120M")

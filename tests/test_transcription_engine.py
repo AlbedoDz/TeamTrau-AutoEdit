@@ -143,3 +143,28 @@ def test_get_ducking_intervals_merges_overlapping():
     assert intervals[0][1] == pytest.approx(3.8, abs=0.01)
     assert intervals[1][0] == pytest.approx(7.8, abs=0.01)
     assert intervals[1][1] == pytest.approx(9.3, abs=0.01)
+
+
+def test_transcript_is_cached_on_disk(tmp_path: Path, mock_whisper_model):
+    media = tmp_path / "talk.wav"
+    media.write_bytes(b"RIFFfake")
+    cfg = PipelineConfig(enable_transcription=True, cache_dir=tmp_path / "cache")
+
+    first = TranscriptionEngine(cfg, model=mock_whisper_model).transcribe_file(media)
+    assert len(first) == 2 and mock_whisper_model.transcribe.call_count == 1
+
+    mock_whisper_model.transcribe.reset_mock()
+    second = TranscriptionEngine(cfg, model=mock_whisper_model).transcribe_file(media)
+    assert mock_whisper_model.transcribe.call_count == 0
+    assert second == first  # frozen dataclasses compare by value, words included
+
+    # Touching the file (new mtime/size) invalidates the entry.
+    media.write_bytes(b"RIFFfake-changed")
+    TranscriptionEngine(cfg, model=mock_whisper_model).transcribe_file(media)
+    assert mock_whisper_model.transcribe.call_count == 1
+
+    # enable_cache=False never reads or writes.
+    mock_whisper_model.transcribe.reset_mock()
+    off = cfg.model_copy(update={"enable_cache": False})
+    TranscriptionEngine(off, model=mock_whisper_model).transcribe_file(media)
+    assert mock_whisper_model.transcribe.call_count == 1

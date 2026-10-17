@@ -5,10 +5,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
+from bisect import bisect_left
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
@@ -213,9 +215,14 @@ class IngestDetector:
             tmp_path.unlink(missing_ok=True)
         return output_path
 
-    def detect_scenes(self, video_path: Path) -> list[SceneCut]:
-        """Detect camera shot boundaries non-destructively using PySceneDetect."""
-        metadata = self.probe_video(video_path)
+    def detect_scenes(
+        self, video_path: Path, metadata: VideoMetadata | None = None
+    ) -> list[SceneCut]:
+        """Detect camera shot boundaries non-destructively using PySceneDetect.
+
+        ``metadata`` (already probed) avoids a redundant ffprobe call.
+        """
+        metadata = metadata or self.probe_video(video_path)
         min_scene_len_frames = max(1, int(self.config.min_scene_len_sec * metadata.fps))
 
         video = open_video(str(video_path))
@@ -266,86 +273,102 @@ class IngestDetector:
         logger.info("Detected %d scenes in %s", len(cuts), video_path.name)
         return cuts
 
+    @staticmethod
+    def _parse_ranges(stderr: str, kind: str) -> list[tuple[float, float]]:
+        """Parse ``{kind}_start`` / ``{kind}_end`` markers from ffmpeg filter stderr."""
+        start_tag, end_tag = f"{kind}_start:", f"{kind}_end:"
+        ranges: list[tuple[float, float]] = []
+        current_start: float | None = None
+        for line in stderr.splitlines():
+            if start_tag in line:
+                try:
+                    current_start = float(line.split(start_tag)[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    current_start = None
+            elif end_tag in line and current_start is not None:
+                try:
+                    end_val = float(line.split(end_tag)[1].strip().split()[0])
+                    ranges.append((current_start, end_val))
+                except (ValueError, IndexError):
+                    pass
+                current_start = None
+        if current_start is not None and kind == "freeze":
+            # freezedetect emits no freeze_end when the clip ends while frozen: close the
+            # interval at the last decoded timestamp from ffmpeg's progress output.
+            matches = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+            if matches:
+                h, m, sec = matches[-1]
+                end_val = int(h) * 3600 + int(m) * 60 + float(sec)
+                if end_val > current_start:
+                    ranges.append((current_start, end_val))
+        return ranges
+
+    def _silence_filter(self) -> str:
+        return f"silencedetect=noise={self.config.silence_threshold_db}dB:d={self.config.dead_air_min_duration}"
+
+    def _freeze_filter(self) -> str:
+        return f"scale=320:-2,freezedetect=n={self.config.freeze_threshold}:d={self.config.dead_air_min_duration}"
+
+    def detect_dead_air_ranges(
+        self,
+        video_path: Path,
+        has_audio: bool | None = None,
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Detect silence AND freeze intervals in ONE ffmpeg decode pass.
+
+        Returns ``(silence_ranges, freeze_ranges)``. When the file has no audio stream the
+        audio filter is omitted (silence is then empty).
+        """
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return [], []
+        if has_audio is None:
+            from src.core.ffmpeg_utils import has_audio_stream
+
+            has_audio = has_audio_stream(video_path)
+
+        cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_path)]
+        if has_audio:
+            cmd += ["-af", self._silence_filter()]
+        else:
+            cmd += ["-an"]
+        cmd += ["-vf", self._freeze_filter(), "-f", "null", "-"]
+        try:
+            res = run_tool(cmd)
+        except (subprocess.SubprocessError, OSError):
+            return [], []
+        stderr = res.stderr or ""
+        return self._parse_ranges(stderr, "silence"), self._parse_ranges(stderr, "freeze")
+
     def detect_silence_ranges(self, video_path: Path) -> list[tuple[float, float]]:
         """Detect audio silence intervals using FFmpeg silencedetect filter."""
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
             return []
-
         cmd = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-nostdin",
-            "-i",
-            str(video_path),
-            "-vn",
-            "-af",
-            f"silencedetect=noise={self.config.silence_threshold_db}dB:d={self.config.dead_air_min_duration}",
-            "-f",
-            "null",
-            "-",
-        ]
+            ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_path),
+            "-vn", "-af", self._silence_filter(), "-f", "null", "-",
+        ]  # fmt: skip
         try:
             res = run_tool(cmd)
         except (subprocess.SubprocessError, OSError):
             return []
-
-        ranges: list[tuple[float, float]] = []
-        current_start: float | None = None
-        for line in (res.stderr or "").splitlines():
-            if "silence_start:" in line:
-                try:
-                    current_start = float(line.split("silence_start:")[1].strip().split()[0])
-                except (ValueError, IndexError):
-                    current_start = None
-            elif "silence_end:" in line and current_start is not None:
-                try:
-                    end_val = float(line.split("silence_end:")[1].strip().split()[0])
-                    ranges.append((current_start, end_val))
-                except (ValueError, IndexError):
-                    pass
-                current_start = None
-        return ranges
+        return self._parse_ranges(res.stderr or "", "silence")
 
     def detect_freeze_ranges(self, video_path: Path) -> list[tuple[float, float]]:
         """Detect visually static/frozen intervals using FFmpeg freezedetect filter."""
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
             return []
-
         cmd = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-i",
-            str(video_path),
-            "-an",
-            "-vf",
-            f"scale=320:-2,freezedetect=n={self.config.freeze_threshold}:d={self.config.dead_air_min_duration}",
-            "-f",
-            "null",
-            "-",
-        ]
+            ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_path),
+            "-an", "-vf", self._freeze_filter(), "-f", "null", "-",
+        ]  # fmt: skip
         try:
             res = run_tool(cmd)
         except (subprocess.SubprocessError, OSError):
             return []
-
-        ranges: list[tuple[float, float]] = []
-        current_start: float | None = None
-        for line in (res.stderr or "").splitlines():
-            if "freeze_start:" in line:
-                try:
-                    current_start = float(line.split("freeze_start:")[1].strip().split()[0])
-                except (ValueError, IndexError):
-                    current_start = None
-            elif "freeze_end:" in line and current_start is not None:
-                try:
-                    end_val = float(line.split("freeze_end:")[1].strip().split()[0])
-                    ranges.append((current_start, end_val))
-                except (ValueError, IndexError):
-                    pass
-                current_start = None
-        return ranges
+        return self._parse_ranges(res.stderr or "", "freeze")
 
     def find_dead_air_intervals(
         self,
@@ -357,17 +380,24 @@ class IngestDetector:
             return []
 
         dead_air: list[tuple[float, float]] = []
-        for s_start, s_end in silence_ranges:
-            for f_start, f_end in freeze_ranges:
-                overlap_start = max(s_start, f_start)
-                overlap_end = min(s_end, f_end)
-                if overlap_end > overlap_start:
-                    dur = overlap_end - overlap_start
-                    if dur >= self.config.dead_air_min_duration:
-                        dead_air.append((overlap_start, overlap_end))
+        sil = sorted(silence_ranges)
+        frz = sorted(freeze_ranges)
+        i = j = 0
+        while i < len(sil) and j < len(frz):
+            overlap_start = max(sil[i][0], frz[j][0])
+            overlap_end = min(sil[i][1], frz[j][1])
+            if overlap_end > overlap_start and overlap_end - overlap_start >= self.config.dead_air_min_duration:
+                dead_air.append((overlap_start, overlap_end))
+            # Advance whichever interval ends first.
+            if sil[i][1] <= frz[j][1]:
+                i += 1
+            else:
+                j += 1
         return dead_air
 
-    def analyze_activity(self, video_path: Path) -> list[ActiveSegment]:
+    def analyze_activity(
+        self, video_path: Path, metadata: VideoMetadata | None = None
+    ) -> list[ActiveSegment]:
         """Evaluate motion activity to prune static sections.
 
         Attempts Auto-Editor CLI first; falls back to native OpenCV frame-difference analysis.
@@ -382,7 +412,7 @@ class IngestDetector:
                     exc,
                 )
 
-        return self._analyze_activity_opencv(video_path)
+        return self._analyze_activity_opencv(video_path, metadata=metadata)
 
     def _analyze_activity_auto_editor(
         self, video_path: Path, executable: str
@@ -437,10 +467,18 @@ class IngestDetector:
         return self._analyze_activity_opencv(video_path)
 
     def _analyze_activity_opencv(
-        self, video_path: Path, sample_interval_sec: float = 0.5
+        self,
+        video_path: Path,
+        sample_interval_sec: float = 0.5,
+        metadata: VideoMetadata | None = None,
     ) -> list[ActiveSegment]:
-        """Compute inter-frame motion scores via frame-difference luminance variance."""
-        metadata = self.probe_video(video_path)
+        """Compute inter-frame motion scores via frame-difference luminance variance.
+
+        Reads the stream sequentially with ``grab()`` (cheap, no colour conversion) and only
+        ``retrieve()``s the sampled frames - random ``CAP_PROP_POS_FRAMES`` seeks re-decode
+        from the previous keyframe every time and were ~5x slower on long-GOP footage.
+        """
+        metadata = metadata or self.probe_video(video_path)
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             return [
@@ -458,42 +496,39 @@ class IngestDetector:
         frame_idx = 0
 
         while frame_idx < metadata.total_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            if not cap.grab():
                 break
+            if frame_idx % step_frames == 0:
+                ret, frame = cap.retrieve()
+                if ret and frame is not None:
+                    # Downsample for ultra-fast motion estimation
+                    small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
+                    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
-            # Downsample for ultra-fast motion estimation
-            small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                    start_t = frame_idx / metadata.fps
+                    end_t = min(metadata.duration, (frame_idx + step_frames) / metadata.fps)
 
-            start_t = frame_idx / metadata.fps
-            end_t = min(metadata.duration, (frame_idx + step_frames) / metadata.fps)
-
-            if prev_gray is not None:
-                diff = cv2.absdiff(gray, prev_gray)
-                mean_diff = float(diff.mean()) / 255.0
-                is_active = mean_diff >= self.config.auto_editor_motion_threshold
-                segments.append(
-                    ActiveSegment(
-                        start_time=start_t,
-                        end_time=end_t,
-                        motion_score=mean_diff,
-                        is_active=is_active,
-                    )
-                )
-            else:
-                segments.append(
-                    ActiveSegment(
-                        start_time=start_t,
-                        end_time=end_t,
-                        motion_score=1.0,
-                        is_active=True,
-                    )
-                )
-
-            prev_gray = gray
-            frame_idx += step_frames
+                    if prev_gray is not None:
+                        mean_diff = float(cv2.absdiff(gray, prev_gray).mean()) / 255.0
+                        segments.append(
+                            ActiveSegment(
+                                start_time=start_t,
+                                end_time=end_t,
+                                motion_score=mean_diff,
+                                is_active=mean_diff >= self.config.auto_editor_motion_threshold,
+                            )
+                        )
+                    else:
+                        segments.append(
+                            ActiveSegment(
+                                start_time=start_t,
+                                end_time=end_t,
+                                motion_score=1.0,
+                                is_active=True,
+                            )
+                        )
+                    prev_gray = gray
+            frame_idx += 1
 
         cap.release()
 
@@ -519,16 +554,32 @@ class IngestDetector:
         if not scenes:
             return []
 
+        dead_sorted = sorted(dead_air_intervals or [])
+        active_sorted = sorted(
+            (seg.start_time, seg.end_time) for seg in activity_segments if seg.is_active
+        )
+
+        def _overlap_total(intervals: list[tuple[float, float]], start: float, end: float) -> float:
+            """Total overlap of sorted intervals with [start, end] (bisect to the first candidate)."""
+            total = 0.0
+            lo = bisect_left(intervals, (start, float("-inf")))
+            # The interval just before ``lo`` may still straddle ``start``.
+            if lo > 0:
+                lo -= 1
+            for k in range(lo, len(intervals)):
+                i_start, i_end = intervals[k]
+                if i_start >= end:
+                    break
+                ov = min(end, i_end) - max(start, i_start)
+                if ov > 0:
+                    total += ov
+            return total
+
         filtered: list[SceneCut] = []
         for scene in scenes:
             # Check dead-air overlap (simultaneous audio silence + video freeze)
-            if dead_air_intervals and scene.duration > 0:
-                dead_overlap = 0.0
-                for d_start, d_end in dead_air_intervals:
-                    overlap_start = max(scene.start_time, d_start)
-                    overlap_end = min(scene.end_time, d_end)
-                    if overlap_end > overlap_start:
-                        dead_overlap += overlap_end - overlap_start
+            if dead_sorted and scene.duration > 0:
+                dead_overlap = _overlap_total(dead_sorted, scene.start_time, scene.end_time)
                 if (dead_overlap / scene.duration) >= 0.5:
                     logger.debug(
                         "Pruning dead-air scene: %s [%.2f - %.2f] (dead-air ratio: %.2f)",
@@ -541,14 +592,7 @@ class IngestDetector:
 
             # Check overlap with active segments
             if activity_segments:
-                active_duration = 0.0
-                for seg in activity_segments:
-                    if not seg.is_active:
-                        continue
-                    overlap_start = max(scene.start_time, seg.start_time)
-                    overlap_end = min(scene.end_time, seg.end_time)
-                    if overlap_end > overlap_start:
-                        active_duration += overlap_end - overlap_start
+                active_duration = _overlap_total(active_sorted, scene.start_time, scene.end_time)
 
                 # If at least 25% of the scene has active motion, keep it
                 activity_ratio = active_duration / scene.duration if scene.duration > 0 else 1.0
@@ -693,37 +737,46 @@ class IngestDetector:
         self,
         video_path: Path,
         cancel_event: threading.Event | None = None,
+        metadata: VideoMetadata | None = None,
     ) -> list[SceneCut]:
-        """Detect scenes and prune activity for a single video with caching."""
+        """Detect scenes and prune activity for a single video with caching.
+
+        ``metadata`` is the already-probed ``VideoMetadata`` for ``video_path`` (e.g. from the
+        service's VFR pre-pass); it spares a repeated ffprobe per processing step.
+        """
         if cancel_event and cancel_event.is_set():
             return []
 
         if getattr(self.config, "auto_normalize_vfr", True):
             try:
-                meta = self.probe_video(video_path)
-                if meta.is_vfr:
+                metadata = metadata or self.probe_video(video_path)
+                if metadata.is_vfr:
                     video_path = self.normalize_to_cfr(video_path, target_fps=self.config.fps)
+                    metadata = None  # the normalised file differs from the probed one
             except Exception as e:
                 logger.warning("Auto CFR normalization check failed for %s: %s", video_path.name, e)
+                metadata = None
 
         cache_file = self._get_cache_path(video_path)
         cached = self._load_cached_scenes(cache_file, video_path)
         if cached is not None:
             return cached
 
+        metadata = metadata or self.probe_video(video_path)
+
         # Full pipeline for single video
-        raw_scenes = self.detect_scenes(video_path)
+        raw_scenes = self.detect_scenes(video_path, metadata=metadata)
         if cancel_event and cancel_event.is_set():
             return []
 
-        activity = self.analyze_activity(video_path)
+        activity = self.analyze_activity(video_path, metadata=metadata)
         if cancel_event and cancel_event.is_set():
             return []
 
         dead_air: list[tuple[float, float]] = []
-        if self.config.enable_dead_air_detection:
-            silence_ranges = self.detect_silence_ranges(video_path)
-            freeze_ranges = self.detect_freeze_ranges(video_path)
+        if self.config.enable_dead_air_detection and metadata.has_audio:
+            # Dead air needs silence AND freeze: skip the pass for audio-less clips.
+            silence_ranges, freeze_ranges = self.detect_dead_air_ranges(video_path, has_audio=True)
             dead_air = self.find_dead_air_intervals(silence_ranges, freeze_ranges)
 
         final_scenes = self.filter_scenes_by_activity(raw_scenes, activity, dead_air)
@@ -731,13 +784,28 @@ class IngestDetector:
         self._save_cached_scenes(cache_file, final_scenes)
         return final_scenes
 
+    def _process_with_metadata(
+        self,
+        vp: Path,
+        cancel_event: threading.Event | None,
+        metadata_map: dict[Path, VideoMetadata] | None,
+    ) -> list[SceneCut]:
+        meta = (metadata_map or {}).get(vp)
+        if meta is None:
+            return self.process_single_video(vp, cancel_event)
+        return self.process_single_video(vp, cancel_event, metadata=meta)
+
     def batch_process_videos(
         self,
         video_paths: list[Path],
         progress_callback: Callable[[float, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        metadata_map: dict[Path, VideoMetadata] | None = None,
     ) -> list[SceneCut]:
-        """Process multiple videos concurrently using thread pool workers."""
+        """Process multiple videos concurrently using thread pool workers.
+
+        ``metadata_map`` optionally supplies already-probed metadata keyed by path.
+        """
         if not video_paths:
             return []
 
@@ -758,7 +826,7 @@ class IngestDetector:
         executor = ThreadPoolExecutor(max_workers=workers)
         try:
             future_to_path = {
-                executor.submit(self.process_single_video, vp, cancel_event): vp
+                executor.submit(self._process_with_metadata, vp, cancel_event, metadata_map): vp
                 for vp in video_paths
             }
             for future in as_completed(future_to_path):

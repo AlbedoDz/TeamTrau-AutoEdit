@@ -5,6 +5,7 @@ with an automated heuristic fallback (zero direct heavy weights).
 """
 
 import base64
+import dataclasses
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig
 from src.core.types import SceneVLMAnalysis, ScoredScene
 
@@ -354,7 +356,35 @@ class VLMAssistant:
         max_workers = concurrency or getattr(self.config, "vlm_concurrency", 4)
         max_workers = max(1, min(max_workers, len(scenes)))
 
+        # Real-model answers are cached per clip (heuristic output is cheap and score-derived).
+        cache = AnalysisCache(self.config)
+        use_cache = self.client is not None and cache.enabled
+        cache_entries: dict[Path, tuple[str | None, dict[str, Any]]] = {}
+        if use_cache:
+            for sc in scenes:
+                path = sc.scene.clip_path
+                if path not in cache_entries:
+                    key = cache.make_key(
+                        path,
+                        provider=self.provider,
+                        model=self.model,
+                        temp=self.config.vlm_temperature,
+                        prompt="v1",
+                    )
+                    cache_entries[path] = (key, cache.load("vlm", path, key) or {})
+
+        def _cached(sc: ScoredScene) -> dict[str, Any] | None:
+            if not use_cache:
+                return None
+            return cache_entries[sc.scene.clip_path][1].get(scene_key(sc.scene.start_time, sc.scene.end_time))
+
         def _process_single(scene_idx: int, sc: ScoredScene) -> tuple[int, SceneVLMAnalysis]:
+            hit = _cached(sc)
+            if hit:
+                try:
+                    return scene_idx, SceneVLMAnalysis(**{**hit, "scene_index": scene_idx})
+                except TypeError:
+                    pass
             frame = keyframes.get(scene_idx)
             if frame is None and sc.scene.clip_path:
                 mid_t = (sc.scene.start_time + sc.scene.end_time) / 2.0
@@ -395,6 +425,21 @@ class VLMAssistant:
                         duration=sc.scene.duration,
                         frame=keyframes.get(idx),
                     )
+
+        if use_cache:
+            dirty: set[Path] = set()
+            for scene_idx, sc in enumerate(scenes):
+                an = results_map.get(scene_idx)
+                # Persist only genuine model answers, never heuristic fallbacks.
+                if an is not None and an.confidence >= 0.9 and not _cached(sc):
+                    path = sc.scene.clip_path
+                    cache_entries[path][1][scene_key(sc.scene.start_time, sc.scene.end_time)] = (
+                        dataclasses.asdict(an)
+                    )
+                    dirty.add(path)
+            for path in dirty:
+                key, entry = cache_entries[path]
+                cache.save("vlm", path, key, entry)
 
         for scene_idx, scored_scene in enumerate(scenes):
             analysis = results_map.get(scene_idx)

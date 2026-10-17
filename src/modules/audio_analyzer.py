@@ -1,5 +1,6 @@
 """Audio rhythm, downbeat, onset tracking, and structural energy-sync module using Librosa."""
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -7,11 +8,13 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import librosa
 import numpy as np
 import soundfile as sf
 
+from src.core.analysis_cache import AnalysisCache
 from src.core.config import PipelineConfig
 from src.core.ffmpeg_utils import run_tool
 from src.core.types import BeatMarker, SongSection, SongSectionType
@@ -37,6 +40,19 @@ class AudioAnalyzer:
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
+        # Last (waveform, sr, hop) -> onset envelope / energy profile, so the expensive librosa
+        # features are computed once per analyze() instead of once per consumer.
+        self._onset_memo: tuple[np.ndarray, int, int, np.ndarray] | None = None
+        self._profile_memo: tuple[np.ndarray, int, int, tuple[Any, ...]] | None = None
+
+    def _onset_envelope(self, y: np.ndarray, sr: int, hop_length: int = 512) -> np.ndarray:
+        """Onset strength envelope, memoised for the most recent waveform."""
+        m = self._onset_memo
+        if m is not None and m[0] is y and m[1] == sr and m[2] == hop_length:
+            return m[3]
+        env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+        self._onset_memo = (y, sr, hop_length, env)
+        return env
 
     def _load_audio(self, audio_path: Path) -> tuple[np.ndarray, int]:
         """Safely load audio waveform via librosa or soundfile fallback."""
@@ -136,9 +152,19 @@ class AudioAnalyzer:
         Returns:
             (times, smooth_energy, norm_rms, norm_onset, chroma)
         """
+        pm = self._profile_memo
+        if pm is not None and pm[0] is y and pm[1] == sr and pm[2] == hop_length:
+            return pm[3]  # type: ignore[return-value]
+        result = self._compute_energy_profile_uncached(y, sr, hop_length)
+        self._profile_memo = (y, sr, hop_length, result)
+        return result
+
+    def _compute_energy_profile_uncached(
+        self, y: np.ndarray, sr: int, hop_length: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         frame_len = 2048
         rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop_length)[0]
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+        onset_env = self._onset_envelope(y, sr, hop_length)
 
         # 12-dimensional pitch-class Chroma profile
         try:
@@ -570,6 +596,58 @@ class AudioAnalyzer:
         )
         return float(closest_db)
 
+    def _result_cache_key(
+        self,
+        cache: AnalysisCache,
+        audio_path: Path,
+        target_duration: float | None,
+        available_footage_duration: float | None,
+        duration_mode: str | None,
+    ) -> str | None:
+        cfg = self.config
+        mode = duration_mode or cfg.duration_mode
+        target = target_duration if target_duration is not None else cfg.target_duration
+        return cache.make_key(
+            audio_path,
+            sr=cfg.audio_sample_rate,
+            mode=mode,
+            target=target,
+            footage=round(available_footage_duration, 3)
+            if (mode == "footage_driven" and available_footage_duration)
+            else None,
+            sync=cfg.enable_structural_sync,
+            min_beat=cfg.min_beat_interval,
+            std_beat=cfg.standard_min_beat_interval,
+            climax_beat=cfg.climax_min_beat_interval,
+            fade=cfg.audio_fade_out_sec,
+        )
+
+    @staticmethod
+    def _result_to_json(res: AudioAnalysisResult) -> dict[str, Any]:
+        d = dataclasses.asdict(res)
+        d["extracted_audio_path"] = str(res.extracted_audio_path) if res.extracted_audio_path else None
+        for sec in d["sections"]:
+            sec["section_type"] = sec["section_type"].value
+        return d
+
+    @staticmethod
+    def _result_from_json(d: dict[str, Any]) -> AudioAnalysisResult:
+        extracted = Path(d["extracted_audio_path"]) if d.get("extracted_audio_path") else None
+        if extracted is not None and not extracted.is_file():
+            raise FileNotFoundError(extracted)
+        return AudioAnalysisResult(
+            tempo_bpm=float(d["tempo_bpm"]),
+            duration=float(d["duration"]),
+            beats=[BeatMarker(**b) for b in d["beats"]],
+            cut_timestamps=[float(c) for c in d["cut_timestamps"]],
+            sample_rate=int(d["sample_rate"]),
+            sections=[
+                SongSection(**{**sec, "section_type": SongSectionType(sec["section_type"])})
+                for sec in d["sections"]
+            ],
+            extracted_audio_path=extracted,
+        )
+
     def analyze(
         self,
         audio_path: Path,
@@ -577,9 +655,42 @@ class AudioAnalyzer:
         available_footage_duration: float | None = None,
         duration_mode: str | None = None,
     ) -> AudioAnalysisResult:
-        """Load audio file and extract rhythmic pulse, downbeats, sections, and cut intervals."""
+        """Load audio file and extract rhythmic pulse, downbeats, sections, and cut intervals.
+
+        The full result is cached on disk (keyed by file identity + every parameter that
+        influences it), so re-analysing an unchanged soundtrack is instant.
+        """
         if not audio_path.is_file():
             raise FileNotFoundError(f"Soundtrack file not found: {audio_path}")
+        cache = AnalysisCache(self.config)
+        key = self._result_cache_key(
+            cache, audio_path, target_duration, available_footage_duration, duration_mode
+        )
+        cached = cache.load("audio", audio_path, key)
+        if cached is not None:
+            try:
+                res = self._result_from_json(cached)
+                logger.info("Audio analysis cache hit for %s", audio_path.name)
+                return res
+            except (TypeError, KeyError, ValueError, OSError):
+                logger.debug("Ignoring stale audio analysis cache for %s", audio_path.name)
+        try:
+            res = self._analyze_uncached(
+                audio_path, target_duration, available_footage_duration, duration_mode
+            )
+        finally:
+            self._onset_memo = None
+            self._profile_memo = None
+        cache.save("audio", audio_path, key, self._result_to_json(res))
+        return res
+
+    def _analyze_uncached(
+        self,
+        audio_path: Path,
+        target_duration: float | None = None,
+        available_footage_duration: float | None = None,
+        duration_mode: str | None = None,
+    ) -> AudioAnalysisResult:
 
         logger.info("Loading soundtrack: %s", audio_path.name)
         y, sr = self._load_audio(audio_path)
@@ -588,8 +699,8 @@ class AudioAnalyzer:
         # Detect song structure sections (INTRO, BUILDUP, DROP, OUTRO)
         sections = self.detect_song_sections(audio_path, y, sr)
 
-        # Compute dynamic onset strength envelope
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        # Dynamic onset strength envelope (shared with the energy profile - computed once)
+        onset_env = self._onset_envelope(y, sr)
 
         # Estimate tempo and beat positions
         tempo_val, beat_frames = librosa.beat.beat_track(
