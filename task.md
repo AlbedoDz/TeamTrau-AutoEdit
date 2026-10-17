@@ -234,3 +234,24 @@
   - [x] Test Suite & Verification:
     - 9 comprehensive unit and integration tests in `tests/test_rough_cut_cleaner.py`.
     - Full project regression test suite: 228/228 tests passing (`pytest tests -q`), 0 ruff errors.
+- [x] Phase 17: Real-Footage Robustness (commit 4b2de02)
+  - [x] Segment-based renderer (`-ss/-t` fast seek, frame-exact cuts, atempo on speed ramps, silent track for clips w/o audio, 48k stereo normalization, `.part` atomic output, NVENC->CPU fallback only on hardware errors).
+  - [x] UTF-8 subprocess helpers (`src/core/ffmpeg_utils.py`) so unicode/Vietnamese filenames no longer crash ffmpeg.
+  - [x] ffprobe-based probe (rotation, duration, has_audio); CFR cache keyed by path+size+mtime, atomic writes.
+  - [x] Soundtrack cut from original (native rate/stereo); compressed audio decoded once via ffmpeg.
+  - [x] OTIO: real media available_range/rate, Gaps keep later cuts on beat, duration-aware scene picker.
+  - [x] Failed clips surfaced in `PipelineExecutionResult.failed_files`; fast cancel; natural sort for rough cut.
+  - [x] `tests/integration/*`: real-ffmpeg render/ingest/audio/timeline tests.
+- [x] Phase 18: Edit / Deliver Split (Resolve / Premiere / CapCut workflow) (commits e86c80d, ccce241)
+  - [x] `EditClip` / `EditTimeline` = single source of truth (`src/modules/edit_timeline.py`); renderer, OTIO and variants consume it.
+  - [x] `submit_job` stops at "Timeline ready" (no_render=True, export_nle=False by default); analysis side-products in `output/.analysis`.
+  - [x] `submit_deliver_job`: mp4 / fcpxml / premiere / otio / capcut / 540p preview without re-analysis.
+  - [x] `.tteproj` v2.1 stores edit timelines (v2.0 upgraded from variants).
+  - [x] CLI: `run` saves a project; `deliver --project X.tteproj --format ...`; `--render` / `--export-nle` for one-shot.
+  - [x] MCP: analysis-only default; `render_master` / `export_timeline` accept `project_path`.
+  - [x] GUI: Media > Edit > Deliver stepper, Export disabled until a timeline exists, TimelineView edits flow to Export, Render Preview.
+- [x] Phase 19: Speed (commit merged 7ea75d2)
+  - [x] Shared keyframe sweep (`keyframe_cache.py`), analysis disk cache (`analysis_cache.py`), merged silence+freeze pass, GPU batching (MobileNet/YOLO), concurrent audio/Whisper/scoring.
+  - [x] Benchmark (`scripts/benchmark_pipeline.py`, 6x30s 1080p): total 133.0s -> 57.2s cold, 52.8s -> 20.9s cached; analysis 110.8s -> 38.0s cold, 33.6s -> 1.8s cached. Render ~19s (CPU-filter bound).
+  - [x] Full suite: 288 tests passing, 0 ruff errors.
+- [ ] Known follow-ups: GUI manually verified? (only headless-tested); Export of all variants at once; render speed beyond ~19s needs GPU filters (scale_cuda/overlay_cuda); Phase 16 roadmap items (LUT/color, multi-stem audio, Silero VAD, VLM rate limiter).
