@@ -956,7 +956,8 @@ class StudioMainWindow(QMainWindow):
         self.export_panel.set_output_dir(self.media_browser.get_output_dir())
         if self._current_job and self._current_job.is_running():
             return
-        is_ready, msg = self.media_browser.is_valid_setup()
+        wf = self.inspector_panel.combo_workflow.currentData() if hasattr(self, "inspector_panel") else "standard"
+        is_ready, msg = self.media_browser.is_valid_setup(workflow_mode=wf or "standard")
         if is_ready:
             self.lbl_message.setText("Ready to run editing pipeline")
         else:
@@ -972,7 +973,8 @@ class StudioMainWindow(QMainWindow):
             )
             return
 
-        is_ready, reason = self.media_browser.is_valid_setup()
+        wf = self.inspector_panel.combo_workflow.currentData() if hasattr(self, "inspector_panel") else "standard"
+        is_ready, reason = self.media_browser.is_valid_setup(workflow_mode=wf or "standard")
         if not is_ready:
             QMessageBox.warning(self, "Incomplete Project Setup", reason)
             return

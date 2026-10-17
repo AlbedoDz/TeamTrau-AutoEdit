@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -76,10 +77,42 @@ class InspectorPanelWidget(QWidget):
         self.combo_workflow.addItem("Cinematic Wedding / Narrative", "standard")
         self.combo_workflow.addItem("Build / Timelapse (Speed-Ramp)", "build_timelapse")
         self.combo_workflow.addItem("Unboxing / Narration (Speech-Focus)", "unboxing_narration")
+        self.combo_workflow.addItem("Rough Cut & Defect Pruning", "rough_cut")
         self.combo_workflow.currentIndexChanged.connect(self._on_workflow_preset_changed)
         form_wf.addRow("Preset:", self.combo_workflow)
 
         layout.addWidget(grp_workflow)
+
+        # Defect Cleaning Controls (Rough Cut)
+        self.grp_defect_pruning = QGroupBox("Defect Cleaning Controls", content)
+        form_defect = QFormLayout(self.grp_defect_pruning)
+        form_defect.setSpacing(6)
+
+        self.chk_prune_wobble = QCheckBox("Auto-Prune Start/Stop Wobble", self.grp_defect_pruning)
+        self.chk_prune_wobble.setChecked(True)
+        form_defect.addRow(self.chk_prune_wobble)
+
+        self.chk_prune_shake = QCheckBox("Slice Out Camera Shake & Whip-Pan", self.grp_defect_pruning)
+        self.chk_prune_shake.setChecked(True)
+        form_defect.addRow(self.chk_prune_shake)
+
+        self.chk_prune_focus = QCheckBox("Cut Out Lens Defocus & Occlusions", self.grp_defect_pruning)
+        self.chk_prune_focus.setChecked(True)
+        form_defect.addRow(self.chk_prune_focus)
+
+        self.chk_audio_conditioning = QCheckBox("80Hz High-Pass Filter for Camera Audio", self.grp_defect_pruning)
+        self.chk_audio_conditioning.setChecked(True)
+        form_defect.addRow(self.chk_audio_conditioning)
+
+        self.spin_min_take = QDoubleSpinBox(self.grp_defect_pruning)
+        self.spin_min_take.setRange(1.0, 5.0)
+        self.spin_min_take.setSingleStep(0.1)
+        self.spin_min_take.setValue(1.5)
+        self.spin_min_take.setSuffix(" s")
+        form_defect.addRow("Min Usable Take:", self.spin_min_take)
+
+        self.grp_defect_pruning.setVisible(False)
+        layout.addWidget(self.grp_defect_pruning)
 
         # 2. Duration & Pacing
         grp_duration = QGroupBox("Duration & Pacing", content)
@@ -175,6 +208,14 @@ class InspectorPanelWidget(QWidget):
         self.chk_ken_burns = QCheckBox("Ambient Motion (Ken Burns on Static Shots)", grp_retention)
         self.chk_ken_burns.setChecked(True)
         form_retention.addRow(self.chk_ken_burns)
+
+        self.spin_ken_burns_zoom = QDoubleSpinBox(grp_retention)
+        self.spin_ken_burns_zoom.setRange(1.01, 1.30)
+        self.spin_ken_burns_zoom.setSingleStep(0.01)
+        self.spin_ken_burns_zoom.setValue(1.08)
+        self.spin_ken_burns_zoom.setSuffix("x")
+        self.spin_ken_burns_zoom.setToolTip("Subtle Ken Burns zoom scale factor on low-motion scenes")
+        form_retention.addRow("Ken Burns Zoom:", self.spin_ken_burns_zoom)
 
         layout.addWidget(grp_retention)
 
@@ -290,9 +331,17 @@ class InspectorPanelWidget(QWidget):
         mode = self.combo_workflow.currentData()
         if mode == "build_timelapse":
             self.chk_speed_ramping.setChecked(True)
+            self.grp_defect_pruning.setVisible(False)
         elif mode == "unboxing_narration":
             self.chk_speed_ramping.setChecked(False)
             self.chk_ai_voice.setChecked(True)
+            self.grp_defect_pruning.setVisible(False)
+        elif mode == "rough_cut":
+            self.chk_speed_ramping.setChecked(False)
+            self.chk_teaser.setChecked(False)
+            self.grp_defect_pruning.setVisible(True)
+        else:
+            self.grp_defect_pruning.setVisible(False)
 
     @Slot()
     def _on_browse_watermark(self) -> None:
@@ -347,6 +396,14 @@ class InspectorPanelWidget(QWidget):
         config.subtitle_style = self.combo_subtitles.currentData() or "kinetic_ass"
         config.enable_exposure_guard = self.chk_exposure_guard.isChecked()
         config.enable_ken_burns = self.chk_ken_burns.isChecked()
+        config.ken_burns_scale_factor = float(self.spin_ken_burns_zoom.value())
+
+        # Rough Cut Defect Pruning
+        config.enable_head_tail_trim = self.chk_prune_wobble.isChecked()
+        config.enable_shake_pruning = self.chk_prune_shake.isChecked()
+        config.enable_focus_guard = self.chk_prune_focus.isChecked()
+        config.enable_audio_conditioning = self.chk_audio_conditioning.isChecked()
+        config.min_take_duration_sec = float(self.spin_min_take.value())
 
     def load_from_config(self, config: PipelineConfig) -> None:
         """Populate Inspector controls from PipelineConfig."""
@@ -393,4 +450,13 @@ class InspectorPanelWidget(QWidget):
 
         self.chk_exposure_guard.setChecked(getattr(config, "enable_exposure_guard", True))
         self.chk_ken_burns.setChecked(getattr(config, "enable_ken_burns", True))
+        self.spin_ken_burns_zoom.setValue(float(getattr(config, "ken_burns_scale_factor", 1.08)))
         self.chk_ai_color.setChecked(getattr(config, "enable_vlm_tagging", True))
+
+        # Rough Cut Defect Pruning
+        self.chk_prune_wobble.setChecked(getattr(config, "enable_head_tail_trim", True))
+        self.chk_prune_shake.setChecked(getattr(config, "enable_shake_pruning", True))
+        self.chk_prune_focus.setChecked(getattr(config, "enable_focus_guard", True))
+        self.chk_audio_conditioning.setChecked(getattr(config, "enable_audio_conditioning", True))
+        self.spin_min_take.setValue(float(getattr(config, "min_take_duration_sec", 1.5)))
+        self.grp_defect_pruning.setVisible(config.workflow_mode == "rough_cut")

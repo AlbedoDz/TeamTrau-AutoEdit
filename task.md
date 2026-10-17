@@ -197,6 +197,40 @@
   - [x] Upgraded `StudioMainWindow._do_save` and `StudioMainWindow._do_open` (`src/ui/main_window.py`) to serialize and restore all workspace sub-widgets completely without re-running analysis or neural scoring.
   - [x] Added `set_input_dirs` and `set_clip_roles` to `MediaBrowserWidget`, `get_variants` and `get_active_variant_key` to `TimelineViewWidget`.
   - [x] Verified full session roundtrip via unit tests (`tests/test_project_manager.py` and `tests/test_nle_menus_and_workflow.py`).
-
-
-
+- [x] Phase 15: Critical Engine Debt Clearance (VFR Guard, VRAM Eviction, Concurrent VLM & GUI Parameters)
+  - [x] Task A (VFR Guard): Automated Variable Frame Rate detection (`is_vfr`) in `IngestDetector.probe_video` and fast non-destructive CFR normalization (`normalize_to_cfr`) via FFmpeg pass (`-c:v libx264 -preset ultrafast -crf 17 -vsync cfr -r {fps} -c:a copy`) with disk caching. Wired into Stage 1 in `StudioBackendAdapter`.
+  - [x] Task B (GPU VRAM Eviction Protocol): Enforced sequential VRAM eviction across pipeline stages (`VisualScorer.unload_model()`, `SmartReframer.unload_model()`, `TranscriptionEngine.unload_model()`) and `_enforce_vram_headroom(2.0GB)` before NVENC rendering in Stage 7.
+  - [x] Task C (Async Concurrent VLM Batching): Refactored `VLMAssistant.tag_scored_scenes` to use `ThreadPoolExecutor(max_workers=concurrency)` with per-request latency guard and automatic graceful fallback to heuristic metadata without blocking workers or disrupting scene order.
+  - [x] Task D (Expose Missing Parameters in GUI):
+    - Added Ken Burns zoom factor double spinbox (`spin_ken_burns_zoom`, 1.01x - 1.30x) in `InspectorPanelWidget`.
+    - Added collapsible/checkable group `Advanced NVENC Quality Overrides` with target bitrate spinbox (10 - 200 Mbps) and CQ spinbox (1 - 35) in `ExportPanelWidget` and `ExportDialog`.
+    - Verified Audio tab ducking attenuation (-24dB to -6dB) and Ingest tab dHash threshold (1 - 15 bits) in `SettingsDialog`.
+  - [x] Full test verification: 219/219 tests passing (`pytest tests -v`), 0 ruff lint errors (`ruff check src tests main.py`).
+- [x] Phase 16: Universal Defect Pruning & Assembly Rough-Cut Engine (`rough_cut_assembly`)
+  - [x] Component 1: Data Contracts & Configuration
+    - Added `DefectType` enum (`HEAD_TAIL_WOBBLE`, `CAMERA_SHAKE`, `GROUND_CARRYING`, `DEFOCUS_BLUR`, `LENS_OCCLUSION`, `EXPOSURE_CLIPPING`, `STROBE_FLICKER`), `DefectSpan`, and `CleanedSegment` in `src/core/types.py`.
+    - Added `"rough_cut"` to `WorkflowMode` literal, added defect pruning fields (`enable_head_tail_trim`, `head_prune_sec`, `tail_prune_sec`, `head_tail_motion_ratio`, `enable_shake_pruning`, `max_shake_threshold`, `max_shake_min_duration`, `enable_ground_carrying_pruning`, `enable_focus_guard`, `focus_drop_ratio`, `focus_drop_min_duration`, `enable_occlusion_guard`, `occlusion_area_ratio`, `occlusion_luma_threshold`, `occlusion_min_duration`, `enable_exposure_clipping_guard`, `exposure_clip_ratio`, `enable_flicker_repair`, `min_take_duration_sec`) to `PipelineConfig` in `src/core/config.py`.
+    - Added `ROUGH_CUT_PRESET` and wired `get_preset_by_key("rough_cut_assembly")` in `src/core/genre_presets.py`.
+  - [x] Component 2: Multi-Defect Inspection Pipeline (`src/modules/rough_cut_cleaner.py`)
+    - Implemented `RoughCutCleaner` class with DIS Optical Flow and 2D Phase Correlation (`cv2.phaseCorrelate`) for high-speed macro motion tracking.
+    - Head & Tail Wobble (Start/Stop Jerk) pruning based on variance thresholding ($>2.5\times$ interior baseline).
+    - Mid-Clip Wild Shake & Whip-Pan bisection ($>80\text{ px/f}$ over $>0.3\text{s}$).
+    - Ground / Idle carrying excision (downward optical flow $+15\text{ px/f}$ with low texture).
+    - Focus Hunting & Defocus Blur interval pruning (Tenengrad sharpness drop $>65\%$).
+    - Lens Occlusion / Cap blockage excision ($Y < 15$ over $>40\%$ area).
+    - Extreme Exposure Clipping excision ($>30\%$ pixels saturated at $\le 2$ or $\ge 253$).
+    - LED/AC Strobe Flicker detection for downstream deflicker filter conditioning.
+    - Non-destructive interval bisecting and micro-take clamping ($<1.5\text{s}$ discarded).
+    - Chronological sorting in `clean_batch` preserving capture timestamp fidelity.
+  - [x] Component 3: Camera Audio Conditioning (`src/modules/audio_normalizer.py`)
+    - Added `inspect_and_condition_camera_audio` executing FFmpeg 80Hz high-pass filter (`highpass=f=80,alimiter=limit=0.95`) for handling mic rumble and wind noise.
+  - [x] Component 4: Sequence Assembly & Interchange Dispatching
+    - Implemented `TimelineBuilder.build_rough_cut_timeline` assembling non-destructive OTIO sequence with Track V1 (cleaned video), Track A1 (linked camera audio), and Track V2 (color-coded review markers for excised defects).
+    - Updated `NvencRenderer.render_sequence` and `concat_filtergraph` to support optional soundtrack with automatic camera audio concatenation.
+    - Updated `StudioBackendAdapter` stages 2, 3, 6, 7 to handle `workflow_mode == "rough_cut"` and optional soundtrack paths.
+  - [x] Component 5: Desktop Studio GUI Integration
+    - Added "Rough Cut & Defect Pruning" in `InspectorPanelWidget` workflow combo box and added collapsible `Defect Cleaning Controls` group box with real-time parameter bindings.
+    - Updated `MediaBrowserWidget` and `StudioMainWindow` to allow workflow execution without soundtrack when in `rough_cut` mode.
+  - [x] Test Suite & Verification:
+    - 9 comprehensive unit and integration tests in `tests/test_rough_cut_cleaner.py`.
+    - Full project regression test suite: 228/228 tests passing (`pytest tests -q`), 0 ruff errors.

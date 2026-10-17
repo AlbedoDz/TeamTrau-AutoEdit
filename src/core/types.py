@@ -19,6 +19,7 @@ class VideoMetadata:
     codec: str = "unknown"
     camera_role: str = "cam_a"
     source_folder: Path | None = None
+    is_vfr: bool = False
 
     @property
     def aspect_ratio(self) -> float:
@@ -144,8 +145,52 @@ class SceneVLMAnalysis:
     confidence: float = 1.0
 
 
-WorkflowMode = Literal["standard", "build_timelapse", "unboxing_narration"]
+WorkflowMode = Literal["standard", "build_timelapse", "unboxing_narration", "rough_cut"]
 WatermarkPosition = Literal["top-left", "top-right", "bottom-left", "bottom-right", "center"]
+
+
+class DefectType(str, Enum):
+    """Categorical classification of raw footage defects."""
+
+    HEAD_TAIL_WOBBLE = "HEAD_TAIL_WOBBLE"
+    CAMERA_SHAKE = "CAMERA_SHAKE"
+    WHIP_PAN = "WHIP_PAN"
+    GROUND_CARRYING = "GROUND_CARRYING"
+    DEFOCUS_BLUR = "DEFOCUS_BLUR"
+    LENS_OCCLUSION = "LENS_OCCLUSION"
+    EXPOSURE_CLIPPING = "EXPOSURE_CLIPPING"
+    FLICKER = "FLICKER"
+    AUDIO_RUMBLE = "AUDIO_RUMBLE"
+    MICRO_TAKE = "MICRO_TAKE"
+
+
+@dataclass(frozen=True)
+class DefectSpan:
+    """Interval within a clip flagged with a specific defect."""
+
+    start_time: float
+    end_time: float
+    defect_type: DefectType
+    severity: float = 1.0
+    description: str = ""
+
+
+@dataclass
+class CleanedSegment:
+    """Non-destructively trimmed golden segment free from operator/environmental defects."""
+
+    scene: SceneCut
+    clip_path: Path
+    start_time: float
+    end_time: float
+    duration: float
+    source_start_time: float
+    source_end_time: float
+    defects_removed: list[DefectSpan] = field(default_factory=list)
+    audio_filter: str | None = None
+    requires_deflicker: bool = False
+    sharpness_score: float = 1.0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class LayoutMode(str, Enum):

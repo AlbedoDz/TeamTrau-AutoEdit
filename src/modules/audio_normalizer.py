@@ -178,3 +178,93 @@ class AudioNormalizer:
                 clean_path.unlink(missing_ok=True)
             logger.error("Failed to clean audio %s: %s", audio_path, exc)
             raise AudioNormalizationError(f"Failed to normalize audio {audio_path}: {exc}") from exc
+
+    def inspect_and_condition_camera_audio(
+        self,
+        media_path: Path,
+        force_highpass: bool = False,
+        rumble_threshold_db: float = -18.0,
+        target_sample_rate: int = 48000,
+    ) -> tuple[Path, bool]:
+        """Inspect camera audio for low-frequency rumble and apply 80Hz high-pass conditioning.
+
+        Args:
+            media_path: Video or audio file path.
+            force_highpass: Force 80Hz highpass filter without testing rumble.
+            rumble_threshold_db: Threshold in dBFS for low frequency (<80Hz) energy.
+            target_sample_rate: Standard NLE sample rate (48000 Hz).
+
+        Returns:
+            Tuple of (output_wav_path, filter_applied).
+        """
+        media_path = Path(media_path).resolve()
+        if not media_path.exists():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+
+        has_rumble = force_highpass
+        if not has_rumble:
+            # Quick probe for low-frequency energy using ffmpeg astats
+            try:
+                cmd_probe = [
+                    self.ffmpeg_bin,
+                    "-v",
+                    "info",
+                    "-i",
+                    str(media_path),
+                    "-t",
+                    "5.0",
+                    "-af",
+                    "lowpass=f=80,astats=metadata=1:reset=1",
+                    "-f",
+                    "null",
+                    "-",
+                ]
+                res = subprocess.run(cmd_probe, capture_output=True, text=True, timeout=10)
+                for line in (res.stderr + res.stdout).splitlines():
+                    if "RMS level dB" in line or "Peak level dB" in line:
+                        try:
+                            val = float(line.split(":")[-1].strip())
+                            if val >= rumble_threshold_db and val < 0:
+                                has_rumble = True
+                                break
+                        except ValueError:
+                            pass
+            except Exception as probe_err:
+                logger.debug("Rumble probe failed on %s: %s", media_path.name, probe_err)
+
+        suffix = "_conditioned_80hz.wav" if has_rumble else "_clean_24bit.wav"
+        out_path = self.cache_dir / f"{media_path.stem}{suffix}"
+
+        if out_path.exists() and out_path.stat().st_mtime >= media_path.stat().st_mtime:
+            return out_path, has_rumble
+
+        cmd = [
+            self.ffmpeg_bin,
+            "-y",
+            "-i",
+            str(media_path),
+            "-vn",
+            "-map_metadata",
+            "-1",
+            "-fflags",
+            "+bitexact",
+        ]
+        if has_rumble:
+            cmd.extend(["-af", "highpass=f=80,alimiter=limit=0.95"])
+
+        cmd.extend([
+            "-acodec",
+            "pcm_s24le",
+            "-ar",
+            str(target_sample_rate),
+            str(out_path),
+        ])
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            return out_path, has_rumble
+        except (subprocess.SubprocessError, OSError) as exc:
+            if out_path.exists():
+                out_path.unlink(missing_ok=True)
+            logger.error("Failed to condition audio for %s: %s", media_path.name, exc)
+            raise AudioNormalizationError(f"Failed to condition audio {media_path}: {exc}") from exc

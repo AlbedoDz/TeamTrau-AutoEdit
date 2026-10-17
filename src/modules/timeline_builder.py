@@ -7,7 +7,14 @@ import opentimelineio as otio
 from opentimelineio.opentime import RationalTime, TimeRange
 
 from src.core.config import PipelineConfig
-from src.core.types import ScoredScene, SongSection, SongSectionType, TimelineExportResult
+from src.core.types import (
+    CleanedSegment,
+    DefectType,
+    ScoredScene,
+    SongSection,
+    SongSectionType,
+    TimelineExportResult,
+)
 from src.modules.visual_flow import assign_ambient_motion, evaluate_cut_continuity
 
 logger = logging.getLogger(__name__)
@@ -283,6 +290,122 @@ class TimelineBuilder:
         )
         return timeline
 
+    def build_rough_cut_timeline(
+        self,
+        cleaned_segments: list[CleanedSegment],
+        timeline_name: str = "RoughCut_Assembly",
+        fps: float | None = None,
+    ) -> otio.schema.Timeline:
+        """Synthesize chronological assembly rough-cut stringout sequence.
+
+        Track Structure:
+        - Track V1: All cleaned golden takes concatenated back-to-back in chronological order.
+        - Track A1: Synchronized original camera audio (BWF metadata stripped) with identical SourceRange.
+        - Track V2: Review markers indicating defect types removed (wobble, shake, defocus).
+        """
+        if not cleaned_segments:
+            raise ValueError("Cannot build rough cut timeline with empty cleaned_segments list.")
+
+        actual_fps = fps or self.config.fps or 30.0
+        timeline = otio.schema.Timeline(name=timeline_name)
+        video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
+        audio_track = otio.schema.Track(name="A1", kind=otio.schema.TrackKind.Audio)
+        review_track = otio.schema.Track(name="V2_Review_Markers", kind=otio.schema.TrackKind.Video)
+
+        timeline.tracks.append(video_track)
+        timeline.tracks.append(review_track)
+        timeline.tracks.append(audio_track)
+
+        # Enforce chronological ordering
+        sorted_segments = sorted(
+            cleaned_segments,
+            key=lambda s: (str(s.clip_path), s.start_time),
+        )
+
+        for i, seg in enumerate(sorted_segments):
+            dur_frames = max(1, int(round(seg.duration * actual_fps)))
+            start_frame = int(round(seg.source_start_time * actual_fps))
+
+            media_ref = otio.schema.ExternalReference(
+                target_url=seg.clip_path.resolve().as_uri(),
+                available_range=TimeRange(
+                    start_time=RationalTime(0, actual_fps),
+                    duration=RationalTime(
+                        int(round(max(seg.scene.duration, seg.source_end_time) * actual_fps)),
+                        actual_fps,
+                    ),
+                ),
+            )
+
+            # 1. Video Clip on V1
+            v_clip = otio.schema.Clip(
+                name=f"{seg.clip_path.stem}_take_{i+1:03d}",
+                media_reference=media_ref,
+                source_range=TimeRange(
+                    start_time=RationalTime(start_frame, actual_fps),
+                    duration=RationalTime(dur_frames, actual_fps),
+                ),
+            )
+            v_clip.metadata["AutoEdit"] = {
+                "rough_cut": True,
+                "defects_removed_count": len(seg.defects_removed),
+                "sharpness_score": seg.sharpness_score,
+                "requires_deflicker": seg.requires_deflicker,
+            }
+            video_track.append(v_clip)
+
+            # 2. Audio Clip on A1 (matching identical SourceRange for synchronous camera audio)
+            a_clip = otio.schema.Clip(
+                name=f"{seg.clip_path.stem}_audio_{i+1:03d}",
+                media_reference=media_ref,
+                source_range=TimeRange(
+                    start_time=RationalTime(start_frame, actual_fps),
+                    duration=RationalTime(dur_frames, actual_fps),
+                ),
+            )
+            audio_track.append(a_clip)
+
+            # 3. Review Marker on V2 / v_clip for any pruned defect spans
+            for def_span in seg.defects_removed:
+                marker_color = (
+                    otio.schema.MarkerColor.RED
+                    if def_span.defect_type in (DefectType.CAMERA_SHAKE, DefectType.WHIP_PAN)
+                    else otio.schema.MarkerColor.ORANGE
+                    if def_span.defect_type == DefectType.HEAD_TAIL_WOBBLE
+                    else otio.schema.MarkerColor.YELLOW
+                )
+                v_clip.markers.append(
+                    otio.schema.Marker(
+                        name=f"Pruned: {def_span.defect_type.value}",
+                        marked_range=TimeRange(
+                            start_time=RationalTime(start_frame, actual_fps),
+                            duration=RationalTime(dur_frames, actual_fps),
+                        ),
+                        color=marker_color,
+                        comment=def_span.description,
+                    )
+                )
+
+        # Gap filler for review track V2 matching total timeline duration
+        total_dur = timeline.duration()
+        if total_dur and total_dur.value > 0:
+            review_track.append(
+                otio.schema.Gap(
+                    source_range=TimeRange(
+                        start_time=RationalTime(0, actual_fps),
+                        duration=total_dur,
+                    )
+                )
+            )
+
+        logger.info(
+            "Constructed rough cut timeline '%s' with %d golden takes (total %.2f sec).",
+            timeline_name,
+            len(video_track),
+            total_dur.to_seconds() if total_dur else 0.0,
+        )
+        return timeline
+
     def export_all(
         self,
         timeline: otio.schema.Timeline,
@@ -345,7 +468,10 @@ class TimelineBuilder:
 
         # Compute duration and clip count
         video_tracks = [t for t in timeline.tracks if t.kind == otio.schema.TrackKind.Video]
-        clip_count = sum(len(t) for t in video_tracks)
+        clip_count = sum(
+            len([c for c in t if isinstance(c, otio.schema.Clip)])
+            for t in video_tracks
+        )
         dur_rational = timeline.duration()
         total_duration = dur_rational.to_seconds() if dur_rational else 0.0
 

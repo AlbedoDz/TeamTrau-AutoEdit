@@ -34,6 +34,21 @@ class TranscriptionEngine:
             logger.warning("Could not initialize faster-whisper (%s). Running in mock/fallback mode.", e)
             self._model = None
 
+    def unload_model(self) -> None:
+        """Unload faster-whisper model from VRAM and run garbage collection."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("Evicted TranscriptionEngine whisper model from CUDA VRAM.")
+        except ImportError:
+            pass
+
     def transcribe_file(self, media_path: Path) -> list[SentenceSegment]:
         """Transcribe audio/video file and extract complete sentences with word-level boundaries."""
         if not media_path.is_file():

@@ -186,6 +186,7 @@ class PipelineConfig(BaseModel):
     min_scene_len_sec: float = Field(default=0.8)
     auto_editor_motion_threshold: float = Field(default=0.05)
     auto_editor_margin: str = Field(default="0.2s")
+    auto_normalize_vfr: bool = Field(default=True)
 
     # Audio & Rhythm Constants
     min_beat_interval: float = Field(default=0.4)
@@ -267,6 +268,7 @@ class PipelineConfig(BaseModel):
     vlm_model: str = Field(default="openai/gpt-4o-mini")
     vlm_temperature: float = Field(default=0.2)
     vlm_timeout_sec: float = Field(default=15.0)
+    vlm_concurrency: int = Field(default=4, ge=1, le=16)
 
     # Universal AI Agent & MCP Hub Integration
     agent_provider: str = Field(default="auto")  # "auto", "openrouter", "deepseek", "openai", "ollama", "lm_studio", "custom"
@@ -287,6 +289,30 @@ class PipelineConfig(BaseModel):
     nvenc_bufsize: str = Field(default="120M")
     nvenc_pix_fmt: str = Field(default="yuv420p")
 
+    # Rough-Cut & Defect Pruning Constants
+    enable_head_tail_trim: bool = Field(default=True)
+    head_prune_sec: float = Field(default=0.8)
+    tail_prune_sec: float = Field(default=0.5)
+    head_tail_motion_ratio: float = Field(default=2.5)
+    enable_shake_pruning: bool = Field(default=True)
+    max_shake_threshold: float = Field(default=80.0)  # px/frame
+    max_shake_min_duration: float = Field(default=0.3)  # sec
+    enable_ground_carrying_pruning: bool = Field(default=True)
+    enable_focus_guard: bool = Field(default=True)
+    focus_drop_ratio: float = Field(default=0.65)
+    focus_drop_min_duration: float = Field(default=0.5)
+    enable_occlusion_guard: bool = Field(default=True)
+    occlusion_area_ratio: float = Field(default=0.40)
+    occlusion_luma_threshold: int = Field(default=15)
+    occlusion_min_duration: float = Field(default=0.4)
+    enable_exposure_clipping_guard: bool = Field(default=True)
+    exposure_clip_ratio: float = Field(default=0.30)
+    enable_flicker_repair: bool = Field(default=True)
+    enable_audio_conditioning: bool = Field(default=True)
+    audio_rumble_threshold_db: float = Field(default=-18.0)
+    min_take_duration_sec: float = Field(default=1.5)
+    keep_camera_audio: bool = Field(default=True)
+
     # External NLE Paths
     resolve_script_path: Path = Field(default_factory=find_default_resolve_script_path)
     resolve_exe_path: Path = Field(default_factory=find_default_resolve_exe)
@@ -303,7 +329,7 @@ class PipelineConfig(BaseModel):
         self.fps = preset.fps
 
     def apply_workflow_mode(self, mode: WorkflowMode) -> None:
-        """Apply workflow mode configuration (standard, build_timelapse, unboxing_narration)."""
+        """Apply workflow mode configuration (standard, build_timelapse, unboxing_narration, rough_cut)."""
         if mode == "build_timelapse":
             self.workflow_mode = "build_timelapse"
             self.enable_speed_ramping = True
@@ -316,8 +342,16 @@ class PipelineConfig(BaseModel):
         elif mode == "standard":
             self.workflow_mode = "standard"
             self.keep_video_audio = True
+        elif mode == "rough_cut":
+            self.workflow_mode = "rough_cut"
+            self.enable_speed_ramping = False
+            self.enable_teaser = False
+            self.enable_structural_sync = False
+            self.keep_video_audio = True
+            self.keep_camera_audio = True
+            self.enable_dead_air_detection = False
         else:
-            raise ValueError(f"Unknown workflow mode: '{mode}'. Must be one of: standard, build_timelapse, unboxing_narration")
+            raise ValueError(f"Unknown workflow mode: '{mode}'. Must be one of: standard, build_timelapse, unboxing_narration, rough_cut")
 
     @classmethod
     def from_preset(cls, preset_name: str = DEFAULT_PRESET_NAME, **overrides) -> "PipelineConfig":

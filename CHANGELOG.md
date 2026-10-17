@@ -2,6 +2,21 @@
 
 ---
 
+## [Push 6] — 2026-10-17
+**feat: Phase 7 hardening - rough cut cleaner, VFR normalization, VRAM cleanup, VLM semaphore**
+
+### Hardening & Production Reliability
+- `src/modules/rough_cut_cleaner.py`: Loại bỏ clip rung lắc, mờ tối, micro-cuts, dead-air trước khi vào sequencer.
+- `src/modules/ingest_detector.py`: Tự động phát hiện và chuẩn hóa Variable Frame Rate (VFR) sang Constant Frame Rate (CFR) để tránh lệch tiếng.
+- `src/modules/visual_scorer.py`: Cơ chế dọn dẹp bộ nhớ PyTorch CUDA VRAM (`torch.cuda.empty_cache()`, giải phóng model handler).
+- `src/modules/vlm_assistant.py`: Bổ sung `asyncio.Semaphore` giới hạn số lượng request đồng thời tránh tràn rate-limit API.
+- `docs/TECHNICAL_HANDOFF.md`: Tài liệu bàn giao kỹ thuật kiến trúc, quy trình deploy và vận hành pipeline.
+
+### Tests
+- 228/228 test pass 100% (+4 test files mới: `test_rough_cut_cleaner`, `test_vfr_normalization`, `test_vram_cleanup`, `test_vlm_concurrency`).
+
+---
+
 ## [Push 5] — 2026-10-17
 **feat: Phase 6 multi-variant synthesizer, genre recommender, security guardrails**
 

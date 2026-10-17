@@ -84,6 +84,23 @@ class VisualScorer:
             )
             self._torch_model = None
 
+    def unload_model(self) -> None:
+        """Unload PyTorch models from VRAM and run garbage collection."""
+        if self._torch_model is not None:
+            del self._torch_model
+            self._torch_model = None
+        if hasattr(self, "_torch_transforms"):
+            del self._torch_transforms
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("Evicted VisualScorer PyTorch model from CUDA VRAM.")
+        except ImportError:
+            pass
+
     def score_scene(self, scene: SceneCut) -> ScoredScene:
         """Sample keyframes and compute sharpness, aesthetic, and composite scores."""
         keyframes = self._extract_keyframes(

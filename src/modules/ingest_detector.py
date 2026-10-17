@@ -52,6 +52,51 @@ class IngestDetector:
 
         duration = total_frames / fps if fps > 0 else 0.0
 
+        is_vfr = False
+        ffprobe_bin = shutil.which("ffprobe")
+        if ffprobe_bin:
+            try:
+                cmd = [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=r_frame_rate,avg_frame_rate",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ]
+                res = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=5.0,
+                )
+                if res.returncode == 0 and res.stdout:
+                    data = json.loads(res.stdout)
+                    streams = data.get("streams", [])
+                    if streams:
+                        r_fr_str = streams[0].get("r_frame_rate", "")
+                        avg_fr_str = streams[0].get("avg_frame_rate", "")
+
+                        def _parse_fps(s: str) -> float:
+                            if "/" in s:
+                                n, d = s.split("/", 1)
+                                den = float(d)
+                                return float(n) / den if den != 0.0 else 0.0
+                            return float(s) if s else 0.0
+
+                        r_fps = _parse_fps(r_fr_str)
+                        avg_fps = _parse_fps(avg_fr_str)
+                        if r_fps > 0 and avg_fps > 0 and abs(r_fps - avg_fps) > 0.05:
+                            is_vfr = True
+            except Exception as exc:
+                logger.debug("ffprobe VFR probe failed for %s: %s", video_path, exc)
+
         from src.core.ontology import infer_camera_role
 
         inferred_role = camera_role or infer_camera_role(source_folder or video_path).value
@@ -66,7 +111,78 @@ class IngestDetector:
             codec="raw",
             camera_role=inferred_role,
             source_folder=source_folder or video_path.parent,
+            is_vfr=is_vfr,
         )
+
+    def normalize_to_cfr(
+        self,
+        video_path: Path,
+        target_fps: float = 30.0,
+        output_path: Path | None = None,
+    ) -> Path:
+        """Execute fast FFmpeg pass to convert VFR footage to Constant Frame Rate (CFR).
+
+        Uses fast encoding: -c:v libx264 -preset ultrafast -crf 17 -vsync cfr -r {target_fps} -c:a copy.
+        """
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            logger.warning(
+                "FFmpeg binary not found. Skipping CFR normalization for %s",
+                video_path.name,
+            )
+            return video_path
+
+        if output_path is None:
+            cache_dir = Path(".cache/cfr_normalized")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            output_path = cache_dir / f"{video_path.stem}_cfr_{int(target_fps)}fps{video_path.suffix}"
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists() and output_path.stat().st_size > 0:
+            logger.info("Reusing existing CFR normalized video: %s", output_path)
+            return output_path
+
+        logger.info(
+            "Normalizing VFR video %s to CFR (target %s fps) -> %s",
+            video_path.name,
+            target_fps,
+            output_path.name,
+        )
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-i",
+            str(video_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "17",
+            "-vsync",
+            "cfr",
+            "-r",
+            str(target_fps),
+            "-c:a",
+            "copy",
+            str(output_path),
+        ]
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            logger.error(
+                "FFmpeg CFR normalization failed for %s: %s",
+                video_path,
+                res.stderr,
+            )
+            raise RuntimeError(f"CFR normalization failed: {res.stderr}")
+        return output_path
 
     def detect_scenes(self, video_path: Path) -> list[SceneCut]:
         """Detect camera shot boundaries non-destructively using PySceneDetect."""
@@ -560,6 +676,14 @@ class IngestDetector:
         """Detect scenes and prune activity for a single video with caching."""
         if cancel_event and cancel_event.is_set():
             return []
+
+        if getattr(self.config, "auto_normalize_vfr", True):
+            try:
+                meta = self.probe_video(video_path)
+                if meta.is_vfr:
+                    video_path = self.normalize_to_cfr(video_path, target_fps=self.config.fps)
+            except Exception as e:
+                logger.warning("Auto CFR normalization check failed for %s: %s", video_path.name, e)
 
         cache_file = self._get_cache_path(video_path)
         cached = self._load_cached_scenes(cache_file, video_path)

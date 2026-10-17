@@ -71,6 +71,9 @@ class SubGenrePreset:
             config.canvas_height = preset.height
             config.fps = preset.fps
 
+        if self.key == "rough_cut_assembly":
+            config.apply_workflow_mode("rough_cut")
+
         return config
 
 
@@ -621,9 +624,35 @@ GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = {
     ),
 }
 
+ROUGH_CUT_PRESET: Final[SubGenrePreset] = SubGenrePreset(
+    key="rough_cut_assembly",
+    major_genre=MajorGenre.DOCUMENTARY_NARRATIVE,
+    display_name="Rough Cut Stringout & Defect Pruning",
+    description="Strict chronological stringout. Auto-excises wobbles, wild shakes, out-of-focus hunting, and occlusions.",
+    min_scene_len_sec=1.5,
+    min_beat_interval=1.0,
+    standard_min_beat_interval=1.5,
+    climax_min_beat_interval=1.0,
+    enable_speed_ramping=False,
+    max_speed_multiplier=1.0,
+    min_speed_multiplier=1.0,
+    enable_teaser=False,
+    teaser_duration=0.0,
+    enable_exposure_guard=False,
+    cross_dissolve_frames=0,
+    enable_ken_burns=False,
+    ken_burns_scale_factor=1.0,
+    preferred_render_preset="1080p30",
+    reframing_mode="auto_hybrid",
+    action_drop_threshold=0.70,
+    preferred_camera_roles=["cam_a", "cam_b", "drone", "action_cam", "b_roll"],
+)
+
 
 def get_preset_by_key(key: str) -> SubGenrePreset:
     """Retrieve sub-genre preset by key, defaulting to 'travel_cinematic' if not found."""
+    if key == "rough_cut_assembly":
+        return ROUGH_CUT_PRESET
     return GENRE_PRESETS.get(key, GENRE_PRESETS["travel_cinematic"])
 
 

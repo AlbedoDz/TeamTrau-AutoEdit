@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -343,25 +344,67 @@ class VLMAssistant:
         self,
         scenes: list[ScoredScene],
         keyframes: dict[int, np.ndarray] | None = None,
+        concurrency: int | None = None,
     ) -> list[ScoredScene]:
-        """Enrich a list of ScoredScene instances with semantic VLM tags and metadata."""
+        """Enrich a list of ScoredScene instances with semantic VLM tags and metadata concurrently."""
         keyframes = keyframes or {}
+        if not scenes:
+            return scenes
 
-        for scene_idx, scored_scene in enumerate(scenes):
+        max_workers = concurrency or getattr(self.config, "vlm_concurrency", 4)
+        max_workers = max(1, min(max_workers, len(scenes)))
+
+        def _process_single(scene_idx: int, sc: ScoredScene) -> tuple[int, SceneVLMAnalysis]:
             frame = keyframes.get(scene_idx)
-            if frame is None and scored_scene.scene.clip_path:
-                mid_t = (scored_scene.scene.start_time + scored_scene.scene.end_time) / 2.0
-                frame = self.extract_keyframe(scored_scene.scene.clip_path, mid_t)
-
-            duration = scored_scene.scene.duration
+            if frame is None and sc.scene.clip_path:
+                mid_t = (sc.scene.start_time + sc.scene.end_time) / 2.0
+                frame = self.extract_keyframe(sc.scene.clip_path, mid_t)
 
             analysis = self.analyze_scene(
                 frame=frame,
                 scene_index=scene_idx,
-                motion_energy=scored_scene.motion_energy,
-                sharpness_score=scored_scene.sharpness_score,
-                duration=duration,
+                motion_energy=sc.motion_energy,
+                sharpness_score=sc.sharpness_score,
+                duration=sc.scene.duration,
             )
+            return scene_idx, analysis
+
+        results_map: dict[int, SceneVLMAnalysis] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_process_single, idx, sc): idx
+                for idx, sc in enumerate(scenes)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    # Timeout guard: per-request timeout + 5s buffer
+                    _, analysis = future.result(timeout=self.timeout + 5.0)
+                    results_map[idx] = analysis
+                except Exception as exc:
+                    logger.warning(
+                        "VLM worker failed or timed out for scene %d (%s). Falling back to heuristic.",
+                        idx,
+                        exc,
+                    )
+                    sc = scenes[idx]
+                    results_map[idx] = self._heuristic_fallback(
+                        scene_index=idx,
+                        motion_energy=sc.motion_energy,
+                        sharpness_score=sc.sharpness_score,
+                        duration=sc.scene.duration,
+                        frame=keyframes.get(idx),
+                    )
+
+        for scene_idx, scored_scene in enumerate(scenes):
+            analysis = results_map.get(scene_idx)
+            if analysis is None:
+                analysis = self._heuristic_fallback(
+                    scene_index=scene_idx,
+                    motion_energy=scored_scene.motion_energy,
+                    sharpness_score=scored_scene.sharpness_score,
+                    duration=scored_scene.scene.duration,
+                )
 
             # Store in dataclass
             scored_scene.vlm_analysis = analysis

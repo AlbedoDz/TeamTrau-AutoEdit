@@ -140,6 +140,7 @@ def test_inspector_panel_config_sync(qapp):
     panel.combo_subtitles.setCurrentIndex(panel.combo_subtitles.findData("clean_srt"))
     panel.chk_exposure_guard.setChecked(False)
     panel.chk_ken_burns.setChecked(False)
+    panel.spin_ken_burns_zoom.setValue(1.15)
 
     retention_cfg = PipelineConfig()
     panel.apply_to_config(retention_cfg)
@@ -147,6 +148,7 @@ def test_inspector_panel_config_sync(qapp):
     assert retention_cfg.subtitle_style == "clean_srt"
     assert retention_cfg.enable_exposure_guard is False
     assert retention_cfg.enable_ken_burns is False
+    assert abs(retention_cfg.ken_burns_scale_factor - 1.15) < 1e-4
 
 
 def test_export_dialog_instantiation(qapp):

@@ -593,17 +593,18 @@ class MediaBrowserWidget(QWidget):
             self._clip_roles[p] = role_val
         self._rebuild_table()
 
-    def is_valid_setup(self) -> tuple[bool, str]:
+    def is_valid_setup(self, workflow_mode: str = "standard") -> tuple[bool, str]:
         """Validate if current selections are sufficient to run the editing pipeline."""
         if not self.get_input_dir() and not self._video_files:
             return False, "No valid source video directory or clips loaded."
         if not self._video_files and self.get_input_dir():
             files = [
-                f for f in self.get_input_dir().iterdir()
+                f
+                for f in self.get_input_dir().iterdir()
                 if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTS
             ]
             if not files:
                 return False, f"No supported video clips found in '{self.get_input_dir()}'."
-        if not self.get_soundtrack_path():
+        if not self.get_soundtrack_path() and workflow_mode != "rough_cut":
             return False, "Soundtrack audio file must be selected."
         return True, "Ready"

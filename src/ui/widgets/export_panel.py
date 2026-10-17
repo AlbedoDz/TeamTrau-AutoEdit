@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -210,6 +212,31 @@ class ExportPanelWidget(QWidget):
         row_teaser.addWidget(self.spin_teaser_dur)
         row_teaser.addStretch()
         layout_render.addLayout(row_teaser)
+
+        # Advanced NVENC Quality Controls
+        self.grp_nvenc_adv = QGroupBox("Advanced NVENC Quality Overrides", group_render)
+        self.grp_nvenc_adv.setCheckable(True)
+        self.grp_nvenc_adv.setChecked(False)
+        self.grp_nvenc_adv.toggled.connect(lambda: self.export_options_changed.emit())
+        layout_nvenc_adv = QFormLayout(self.grp_nvenc_adv)
+        layout_nvenc_adv.setSpacing(6)
+
+        self.spin_nvenc_bitrate = QSpinBox(self.grp_nvenc_adv)
+        self.spin_nvenc_bitrate.setRange(10, 200)
+        self.spin_nvenc_bitrate.setValue(60)
+        self.spin_nvenc_bitrate.setSuffix(" Mbps")
+        self.spin_nvenc_bitrate.setToolTip("Target average encoding bitrate for master deliverable")
+        self.spin_nvenc_bitrate.valueChanged.connect(lambda: self.export_options_changed.emit())
+        layout_nvenc_adv.addRow("Target Bitrate:", self.spin_nvenc_bitrate)
+
+        self.spin_nvenc_cq = QSpinBox(self.grp_nvenc_adv)
+        self.spin_nvenc_cq.setRange(1, 35)
+        self.spin_nvenc_cq.setValue(18)
+        self.spin_nvenc_cq.setToolTip("Constant Quality / CRF factor (Lower = Higher Quality, 18 = Visually Lossless)")
+        self.spin_nvenc_cq.valueChanged.connect(lambda: self.export_options_changed.emit())
+        layout_nvenc_adv.addRow("Constant Quality (CQ):", self.spin_nvenc_cq)
+
+        layout_render.addWidget(self.grp_nvenc_adv)
 
         layout.addWidget(group_render)
 
@@ -426,6 +453,9 @@ class ExportPanelWidget(QWidget):
             "watermark_position": self.combo_wm_pos.currentText(),
             "watermark_opacity": self.spin_wm_opacity.value(),
             "variant_export_scope": "all" if self.combo_variant_target.currentIndex() == 1 else "active",
+            "nvenc_bitrate": f"{self.spin_nvenc_bitrate.value()}M",
+            "nvenc_cq": self.spin_nvenc_cq.value(),
+            "nvenc_overrides_enabled": self.grp_nvenc_adv.isChecked(),
         }
 
     def apply_to_config(self, config: PipelineConfig) -> None:
@@ -450,6 +480,10 @@ class ExportPanelWidget(QWidget):
             config.watermark_path = Path(wm_txt)
         config.watermark_position = self.combo_wm_pos.currentText()  # type: ignore
         config.watermark_opacity = self.spin_wm_opacity.value()
+
+        if self.grp_nvenc_adv.isChecked():
+            config.nvenc_bitrate = f"{self.spin_nvenc_bitrate.value()}M"
+            config.nvenc_cq = self.spin_nvenc_cq.value()
 
         # Variant generation count: 3 for all variants, 1 for active only
         config.generate_variants = 3 if self.combo_variant_target.currentIndex() == 1 else 1
@@ -478,6 +512,15 @@ class ExportPanelWidget(QWidget):
         if wm_pos_idx >= 0:
             self.combo_wm_pos.setCurrentIndex(wm_pos_idx)
         self.spin_wm_opacity.setValue(config.watermark_opacity)
+
+        if hasattr(config, "nvenc_bitrate") and config.nvenc_bitrate:
+            try:
+                b_num = int(re.sub(r"[^\d]", "", str(config.nvenc_bitrate)))
+                self.spin_nvenc_bitrate.setValue(b_num)
+            except ValueError:
+                pass
+        if hasattr(config, "nvenc_cq") and config.nvenc_cq:
+            self.spin_nvenc_cq.setValue(int(config.nvenc_cq))
 
         if getattr(config, "generate_variants", 3) >= 3:
             self.combo_variant_target.setCurrentIndex(1)

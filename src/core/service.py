@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from src.core.config import PipelineConfig
 from src.core.types import (
+    CleanedSegment,
     CropWindow,
     PipelineExecutionResult,
     SceneCut,
@@ -82,6 +83,35 @@ class JobHandle:
     def result(self) -> PipelineExecutionResult | None:
         """Return final execution result if completed, else None."""
         return self._result
+
+
+def _enforce_vram_headroom(max_allowed_gb: float = 2.0) -> None:
+    """Ensure resident VRAM allocation is low before hardware encoding."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            allocated_bytes = torch.cuda.memory_allocated()
+            allocated_gb = allocated_bytes / (1024**3)
+            if allocated_gb > max_allowed_gb:
+                logger.warning(
+                    "High VRAM allocation before NVENC render: %.2f GB (limit: %.2f GB). Triggering aggressive GC.",
+                    allocated_gb,
+                    max_allowed_gb,
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                logger.info(
+                    "VRAM headroom verified before NVENC render: %.2f GB allocated.",
+                    allocated_gb,
+                )
+    except ImportError:
+        pass
 
 
 class StudioBackendAdapter:
@@ -191,7 +221,7 @@ class StudioBackendAdapter:
     def submit_job(
         self,
         input_dir: Path | list[Path],
-        soundtrack: Path,
+        soundtrack: Path | None,
         output_dir: Path,
         config: PipelineConfig,
         callbacks: JobCallbacks | None = None,
@@ -261,7 +291,7 @@ class StudioBackendAdapter:
     def _execute_pipeline(
         self,
         input_dir: Path | list[Path],
-        soundtrack: Path,
+        soundtrack: Path | None,
         output_dir: Path,
         config: PipelineConfig,
         callbacks: JobCallbacks | None,
@@ -331,6 +361,21 @@ class StudioBackendAdapter:
 
         detector = IngestDetector(config)
 
+        # Pre-ingest VFR detection and normalization pass
+        if getattr(config, "auto_normalize_vfr", True):
+            normalized_raw = []
+            for rf in raw_files:
+                _check_cancel()
+                try:
+                    meta = detector.probe_video(rf)
+                    if meta.is_vfr:
+                        _notify_progress(5.0, 1, f"Normalizing VFR footage ({rf.name})...")
+                        rf = detector.normalize_to_cfr(rf, target_fps=config.fps)
+                except Exception as vfr_err:
+                    logger.warning("VFR check/normalization warning for %s: %s", rf.name, vfr_err)
+                normalized_raw.append(rf)
+            raw_files = normalized_raw
+
         def _ingest_prog(pct: float, msg: str) -> None:
             _notify_progress(pct, 1, msg)
 
@@ -352,53 +397,113 @@ class StudioBackendAdapter:
         # -------------------------------------------------------------
         # Stage 2: Audio Rhythm & Structure Analysis
         # -------------------------------------------------------------
-        _notify_stage("Analyzing Soundtrack & Musical Structure", 2)
-        _notify_progress(10.0, 2, "Computing continuous RMS and spectral novelty...")
+        if config.workflow_mode == "rough_cut" and (soundtrack is None or not Path(soundtrack).exists()):
+            _notify_stage("Audio Rhythm & Structure (Bypassed for Rough Cut)", 2)
+            _notify_progress(100.0, 2, "Camera audio will be preserved on Track A1 (No soundtrack)")
+            audio_res = AudioAnalysisResult(
+                tempo_bpm=0.0,
+                beat_timestamps=[],
+                beats=[],
+                downbeat_timestamps=[],
+                cut_timestamps=[0.0, total_footage_duration],
+                sections=[],
+                extracted_audio_path=None,
+            )
+            active_soundtrack = None
+        else:
+            _notify_stage("Analyzing Soundtrack & Musical Structure", 2)
+            _notify_progress(10.0, 2, "Computing continuous RMS and spectral novelty...")
 
-        active_input_soundtrack = soundtrack
-        if config.enable_audio_fix:
-            try:
-                from src.modules.audio_normalizer import AudioNormalizer
+            active_input_soundtrack = soundtrack
+            if config.enable_audio_fix and soundtrack is not None:
+                try:
+                    from src.modules.audio_normalizer import AudioNormalizer
 
-                audio_norm = AudioNormalizer(cache_dir=output_dir / ".cache" / "audio_clean")
-                active_input_soundtrack = audio_norm.clean_audio(soundtrack)
-            except Exception as norm_err:
-                logger.warning("Audio normalization skipped: %s", norm_err)
+                    audio_norm = AudioNormalizer(cache_dir=output_dir / ".cache" / "audio_clean")
+                    active_input_soundtrack = audio_norm.clean_audio(soundtrack)
+                except Exception as norm_err:
+                    logger.warning("Audio normalization skipped: %s", norm_err)
 
-        audio_engine = AudioAnalyzer(config)
-        audio_res = audio_engine.analyze(
-            active_input_soundtrack,
-            target_duration=config.target_duration,
-            available_footage_duration=total_footage_duration,
-            duration_mode=config.duration_mode,
-        )
-        active_soundtrack = audio_res.extracted_audio_path or active_input_soundtrack
-        _notify_progress(
-            100.0,
-            2,
-            f"BPM: {audio_res.tempo_bpm:.1f}, Sections: {len(audio_res.sections)}",
-        )
+            if active_input_soundtrack is None:
+                raise ValueError("Soundtrack path required for music-driven editing modes.")
+
+            audio_engine = AudioAnalyzer(config)
+            audio_res = audio_engine.analyze(
+                active_input_soundtrack,
+                target_duration=config.target_duration,
+                available_footage_duration=total_footage_duration,
+                duration_mode=config.duration_mode,
+            )
+            active_soundtrack = audio_res.extracted_audio_path or active_input_soundtrack
+            _notify_progress(
+                100.0,
+                2,
+                f"BPM: {audio_res.tempo_bpm:.1f}, Sections: {len(audio_res.sections)}",
+            )
 
         # -------------------------------------------------------------
-        # Stage 3: Visual Quality Scoring & Deduplication
+        # Stage 3: Visual Quality Scoring & Deduplication / Defect Pruning
         # -------------------------------------------------------------
-        _notify_stage("Evaluating Visual Quality & Deduplication", 3)
-        scorer = VisualScorer(config)
+        cleaned_segments: list[CleanedSegment] = []
+        if config.workflow_mode == "rough_cut":
+            _notify_stage("Rough Cut Defect Pruning (Wobble, Shake, Focus)", 3)
+            from src.modules.rough_cut_cleaner import RoughCutCleaner
 
-        def _score_prog(pct: float, msg: str) -> None:
-            _notify_progress(pct, 3, msg)
+            cleaner = RoughCutCleaner(config)
 
-        ranked_scenes = scorer.score_and_rank_scenes(
-            all_scenes,
-            progress_callback=_score_prog,
-            cancel_event=cancel_event,
-        )
+            def _clean_prog(sp: float, tp: float, msg: str) -> None:
+                _notify_progress(sp * 100.0, 3, msg)
 
-        if callbacks and callbacks.on_scene_discovered:
-            for sc in ranked_scenes:
-                callbacks.on_scene_discovered(sc)
+            cleaned_segments = cleaner.clean_batch(all_scenes, progress_callback=_clean_prog)
 
-        _notify_progress(100.0, 3, f"Ranked {len(ranked_scenes)} unique scene candidates")
+            ranked_scenes = []
+            for seg in cleaned_segments:
+                sc_cut = SceneCut(
+                    clip_path=seg.clip_path,
+                    start_time=seg.start_time,
+                    end_time=seg.end_time,
+                    start_frame=int(round(seg.start_time * config.fps)),
+                    end_frame=int(round(seg.end_time * config.fps)),
+                    duration=seg.duration,
+                )
+                sc_scene = ScoredScene(
+                    scene=sc_cut,
+                    sharpness_score=seg.sharpness_score,
+                    aesthetic_score=seg.sharpness_score,
+                    composite_score=seg.sharpness_score,
+                    metadata=seg.metadata,
+                )
+                ranked_scenes.append(sc_scene)
+
+            if callbacks and callbacks.on_scene_discovered:
+                for sc in ranked_scenes:
+                    callbacks.on_scene_discovered(sc)
+
+            _notify_progress(
+                100.0,
+                3,
+                f"Cleaned {len(cleaned_segments)} golden takes in chronological order",
+            )
+        else:
+            _notify_stage("Evaluating Visual Quality & Deduplication", 3)
+            scorer = VisualScorer(config)
+
+            def _score_prog(pct: float, msg: str) -> None:
+                _notify_progress(pct, 3, msg)
+
+            ranked_scenes = scorer.score_and_rank_scenes(
+                all_scenes,
+                progress_callback=_score_prog,
+                cancel_event=cancel_event,
+            )
+
+            if callbacks and callbacks.on_scene_discovered:
+                for sc in ranked_scenes:
+                    callbacks.on_scene_discovered(sc)
+
+            _notify_progress(100.0, 3, f"Ranked {len(ranked_scenes)} unique scene candidates")
+            if hasattr(scorer, "unload_model"):
+                scorer.unload_model()
 
         # -------------------------------------------------------------
         # Stage 4: AI Smart 9:16 Reframing (if vertical)
@@ -418,6 +523,8 @@ class StudioBackendAdapter:
                 cancel_event=cancel_event,
             )
             _notify_progress(100.0, 4, "9:16 pan-and-scan crop windows calculated")
+            if hasattr(reframer, "unload_model"):
+                reframer.unload_model()
         else:
             _notify_progress(100.0, 4, "Skipped (Canvas is horizontal or reframing disabled)")
 
@@ -459,6 +566,9 @@ class StudioBackendAdapter:
                     )
                     ranked_scenes = packed_res.selected_scenes
 
+            if hasattr(transcriber, "unload_model"):
+                transcriber.unload_model()
+
         if config.enable_vlm_tagging:
             _notify_progress(60.0, 5, f"Tagging scenes with VLM ({config.vlm_provider})...")
             vlm_engine = VLMAssistant(config)
@@ -474,13 +584,20 @@ class StudioBackendAdapter:
         _notify_stage("Timeline Synthesis & Multi-NLE Serialization", 6)
         _notify_progress(25.0, 6, "Assembling OpenTimelineIO sequence tracks...")
         timeline_engine = TimelineBuilder(config)
-        master_timeline = timeline_engine.build_timeline(
-            scored_scenes=ranked_scenes,
-            cut_timestamps=audio_res.cut_timestamps,
-            soundtrack_path=active_soundtrack,
-            timeline_name=f"AutoEdit_{config.preset_name}",
-            sections=audio_res.sections,
-        )
+        if config.workflow_mode == "rough_cut" and cleaned_segments:
+            master_timeline = timeline_engine.build_rough_cut_timeline(
+                cleaned_segments=cleaned_segments,
+                timeline_name=f"RoughCut_{config.preset_name}",
+                fps=config.fps,
+            )
+        else:
+            master_timeline = timeline_engine.build_timeline(
+                scored_scenes=ranked_scenes,
+                cut_timestamps=audio_res.cut_timestamps,
+                soundtrack_path=active_soundtrack if active_soundtrack else raw_files[0],
+                timeline_name=f"AutoEdit_{config.preset_name}",
+                sections=audio_res.sections,
+            )
 
         # Pre-dispatch Timeline QA & Sanitization Hook
         _notify_progress(45.0, 6, "Auditing sequence integrity (TimelineQA)...")
@@ -505,22 +622,23 @@ class StudioBackendAdapter:
 
         # Multi-Variant Timeline Synthesis (1-3 Variations)
         variants = {}
-        try:
-            from src.modules.variant_synthesizer import MultiVariantTimelineSynthesizer
+        if config.workflow_mode != "rough_cut" and active_soundtrack is not None:
+            try:
+                from src.modules.variant_synthesizer import MultiVariantTimelineSynthesizer
 
-            variant_synth = MultiVariantTimelineSynthesizer(config)
-            variant_cnt = getattr(config, "generate_variants", 3)
-            variants = variant_synth.synthesize_variants(
-                scored_scenes=ranked_scenes,
-                beats=audio_res.beats,
-                soundtrack_path=active_soundtrack,
-                song_sections=audio_res.sections,
-                variant_count=variant_cnt,
-                output_dir=output_dir / "variants",
-            )
-            logger.info("Synthesized %d creative timeline variants.", len(variants))
-        except Exception as var_err:
-            logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
+                variant_synth = MultiVariantTimelineSynthesizer(config)
+                variant_cnt = getattr(config, "generate_variants", 3)
+                variants = variant_synth.synthesize_variants(
+                    scored_scenes=ranked_scenes,
+                    beats=audio_res.beats,
+                    soundtrack_path=active_soundtrack,
+                    song_sections=audio_res.sections,
+                    variant_count=variant_cnt,
+                    output_dir=output_dir / "variants",
+                )
+                logger.info("Synthesized %d creative timeline variants.", len(variants))
+            except Exception as var_err:
+                logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
 
         _notify_progress(100.0, 6, f"Multi-variant synthesis ready ({len(variants)} cuts)")
 
@@ -542,6 +660,7 @@ class StudioBackendAdapter:
         # -------------------------------------------------------------
         render_res = None
         if not no_render:
+            _enforce_vram_headroom(max_allowed_gb=2.0)
             _notify_stage("Master Video Rendering (FFmpeg NVENC)", 7)
             renderer = NvencRenderer(config)
             master_video_path = output_dir / f"master_{config.preset_name}.mp4"
@@ -549,9 +668,18 @@ class StudioBackendAdapter:
             def _render_prog(pct: float, msg: str) -> None:
                 _notify_progress(pct, 7, msg)
 
+            render_cuts = audio_res.cut_timestamps
+            if config.workflow_mode == "rough_cut":
+                cum_cuts = [0.0]
+                cur = 0.0
+                for s in ranked_scenes:
+                    cur += s.scene.duration
+                    cum_cuts.append(cur)
+                render_cuts = cum_cuts
+
             render_res = renderer.render_sequence(
                 scored_scenes=ranked_scenes,
-                cut_timestamps=audio_res.cut_timestamps,
+                cut_timestamps=render_cuts,
                 soundtrack_path=active_soundtrack,
                 output_file=master_video_path,
                 force_cpu=force_cpu,

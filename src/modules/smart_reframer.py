@@ -57,6 +57,21 @@ class SmartReframer:
             )
             self._model = None
 
+    def unload_model(self) -> None:
+        """Unload YOLO model from VRAM and run garbage collection."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info("Evicted SmartReframer YOLO model from CUDA VRAM.")
+        except ImportError:
+            pass
+
     def is_vertical_target(self) -> bool:
         """Check if target canvas preset is vertical (9:16 or height > width)."""
         return self.config.canvas_width < self.config.canvas_height

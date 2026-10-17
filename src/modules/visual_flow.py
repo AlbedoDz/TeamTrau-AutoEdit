@@ -21,7 +21,7 @@ def extract_frame_at_timestamp(
     video_path: Path, timestamp: float
 ) -> np.ndarray | None:
     """Extract a single BGR video frame at the specified timestamp in seconds."""
-    if not video_path.is_file():
+    if not video_path.is_file() or video_path.stat().st_size == 0:
         return None
 
     cap = cv2.VideoCapture(str(video_path))

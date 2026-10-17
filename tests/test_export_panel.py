@@ -311,3 +311,32 @@ def test_export_panel_variant_selection(qapp, tmp_path):
     assert "Beat-Driven" in panel.lbl_deliv_variants.text()
     assert "Cinematic" in panel.lbl_deliv_variants.text()
 
+
+def test_export_panel_nvenc_quality_controls(qapp):
+    """Verify Advanced NVENC Quality group, bitrate, and CQ spinboxes."""
+    panel = ExportPanelWidget()
+    assert panel.grp_nvenc_adv.isChecked() is False
+    assert panel.spin_nvenc_bitrate.value() == 60
+    assert panel.spin_nvenc_cq.value() == 18
+
+    # Enable and adjust
+    panel.grp_nvenc_adv.setChecked(True)
+    panel.spin_nvenc_bitrate.setValue(85)
+    panel.spin_nvenc_cq.setValue(22)
+
+    opts = panel.get_export_options()
+    assert opts["nvenc_bitrate"] == "85M"
+    assert opts["nvenc_cq"] == 22
+    assert opts["nvenc_overrides_enabled"] is True
+
+    cfg = PipelineConfig()
+    panel.apply_to_config(cfg)
+    assert cfg.nvenc_bitrate == "85M"
+    assert cfg.nvenc_cq == 22
+
+    # Load from config
+    cfg2 = PipelineConfig(nvenc_bitrate="120M", nvenc_cq=15)
+    panel.load_from_config(cfg2)
+    assert panel.spin_nvenc_bitrate.value() == 120
+    assert panel.spin_nvenc_cq.value() == 15
+

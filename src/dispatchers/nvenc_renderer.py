@@ -27,7 +27,7 @@ class NvencRenderer:
         self,
         scored_scenes: list[ScoredScene],
         cut_timestamps: list[float],
-        soundtrack_path: Path,
+        soundtrack_path: Path | None,
         output_file: Path,
         force_cpu: bool = False,
         include_teaser: bool | None = None,
@@ -162,12 +162,15 @@ class NvencRenderer:
         )
 
         # Concat video segments with optional watermark overlay
+        has_soundtrack = soundtrack_path is not None and Path(soundtrack_path).exists()
+        audio_input_idx = len(unique_sources) if has_soundtrack else -1
+
         if has_watermark:
             concat_str = (
                 f"{''.join(concat_v_labels)}concat=n={len(concat_v_labels)}:v=1:a=0[vconcat];"
             )
             filter_lines.append(concat_str)
-            wm_input_idx = audio_input_idx + 1
+            wm_input_idx = len(unique_sources) + (1 if has_soundtrack else 0)
             wm_lines = build_watermark_filter_lines(
                 wm_input_idx=wm_input_idx,
                 base_v_label="vconcat",
@@ -183,12 +186,29 @@ class NvencRenderer:
             )
             filter_lines.append(concat_str)
 
-        # Audio track trim
-        audio_trim = (
-            f"[{audio_input_idx}:a]atrim=start=0:duration={total_duration:.3f},"
-            f"asetpts=PTS-STARTPTS[aout]"
-        )
-        filter_lines.append(audio_trim)
+        # Audio track processing
+        if has_soundtrack:
+            audio_trim = (
+                f"[{audio_input_idx}:a]atrim=start=0:duration={total_duration:.3f},"
+                f"asetpts=PTS-STARTPTS[aout]"
+            )
+            filter_lines.append(audio_trim)
+        else:
+            # Concatenate synchronous camera audio from clips
+            concat_a_labels: list[str] = []
+            for i, (sc, clip_dur, _cw, speed, _kb) in enumerate(clip_specs):
+                in_idx = source_to_idx[sc.clip_path.resolve()]
+                a_label = f"a{i}"
+                concat_a_labels.append(f"[{a_label}]")
+                eff_speed = max(0.1, float(speed))
+                src_duration = min(sc.duration, clip_dur * eff_speed) if eff_speed != 1.0 else clip_dur
+                filter_lines.append(
+                    f"[{in_idx}:a]atrim=start={sc.start_time:.3f}:duration={src_duration:.3f},"
+                    f"asetpts=PTS-STARTPTS[{a_label}];"
+                )
+            filter_lines.append(
+                f"{''.join(concat_a_labels)}concat=n={len(concat_a_labels)}:v=0:a=1[aout]"
+            )
 
         filter_complex_content = "\n".join(filter_lines)
 
@@ -208,8 +228,9 @@ class NvencRenderer:
         for src in unique_sources:
             cmd.extend(["-i", str(src)])
 
-        # Add audio input
-        cmd.extend(["-i", str(soundtrack_path.resolve())])
+        # Add audio input if soundtrack present
+        if has_soundtrack and soundtrack_path is not None:
+            cmd.extend(["-i", str(soundtrack_path.resolve())])
 
         # Add watermark input if active
         if has_watermark and self.config.watermark_path is not None:
