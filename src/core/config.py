@@ -374,6 +374,11 @@ class PipelineConfig(BaseModel):
     cpu_encoder_preset: str = Field(default="medium")
     render_workers: int = Field(default=2, ge=1, le=8)
     camera_audio_mix_db: float = Field(default=-12.0)
+    # Deliver master (Phase 22 step 6)
+    master_audio_limit: float = Field(default=0.95, gt=0.0, le=1.0)  # final alimiter ceiling (linear)
+    master_audio_bitrate: str = Field(default="320k")  # AAC bitrate for mp4 masters
+    burn_subtitle_font: str = Field(default="Arial")  # covers Vietnamese diacritics
+    burn_subtitle_font_size: int = Field(default=0, ge=0, le=96)  # 0 = auto (libass 384x288 units)
 
     # Rough-Cut & Defect Pruning Constants
     enable_head_tail_trim: bool = Field(default=True)
