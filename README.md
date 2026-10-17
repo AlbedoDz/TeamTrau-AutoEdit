@@ -1,5 +1,8 @@
 # TeamTrau-AutoEdit: Production-Grade Automated Video Editing Orchestrator
 
+![Uploading image.png…]()
+
+
 Production-grade automated video editing engine on Windows 11 with NVIDIA GPU hardware acceleration (CUDA, NVENC).
 
 The toolkit ingests raw 4K footage and soundtrack audio, isolates camera shot boundaries non-destructively (PySceneDetect), prunes static/dead air sections (Auto-Editor/OpenCV), tracks rhythmic downbeats and tempo (Librosa), scores visual composition and sharpness (CUDA/OpenCV), synthesizes multi-track timelines (OpenTimelineIO), and exports to:
