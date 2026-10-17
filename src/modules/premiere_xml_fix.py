@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
-from src.core.ffmpeg_utils import ffprobe_json
+from src.core.media_info import probe_media
 
 logger = logging.getLogger(__name__)
 
@@ -34,20 +34,22 @@ def _path_from_url(url: str) -> Path | None:
 
 
 def _probe(path: Path) -> dict:
-    """{'width','height','channels','rate','has_audio'} for a media file (zeros when unknown)."""
-    info = {"width": 0, "height": 0, "channels": 0, "rate": 48000, "has_audio": False}
-    data = ffprobe_json(path) if path else None
-    if not data:
-        return info
-    for s in data.get("streams", []):
-        kind = s.get("codec_type")
-        if kind == "video" and not info["width"] and (s.get("disposition", {}) or {}).get("attached_pic", 0) != 1:
-            info["width"], info["height"] = int(s.get("width") or 0), int(s.get("height") or 0)
-        elif kind == "audio" and not info["has_audio"]:
-            info["has_audio"] = True
-            info["channels"] = int(s.get("channels") or 2)
-            info["rate"] = int(s.get("sample_rate") or 48000)
-    return info
+    """{'width','height','channels','rate','has_audio'} for a media file (zeros when unknown).
+
+    Width/height are display sizes (rotation applied), so a portrait iPhone clip is reported
+    as 1080x1920 rather than its coded 1920x1080.
+    """
+    info = probe_media(path) if path else None
+    result = {"width": 0, "height": 0, "channels": 0, "rate": 48000, "has_audio": False}
+    if info is None:
+        return result
+    if info.has_video:
+        result["width"], result["height"] = info.width, info.height
+    if info.has_audio:
+        result["has_audio"] = True
+        result["channels"] = info.audio_channels or 2
+        result["rate"] = info.audio_rate or 48000
+    return result
 
 
 def _set(parent: ET.Element, tag: str, text: str) -> ET.Element:

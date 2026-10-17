@@ -22,21 +22,12 @@ from urllib.request import url2pathname
 import opentimelineio as otio
 
 from src.core.ffmpeg_utils import has_audio_stream
+from src.core.timebase import frame_rate_fraction as frame_rate
 
 logger = logging.getLogger(__name__)
 
 FCPXML_VERSION = "1.8"
 CROSS_DISSOLVE_UID = "FxPlug:4731E73A-8DAC-4113-9A30-AE85B1761265"
-
-_NTSC = {24: 1001, 30: 1001, 60: 1001, 48: 1001}
-
-
-def frame_rate(fps: float) -> Fraction:
-    """Exact frame rate, mapping NTSC-style rates (23.976, 29.97, 59.94) to n/1001."""
-    for whole, den in _NTSC.items():
-        if abs(fps - whole * 1000 / den) < 0.01:
-            return Fraction(whole * 1000, den)
-    return Fraction(fps).limit_denominator(1000)
 
 
 def fmt_time(t: Fraction) -> str:

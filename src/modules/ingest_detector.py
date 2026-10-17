@@ -1,6 +1,7 @@
 """Non-destructive video ingestion, scene detection, and pre-trimming module."""
 
 import csv
+import dataclasses
 import hashlib
 import json
 import logging
@@ -50,6 +51,8 @@ class IngestDetector:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.failed_files: list[tuple[Path, str]] = []
+        # CFR proxy -> user's original media, so NLE exports can relink to the originals.
+        self.proxy_to_original: dict[Path, Path] = {}
 
     def probe_video(
         self,
@@ -168,6 +171,7 @@ class IngestDetector:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists() and output_path.stat().st_size > 0:
             logger.info("Reusing existing CFR normalized video: %s", output_path)
+            self.proxy_to_original[output_path] = video_path
             return output_path
 
         tmp_path = output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
@@ -213,7 +217,19 @@ class IngestDetector:
                 os.replace(tmp_path, output_path)
         finally:
             tmp_path.unlink(missing_ok=True)
+        self.proxy_to_original[output_path] = video_path
         return output_path
+
+    def _attach_original(self, scenes: list[SceneCut]) -> list[SceneCut]:
+        """Stamp scenes cut from a CFR proxy with the original media path."""
+        if not self.proxy_to_original:
+            return scenes
+        lookup = {Path(k).resolve(): v for k, v in self.proxy_to_original.items()}
+        out: list[SceneCut] = []
+        for sc in scenes:
+            orig = lookup.get(Path(sc.clip_path).resolve()) if sc.original_path is None else None
+            out.append(dataclasses.replace(sc, original_path=orig) if orig is not None else sc)
+        return out
 
     def detect_scenes(
         self, video_path: Path, metadata: VideoMetadata | None = None
@@ -857,7 +873,7 @@ class IngestDetector:
 
         # Assemble in original file order
         for vp in video_paths:
-            all_scenes.extend(video_results.get(vp, []))
+            all_scenes.extend(self._attach_original(video_results.get(vp, [])))
 
         return all_scenes
 

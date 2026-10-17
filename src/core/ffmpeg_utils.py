@@ -9,7 +9,6 @@ import json
 import logging
 import shutil
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -69,22 +68,11 @@ def ffprobe_json(path: Path, timeout: float = 30.0) -> dict[str, Any] | None:
         return None
 
 
-@lru_cache(maxsize=512)
-def _has_audio_cached(path_str: str, size: int, mtime: float) -> bool:
-    data = ffprobe_json(Path(path_str))
-    if data is None:
-        return False
-    return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
-
-
 def has_audio_stream(path: Path) -> bool:
     """Whether a media file contains at least one audio stream (cached by size+mtime)."""
-    p = Path(path)
-    try:
-        st = p.stat()
-    except OSError:
-        return False
-    return _has_audio_cached(str(p.resolve()), st.st_size, st.st_mtime)
+    from src.core.media_info import probe_media  # local import: media_info builds on this module
+
+    return probe_media(path).has_audio
 
 
 def stream_rotation(stream: dict[str, Any]) -> int:

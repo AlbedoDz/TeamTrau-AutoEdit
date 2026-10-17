@@ -3,7 +3,14 @@
 from pathlib import Path
 from typing import Any
 
-from src.core.types import CropWindow, EditClip, EditTimeline, SongSection, SongSectionType
+from src.core.types import (
+    CropWindow,
+    DeliverSettings,
+    EditClip,
+    EditTimeline,
+    SongSection,
+    SongSectionType,
+)
 
 
 def _crop_to_dict(cw: CropWindow | None) -> dict[str, Any] | None:
@@ -73,6 +80,8 @@ def edit_clip_to_dict(c: EditClip) -> dict[str, Any]:
         "is_teaser": c.is_teaser,
         "label": c.label,
         "markers": list(c.markers),
+        "original_path": str(c.original_path) if c.original_path else None,
+        "crop_needs_recompute": c.crop_needs_recompute,
     }
 
 
@@ -89,6 +98,8 @@ def edit_clip_from_dict(d: dict[str, Any]) -> EditClip:
         is_teaser=bool(d.get("is_teaser", False)),
         label=str(d.get("label", "")),
         markers=list(d.get("markers", [])),
+        original_path=Path(d["original_path"]) if d.get("original_path") else None,
+        crop_needs_recompute=bool(d.get("crop_needs_recompute", False)),
     )
 
 
@@ -119,4 +130,46 @@ def edit_timeline_from_dict(d: dict[str, Any]) -> EditTimeline:
         sections=[section_from_dict(s) for s in d.get("sections", [])],
         variant_key=str(d.get("variant_key", "master")),
         kind="rough_cut" if d.get("kind") == "rough_cut" else "music",
+    )
+
+
+def deliver_settings_to_dict(s: DeliverSettings) -> dict[str, Any]:
+    """JSON-serializable form of DeliverSettings (stored in .tteproj v2.2)."""
+    return {
+        "canvas_width": s.canvas_width,
+        "canvas_height": s.canvas_height,
+        "fps": s.fps,
+        "fit_mode": s.fit_mode,
+        "color": s.color,
+        "audio_rate": s.audio_rate,
+        "audio_channels": s.audio_channels,
+        "master": s.master,
+        "subtitles": s.subtitles,
+        "watermark_in_nle": s.watermark_in_nle,
+        "relink_original": s.relink_original,
+        "variants": list(s.variants),
+        "fcpxml_version": s.fcpxml_version,
+    }
+
+
+def deliver_settings_from_dict(d: dict[str, Any]) -> DeliverSettings:
+    """Inverse of :func:`deliver_settings_to_dict`; missing keys take the dataclass defaults.
+
+    Unknown keys are ignored (forward compatibility). Invalid values raise ValueError.
+    """
+    defaults = DeliverSettings(canvas_width=1920, canvas_height=1080, fps=30.0)
+    return DeliverSettings(
+        canvas_width=int(d.get("canvas_width", defaults.canvas_width)),
+        canvas_height=int(d.get("canvas_height", defaults.canvas_height)),
+        fps=float(d.get("fps", defaults.fps)),
+        fit_mode=d.get("fit_mode", defaults.fit_mode),
+        color=d.get("color", defaults.color),
+        audio_rate=int(d.get("audio_rate", defaults.audio_rate)),
+        audio_channels=int(d.get("audio_channels", defaults.audio_channels)),
+        master=d.get("master", defaults.master),
+        subtitles=d.get("subtitles", defaults.subtitles),
+        watermark_in_nle=bool(d.get("watermark_in_nle", defaults.watermark_in_nle)),
+        relink_original=bool(d.get("relink_original", defaults.relink_original)),
+        variants=list(d.get("variants") or defaults.variants),
+        fcpxml_version=str(d.get("fcpxml_version", defaults.fcpxml_version)),
     )

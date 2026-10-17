@@ -2,8 +2,14 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
+
+from src.core.timebase import frame_rate_fraction
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (config imports this module)
+    from src.core.config import PipelineConfig
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,8 @@ class SceneCut:
     start_frame: int
     end_frame: int
     duration: float
+    # User's original media when ``clip_path`` is a render proxy (VFR->CFR cache file).
+    original_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.end_time < self.start_time:
@@ -273,6 +281,18 @@ class EditClip:
     is_teaser: bool = False
     label: str = ""
     markers: list[dict[str, Any]] = field(default_factory=list)
+    # The user's original media when ``source_path`` is a render proxy (e.g. a VFR->CFR cache
+    # file). NLE exports link to it so projects never point into the .cache folder.
+    original_path: Path | None = None
+    # Set by retarget_timeline when the canvas aspect changed: ``crop_window`` was computed for
+    # the previous canvas and exporters/renderers should recompute (or ignore) it.
+    crop_needs_recompute: bool = False
+
+    def media_path(self, relink_original: bool = True) -> Path:
+        """Path an NLE file should reference: the original media when known, else the source."""
+        if relink_original and self.original_path is not None:
+            return Path(self.original_path)
+        return Path(self.source_path)
 
     @property
     def source_path_resolved(self) -> Path:
@@ -315,6 +335,108 @@ class EditTimeline:
             acc += c.frames
             pts.append(acc / self.fps)
         return pts
+
+
+DeliverFitMode = Literal["auto", "fit", "fill", "stretch"]
+DeliverColor = Literal["rec709", "rec2020_hlg", "rec2020_pq", "passthrough"]
+DeliverMaster = Literal["hevc", "h264", "prores_422", "prores_hq", "dnxhr_hqx"]
+DeliverSubtitles = Literal["none", "srt", "ass", "burn"]
+VALID_AUDIO_RATES: tuple[int, ...] = (44100, 48000, 96000)
+
+
+@dataclass
+class DeliverSettings:
+    """Everything chosen at Deliver time (canvas, timebase, colour, audio, master, extras).
+
+    Validated on construction; call :meth:`validate` again after mutating fields.
+    ``fps`` stays a float for compatibility - use :attr:`fps_fraction` for exact arithmetic.
+    """
+
+    canvas_width: int
+    canvas_height: int
+    fps: float
+    fit_mode: DeliverFitMode = "auto"
+    color: DeliverColor = "rec709"
+    audio_rate: int = 48000
+    audio_channels: int = 2
+    master: DeliverMaster = "hevc"
+    subtitles: DeliverSubtitles = "none"
+    watermark_in_nle: bool = False
+    relink_original: bool = True
+    variants: list[str] = field(default_factory=lambda: ["active"])
+    fcpxml_version: str = "1.8"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Raise ValueError with a clear message for any invalid field."""
+        for name in ("canvas_width", "canvas_height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            if value % 2:
+                raise ValueError(f"{name} must be even (video encoders need even sizes), got {value}")
+        try:
+            fps_ok = float(self.fps) > 0
+        except (TypeError, ValueError):
+            fps_ok = False
+        if not fps_ok:
+            raise ValueError(f"fps must be a positive number, got {self.fps!r}")
+        if self.audio_rate not in VALID_AUDIO_RATES:
+            raise ValueError(
+                f"audio_rate must be one of {list(VALID_AUDIO_RATES)}, got {self.audio_rate!r}"
+            )
+        if self.audio_channels not in (1, 2):
+            raise ValueError(f"audio_channels must be 1 or 2, got {self.audio_channels!r}")
+        for name, literal in (
+            ("fit_mode", DeliverFitMode),
+            ("color", DeliverColor),
+            ("master", DeliverMaster),
+            ("subtitles", DeliverSubtitles),
+        ):
+            value = getattr(self, name)
+            allowed = get_args(literal)
+            if value not in allowed:
+                raise ValueError(f"{name} must be one of {list(allowed)}, got {value!r}")
+        if not isinstance(self.variants, list) or not self.variants or not all(
+            isinstance(v, str) and v for v in self.variants
+        ):
+            raise ValueError(
+                f"variants must be a non-empty list of variant keys (or ['all']), got {self.variants!r}"
+            )
+        if not isinstance(self.fcpxml_version, str) or not self.fcpxml_version.strip():
+            raise ValueError("fcpxml_version must be a non-empty string such as '1.8'")
+
+    @property
+    def fps_fraction(self) -> Fraction:
+        """Exact frame rate (29.97 -> 30000/1001)."""
+        return frame_rate_fraction(self.fps)
+
+    @property
+    def canvas(self) -> tuple[int, int]:
+        return (self.canvas_width, self.canvas_height)
+
+    @classmethod
+    def from_timeline(
+        cls, edit_tl: "EditTimeline", config: "PipelineConfig | None" = None, **overrides: Any
+    ) -> "DeliverSettings":
+        """Settings matching ``edit_tl`` (canvas, fps); the rest from ``config`` defaults."""
+        kwargs: dict[str, Any] = {}
+        if config is not None:
+            if getattr(config, "burn_hardsubs", False):
+                kwargs["subtitles"] = "burn"
+            elif getattr(config, "enable_transcription", False) and getattr(
+                config, "export_subtitles_srt", False
+            ):
+                kwargs["subtitles"] = "srt"
+        kwargs.update(overrides)
+        return cls(
+            canvas_width=edit_tl.canvas_width,
+            canvas_height=edit_tl.canvas_height,
+            fps=edit_tl.fps,
+            **kwargs,
+        )
 
 
 @dataclass

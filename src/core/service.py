@@ -749,6 +749,7 @@ class StudioBackendAdapter:
                     start_frame=int(round(seg.start_time * config.fps)),
                     end_frame=int(round(seg.end_time * config.fps)),
                     duration=seg.duration,
+                    original_path=seg.scene.original_path,
                 )
                 sc_scene = ScoredScene(
                     scene=sc_cut,

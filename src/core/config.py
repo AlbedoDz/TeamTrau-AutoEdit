@@ -10,6 +10,7 @@ from typing import Final
 from pydantic import BaseModel, Field
 
 from src.core.ffmpeg_utils import run_tool
+from src.core.timebase import frame_rate_fraction  # noqa: F401  (re-exported)
 from src.core.types import RenderPreset, WatermarkPosition, WorkflowMode
 
 # Predefined standard industry presets. Default is 1080p30.
@@ -76,6 +77,91 @@ PRESETS: Final[dict[str, RenderPreset]] = {
         height=2160,
         fps=24.0,
         description="DCI 4K at 24 fps (Theatrical Cinema Standard)",
+    ),
+    # --- Phase 22 additions: NTSC broadcast rates and extra canvases -----------------------
+    "1080p23.976": RenderPreset(
+        name="1080p23.976",
+        width=1920,
+        height=1080,
+        fps=23.976,
+        description="Full HD 1080p at 23.976 fps (NTSC Cinematic)",
+    ),
+    "1080p29.97": RenderPreset(
+        name="1080p29.97",
+        width=1920,
+        height=1080,
+        fps=29.97,
+        description="Full HD 1080p at 29.97 fps (NTSC Broadcast)",
+    ),
+    "1080p59.94": RenderPreset(
+        name="1080p59.94",
+        width=1920,
+        height=1080,
+        fps=59.94,
+        description="Full HD 1080p at 59.94 fps (NTSC High Motion)",
+    ),
+    "4k23.976": RenderPreset(
+        name="4k23.976",
+        width=3840,
+        height=2160,
+        fps=23.976,
+        description="Ultra HD 4K at 23.976 fps (NTSC Cinematic 4K)",
+    ),
+    "4k29.97": RenderPreset(
+        name="4k29.97",
+        width=3840,
+        height=2160,
+        fps=29.97,
+        description="Ultra HD 4K at 29.97 fps (NTSC Broadcast 4K)",
+    ),
+    "4k59.94": RenderPreset(
+        name="4k59.94",
+        width=3840,
+        height=2160,
+        fps=59.94,
+        description="Ultra HD 4K at 59.94 fps (NTSC 4K High Motion)",
+    ),
+    "portrait_2k": RenderPreset(
+        name="portrait_2k",
+        width=1440,
+        height=2560,
+        fps=30.0,
+        description="Vertical 9:16 2K (1440x2560) at 30 fps",
+    ),
+    "portrait_4k": RenderPreset(
+        name="portrait_4k",
+        width=2160,
+        height=3840,
+        fps=30.0,
+        description="Vertical 9:16 4K (2160x3840) at 30 fps",
+    ),
+    "square_1080": RenderPreset(
+        name="square_1080",
+        width=1080,
+        height=1080,
+        fps=30.0,
+        description="Square 1:1 (1080x1080) at 30 fps (Instagram / Facebook feed)",
+    ),
+    "4x5_1080x1350": RenderPreset(
+        name="4x5_1080x1350",
+        width=1080,
+        height=1350,
+        fps=30.0,
+        description="Portrait 4:5 (1080x1350) at 30 fps (Instagram feed)",
+    ),
+    "ultrawide_2560x1080": RenderPreset(
+        name="ultrawide_2560x1080",
+        width=2560,
+        height=1080,
+        fps=30.0,
+        description="Ultrawide 21:9 (2560x1080) at 30 fps",
+    ),
+    "dci_2k_2048x1080": RenderPreset(
+        name="dci_2k_2048x1080",
+        width=2048,
+        height=1080,
+        fps=24.0,
+        description="DCI 2K (2048x1080) at 24 fps (Theatrical)",
     ),
 }
 

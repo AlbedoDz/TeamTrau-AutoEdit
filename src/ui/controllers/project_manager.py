@@ -14,10 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import PRESETS, PipelineConfig
-from src.core.project_io import edit_timeline_from_dict, edit_timeline_to_dict
+from src.core.project_io import (
+    deliver_settings_from_dict,
+    edit_timeline_from_dict,
+    edit_timeline_to_dict,
+)
 from src.core.types import (
     BeatMarker,
     CropWindow,
+    DeliverSettings,
     EditTimeline,
     PipelineExecutionResult,
     SceneCut,
@@ -34,7 +39,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECENT_PROJECTS_PATH = Path.home() / ".teamtrau" / "recent_projects.json"
 PROJECT_FILE_EXTENSION = ".tteproj"
 PROJECT_FILE_FILTER = "TeamTrau Project (*.tteproj);;All Files (*.*)"
-PROJECT_SCHEMA_VERSION = "2.1.0"
+PROJECT_SCHEMA_VERSION = "2.2.0"
 
 
 @dataclass
@@ -69,6 +74,8 @@ class ProjectData:
     # v2.1: edit timelines are the single source of truth for Deliver/Export.
     edit_timelines: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_timeline_key: str = "master"
+    # v2.2: Deliver settings (canvas/fps/colour/audio/master...); empty = derive from timeline.
+    deliver_settings: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert project data to JSON-serializable dictionary."""
@@ -101,7 +108,18 @@ class ProjectData:
             deliverables=data.get("deliverables", {}),
             edit_timelines=data.get("edit_timelines", {}),
             active_timeline_key=data.get("active_timeline_key", "master"),
+            deliver_settings=data.get("deliver_settings") or {},
         )
+
+    def get_deliver_settings(self) -> DeliverSettings | None:
+        """Decode stored Deliver settings; None when absent (v2.0/2.1) or invalid."""
+        if not self.deliver_settings:
+            return None
+        try:
+            return deliver_settings_from_dict(self.deliver_settings)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Ignoring invalid stored deliver_settings: %s", exc)
+            return None
 
     def get_edit_timelines(self) -> dict[str, EditTimeline]:
         """Decode stored edit timelines; v2.0 projects are upgraded from their variants."""
@@ -271,6 +289,7 @@ class ProjectManager:
             "start_frame": scene.scene.start_frame,
             "end_frame": scene.scene.end_frame,
             "duration": scene.scene.duration,
+            "original_path": str(scene.scene.original_path) if scene.scene.original_path else None,
             "sharpness_score": scene.sharpness_score,
             "aesthetic_score": scene.aesthetic_score,
             "composite_score": scene.composite_score,
@@ -293,6 +312,7 @@ class ProjectManager:
             start_frame=int(d["start_frame"]),
             end_frame=int(d["end_frame"]),
             duration=float(d["duration"]),
+            original_path=Path(d["original_path"]) if d.get("original_path") else None,
         )
         crop_win = None
         if d.get("crop_window"):

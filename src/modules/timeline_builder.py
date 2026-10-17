@@ -1,14 +1,13 @@
 """OpenTimelineIO sequence synthesizer exporting FCPXML and Premiere XML."""
 
 import logging
-from functools import lru_cache
 from pathlib import Path
 
 import opentimelineio as otio
 from opentimelineio.opentime import RationalTime, TimeRange
 
 from src.core.config import PipelineConfig
-from src.core.ffmpeg_utils import ffprobe_json
+from src.core.media_info import probe_media
 from src.core.ontology import natural_sort_key
 from src.core.types import (
     CleanedSegment,
@@ -44,36 +43,21 @@ def _media_reference(path: Path, fallback_duration: float, fps: float) -> otio.s
 
 
 def media_duration_and_rate(path: Path) -> tuple[float, float]:
-    """(duration_sec, video_fps) of a media file via cached ffprobe; zeros when unknown."""
-    p = Path(path)
-    try:
-        st = p.stat()
-    except OSError:
-        return 0.0, 0.0
-    return _probe_media_cached(str(p.resolve()), st.st_size, st.st_mtime_ns)
+    """(duration_sec, video_fps) of a media file via the shared probe; zeros when unknown.
+
+    A variable-frame-rate file has no meaningful media rate, so 0.0 is returned and callers
+    fall back to the timeline rate.
+    """
+    info = probe_media(path)
+    if info.is_vfr:
+        return info.duration, 0.0
+    rate = float(info.avg_fps or info.fps or 0)
+    return info.duration, rate
 
 
-@lru_cache(maxsize=1024)
-def _probe_media_cached(path_str: str, size: int, mtime_ns: int) -> tuple[float, float]:
-    data = ffprobe_json(Path(path_str))
-    if not data:
-        return 0.0, 0.0
-    rate = 0.0
-    duration = 0.0
-    try:
-        duration = float((data.get("format") or {}).get("duration") or 0.0)
-    except (TypeError, ValueError):
-        duration = 0.0
-    for st in data.get("streams", []):
-        if st.get("codec_type") == "video":
-            r = str(st.get("avg_frame_rate") or st.get("r_frame_rate") or "0/1")
-            try:
-                n, d = (r.split("/", 1) + ["1"])[:2]
-                rate = float(n) / float(d) if float(d) else 0.0
-            except ValueError:
-                rate = 0.0
-            break
-    return duration, rate
+def _probe_media_cached(path_str: str, size: int = 0, mtime_ns: int = 0) -> tuple[float, float]:
+    """Backwards-compatible shim (probe results are cached in ``probe_media`` itself)."""
+    return media_duration_and_rate(Path(path_str))
 
 
 def _source_range(source_in: float, frames_out: int, timeline_fps: float, media_rate: float) -> TimeRange:
@@ -115,8 +99,14 @@ class TimelineBuilder:
         )
         return self.build_from_edit_timeline(edit_tl)
 
-    def build_from_edit_timeline(self, edit_tl: EditTimeline) -> otio.schema.Timeline:
-        """Serialize an EditTimeline into an OTIO timeline (V1 picture, A1 music or camera audio)."""
+    def build_from_edit_timeline(
+        self, edit_tl: EditTimeline, relink_original: bool = True
+    ) -> otio.schema.Timeline:
+        """Serialize an EditTimeline into an OTIO timeline (V1 picture, A1 music or camera audio).
+
+        With ``relink_original`` (default) clips that were cut from a render proxy (VFR->CFR
+        cache file) reference the user's original media, so NLE files never point into .cache.
+        """
         fps = edit_tl.fps
         timeline = otio.schema.Timeline(name=edit_tl.name)
         video_track = otio.schema.Track(name="V1", kind=otio.schema.TrackKind.Video)
@@ -131,7 +121,7 @@ class TimelineBuilder:
             clip_frames = max(1, min(ec.frames, src_frames))
             pad_frames = max(0, ec.frames - clip_frames)
 
-            media_ref = _media_reference(ec.source_path, ec.source_in + ec.available, fps)
+            media_ref = _media_reference(ec.media_path(relink_original), ec.source_in + ec.available, fps)
             media_rate = media_ref.available_range.duration.rate
             src_range = _source_range(ec.source_in, clip_frames, fps, media_rate)
             clip = otio.schema.Clip(

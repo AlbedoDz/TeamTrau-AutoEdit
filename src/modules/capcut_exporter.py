@@ -10,7 +10,7 @@ from pathlib import Path
 import opentimelineio as otio
 
 from src.core.config import PipelineConfig
-from src.core.ffmpeg_utils import ffprobe_json
+from src.core.media_info import probe_media
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +34,8 @@ def _url_to_path(target_url: str) -> Path:
 
 def _source_size(path: Path) -> tuple[int, int]:
     """Display width/height of a video file (rotation aware); (0, 0) when unknown."""
-    from src.core.ffmpeg_utils import stream_rotation
-
-    data = ffprobe_json(path)
-    for st in (data or {}).get("streams", []):
-        if st.get("codec_type") == "video" and (st.get("disposition", {}) or {}).get("attached_pic", 0) != 1:
-            w, h = int(st.get("width") or 0), int(st.get("height") or 0)
-            return (h, w) if stream_rotation(st) in (90, 270) else (w, h)
-    return (0, 0)
+    info = probe_media(path)
+    return (info.width, info.height) if info.has_video else (0, 0)
 
 
 def _fit_transform(

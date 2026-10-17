@@ -7,13 +7,17 @@ what Deliver renders / exports, so the master video always matches the timeline.
 
 import dataclasses
 import logging
+import math
+from fractions import Fraction
 from pathlib import Path
 
 from src.core.config import PipelineConfig
 from src.core.ontology import natural_sort_key
+from src.core.timebase import frame_rate_fraction
 from src.core.types import (
     CleanedSegment,
     DefectType,
+    DeliverSettings,
     EditClip,
     EditTimeline,
     ScoredScene,
@@ -105,8 +109,13 @@ def select_scenes_for_cuts(
 
 
 def clip_from_scene(sc: ScoredScene, frames: int, *, is_teaser: bool = False, label: str = "") -> EditClip:
-    """Place a scored scene on the timeline for ``frames`` output frames."""
+    """Place a scored scene on the timeline for ``frames`` output frames.
+
+    When the scene was cut from a render proxy (VFR->CFR cache file) the clip remembers the
+    user's original media (``SceneCut.original_path``) so NLE exports can relink to it.
+    """
     return EditClip(
+        original_path=sc.scene.original_path,
         source_path=sc.scene.clip_path,
         source_in=sc.scene.start_time,
         frames=max(1, int(frames)),
@@ -208,6 +217,60 @@ def build_edit_timeline(
     )
 
 
+def _round_half_up(x: Fraction) -> int:
+    return math.floor(x + Fraction(1, 2))
+
+
+def retarget_timeline(edit_tl: EditTimeline, settings: DeliverSettings) -> EditTimeline:
+    """Re-express ``edit_tl`` on the Deliver canvas / frame rate, keeping cut points in seconds.
+
+    - Clip lengths are converted by duration. Boundaries are rounded cumulatively (not clip by
+      clip) so the total stays within one frame of the original and the cut grid does not
+      drift; every clip keeps at least one frame.
+    - ``available``, ``source_in``, ``speed``, soundtrack and sections are untouched.
+    - Crop windows are kept as-is (no new data is invented) but flagged with
+      ``crop_needs_recompute`` when the canvas aspect ratio changed.
+    - Returns ``edit_tl`` itself (identity) when canvas and frame rate already match.
+    """
+    old_rate = frame_rate_fraction(edit_tl.fps)
+    new_rate = settings.fps_fraction
+    same_canvas = (edit_tl.canvas_width, edit_tl.canvas_height) == settings.canvas
+    if same_canvas and old_rate == new_rate:
+        return edit_tl
+
+    aspect_changed = (
+        edit_tl.canvas_width * settings.canvas_height != edit_tl.canvas_height * settings.canvas_width
+    )
+    ratio = new_rate / old_rate
+    old_boundary = 0  # cumulative frames at the old rate
+    new_boundary = 0  # cumulative frames already assigned at the new rate
+    clips: list[EditClip] = []
+    for c in edit_tl.clips:
+        old_boundary += c.frames
+        target = _round_half_up(Fraction(old_boundary) * ratio)
+        frames = max(1, target - new_boundary)
+        new_boundary += frames
+        transition = c.transition_in_frames
+        if transition > 0:
+            transition = max(1, _round_half_up(Fraction(transition) * ratio))
+        clips.append(
+            dataclasses.replace(
+                c,
+                frames=frames,
+                transition_in_frames=transition,
+                crop_needs_recompute=c.crop_needs_recompute
+                or (aspect_changed and c.crop_window is not None),
+            )
+        )
+    return dataclasses.replace(
+        edit_tl,
+        fps=settings.fps,
+        canvas_width=settings.canvas_width,
+        canvas_height=settings.canvas_height,
+        clips=clips,
+    )
+
+
 _DEFECT_COLORS = {
     DefectType.CAMERA_SHAKE: "RED",
     DefectType.WHIP_PAN: "RED",
@@ -245,6 +308,7 @@ def build_rough_cut_edit_timeline(
                 available=max(0.04, seg.duration),
                 label=f"{seg.clip_path.stem}_take_{i + 1:03d}",
                 markers=markers,
+                original_path=seg.scene.original_path,
             )
         )
     return EditTimeline(
