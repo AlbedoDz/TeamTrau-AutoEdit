@@ -207,3 +207,129 @@ def test_filter_scenes_with_dead_air():
     assert filtered[0].clip_path.name == "good.mp4"
 
 
+
+
+# --- Speed optimisations -----------------------------------------------------------------
+
+
+def test_find_dead_air_two_pointer_matches_bruteforce():
+    import random
+
+    rng = random.Random(7)
+    det = IngestDetector(PipelineConfig(dead_air_min_duration=1.0))
+
+    def intervals(n: int) -> list[tuple[float, float]]:
+        t, out = 0.0, []
+        for _ in range(n):
+            t += rng.uniform(0.1, 4.0)
+            end = t + rng.uniform(0.5, 6.0)
+            out.append((t, end))
+            t = end
+        return out
+
+    for _ in range(50):
+        sil, frz = intervals(8), intervals(8)
+        expected = []
+        for s0, s1 in sil:
+            for f0, f1 in frz:
+                a, b = max(s0, f0), min(s1, f1)
+                if b > a and b - a >= 1.0:
+                    expected.append((a, b))
+        assert sorted(det.find_dead_air_intervals(sil, frz)) == sorted(expected)
+
+
+def test_filter_scenes_overlap_matches_bruteforce():
+    rng = np.random.default_rng(3)
+    det = IngestDetector(PipelineConfig())
+    for _ in range(30):
+        segs = [
+            ActiveSegment(start_time=i * 0.5, end_time=(i + 1) * 0.5, motion_score=0.0,
+                          is_active=bool(rng.integers(0, 2)))
+            for i in range(40)
+        ]
+        scenes = []
+        t = 0.0
+        while t < 18:
+            d = float(rng.uniform(0.5, 4.0))
+            scenes.append(SceneCut(clip_path=Path("a.mp4"), start_time=t, end_time=t + d,
+                                   start_frame=0, end_frame=1, duration=d))
+            t += d
+        expected = []
+        for sc in scenes:
+            act = sum(
+                max(0.0, min(sc.end_time, s.end_time) - max(sc.start_time, s.start_time))
+                for s in segs if s.is_active
+            )
+            if act / sc.duration >= 0.25:
+                expected.append(sc)
+        assert det.filter_scenes_by_activity(scenes, segs) == (expected or scenes)
+
+
+def test_activity_opencv_reads_sequentially(synthetic_video_path, monkeypatch):
+    """No random-access seeks: the sampler must grab() frames in order."""
+    seeks: list[int] = []
+    real_cls = cv2.VideoCapture
+
+    class Spy:
+        def __init__(self, *a, **k):
+            self._c = real_cls(*a, **k)
+
+        def set(self, prop, val):
+            seeks.append(prop)
+            return self._c.set(prop, val)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    monkeypatch.setattr(cv2, "VideoCapture", Spy)
+    det = IngestDetector(PipelineConfig())
+    segs = det._analyze_activity_opencv(synthetic_video_path)
+    assert not seeks
+    assert len(segs) >= 3
+    # Hard cut red->blue at 1.0 s must register as motion in the sample spanning the cut.
+    assert any(s.motion_score > 0.1 for s in segs)
+
+
+def test_detect_dead_air_ranges_single_pass(tmp_path):
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg required")
+    clip = tmp_path / "dead.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=320x240:r=10:d=5",
+         "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "5", "-c:v", "libx264",
+         "-c:a", "aac", "-shortest", str(clip)],
+        check=True,
+    )
+    det = IngestDetector(PipelineConfig(dead_air_min_duration=1.0))
+    calls: list[list[str]] = []
+    import src.modules.ingest_detector as mod
+
+    real = mod.run_tool
+
+    def spy(cmd, *a, **k):
+        calls.append(cmd)
+        return real(cmd, *a, **k)
+
+    mod.run_tool, orig = spy, mod.run_tool
+    try:
+        sil, frz = det.detect_dead_air_ranges(clip)
+    finally:
+        mod.run_tool = orig
+    assert len(calls) == 1
+    assert "-af" in calls[0] and "-vf" in calls[0]
+    assert sil and frz
+    assert det.find_dead_air_intervals(sil, frz)
+
+
+def test_process_single_video_reuses_probed_metadata(tmp_path, synthetic_video_path):
+    from unittest.mock import patch
+
+    cfg = PipelineConfig(cache_dir=tmp_path / "c", enable_cache=False)
+    det = IngestDetector(cfg)
+    meta = det.probe_video(synthetic_video_path)
+    with patch.object(det, "probe_video", side_effect=AssertionError("re-probed")):
+        scenes = det.process_single_video(synthetic_video_path, metadata=meta)
+    assert scenes

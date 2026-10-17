@@ -551,6 +551,7 @@ class StudioBackendAdapter:
         detector = IngestDetector(config)
 
         # Pre-ingest VFR detection and normalization pass
+        probed_meta: dict[Path, VideoMetadata] = {}
         if getattr(config, "auto_normalize_vfr", True):
             normalized_raw = []
             for rf in raw_files:
@@ -560,6 +561,8 @@ class StudioBackendAdapter:
                     if meta.is_vfr:
                         _notify_progress(5.0, 1, f"Normalizing VFR footage ({rf.name})...")
                         rf = detector.normalize_to_cfr(rf, target_fps=config.fps)
+                    else:
+                        probed_meta[rf] = meta  # reused by ingest: no second ffprobe
                 except Exception as vfr_err:
                     logger.warning("VFR check/normalization warning for %s: %s", rf.name, vfr_err)
                 normalized_raw.append(rf)
@@ -572,6 +575,7 @@ class StudioBackendAdapter:
             raw_files,
             progress_callback=_ingest_prog,
             cancel_event=cancel_event,
+            **({"metadata_map": probed_meta} if probed_meta else {}),
         )
         for bad_path, reason in detector.failed_files:
             if callbacks and callbacks.on_log:
