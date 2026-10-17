@@ -476,6 +476,44 @@ class PlayerWidget(QWidget):
         self._update_timecode_display()
         self._render_current_frame()
 
+    def load_edit_timeline(self, timeline: Any) -> bool:
+        """Load an ``EditTimeline`` (frame-exact edit decision list) for sequence playback.
+
+        Returns True when at least one clip with an existing source file was loaded.
+        """
+        fps = float(getattr(timeline, "fps", 0.0) or 30.0)
+        entries: list[TimelineClipEntry] = []
+        cur_t = 0.0
+        for c in timeline.clips:
+            dur = max(1.0 / fps, c.frames / fps)
+            path = Path(c.source_path)
+            if path.exists():
+                speed = c.speed if c.speed and c.speed > 0 else 1.0
+                entries.append(
+                    TimelineClipEntry(
+                        clip_path=path,
+                        source_in=c.source_in,
+                        source_out=c.source_in + dur * speed,
+                        timeline_in=cur_t,
+                        timeline_out=cur_t + dur,
+                    )
+                )
+            cur_t += dur
+
+        self._timeline_clips = entries
+        if not entries:
+            return False
+        self._mode = "timeline"
+        self.set_duration(cur_t)
+        self.lbl_mode.setText("🎬 Master Timeline")
+        self.lbl_mode.setStyleSheet(
+            "background: #022c22; color: #6ee7b7; border: 1px solid #10b981; "
+            "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
+        )
+        self._update_timecode_display()
+        self._render_current_frame()
+        return True
+
     def switch_to_timeline_mode(self) -> bool:
         """Switch viewport preview to master timeline if clips are loaded."""
         if self._timeline_clips:

@@ -88,7 +88,9 @@ def test_studio_main_window_instantiation(qapp):
     assert window.isWidgetType()
     assert "TeamTrau AutoEdit" in window.windowTitle()
     assert window.preset_combo.count() >= 5
-    assert window.btn_run.isEnabled()
+    # Export stays disabled until an edit timeline exists
+    assert not window.btn_run.isEnabled()
+    assert not window.action_export.isEnabled()
     assert not window.btn_stop.isEnabled()
     assert window.progress_bar.value() == 0
 

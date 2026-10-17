@@ -107,7 +107,8 @@ def test_edit_menu_actions_and_undo_stack(isolated_studio):
     window.player_widget.current_time = 10.0
     window._on_paste_clip()
     assert len(window.timeline_view.canvas.clips) == 1
-    assert window.timeline_view.canvas.clips[0].start_time == 10.0
+    # Pasting ripples the clip into the (now empty) sequence
+    assert window.timeline_view.canvas.clips[0].start_time == 0.0
 
     window.undo_stack.undo()
     assert len(window.timeline_view.canvas.clips) == 0
@@ -140,14 +141,13 @@ def test_scene_toggle_undo_redo(isolated_studio):
 def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
     """Verify saving a complete project session to .tteproj and fully restoring workspace state."""
     from src.core.types import (
-        BeatMarker,
+        EditClip,
+        EditTimeline,
         SceneCut,
         ScoredScene,
         SongSection,
         SongSectionType,
-        TimelineVariant,
     )
-    from src.modules.audio_analyzer import AudioAnalysisResult
 
     window, _ = isolated_studio
 
@@ -159,25 +159,32 @@ def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
     scored = ScoredScene(cut, sharpness_score=88.0, aesthetic_score=0.85, composite_score=0.86, camera_role="drone")
     window.scene_grid.set_scenes([scored])
 
-    # Setup audio analysis and variant on timeline
-    audio_res = AudioAnalysisResult(
-        tempo_bpm=124.0,
-        duration=30.0,
-        sample_rate=44100,
-        cut_timestamps=[0.0, 2.0, 4.0],
-        beats=[BeatMarker(2.0, 60, 0.9, True)],
+    # Setup edit timelines (the Edit state) on the timeline view
+    tl_master = EditTimeline(
+        name="Master",
+        fps=30.0,
+        canvas_width=1920,
+        canvas_height=1080,
+        clips=[
+            EditClip(tmp_path / "clip_a.mp4", 0.0, 60, 4.0, label="a"),
+            EditClip(tmp_path / "clip_a.mp4", 1.0, 90, 4.0, label="b"),
+        ],
         sections=[SongSection(SongSectionType.INTRO, 0.0, 10.0, 10.0, 0.4)],
+        variant_key="master",
     )
-    window.timeline_view.canvas.audio_analysis = audio_res
-
-    var = TimelineVariant(
-        name="beat_driven",
-        display_name="Variant 1: Beat-Driven",
-        total_duration=4.0,
-        clip_count=1,
-        sequence_scenes=[scored],
+    tl_beat = EditTimeline(
+        name="Beat Driven",
+        fps=30.0,
+        canvas_width=1920,
+        canvas_height=1080,
+        clips=[EditClip(tmp_path / "clip_a.mp4", 0.0, 30, 4.0)],
+        variant_key="beat_driven",
     )
-    window.timeline_view.set_variants({"beat_driven": var}, active_key="beat_driven")
+    window._edit_timelines = {"master": tl_master, "beat_driven": tl_beat}
+    window.timeline_view.set_edit_timelines(window._edit_timelines, active_key="master", tempo_bpm=124.0)
+    # User edit: delete the first clip (ripple)
+    window.timeline_view.canvas.selected_clip = window.timeline_view.canvas.clips[0]
+    window._on_delete_clip()
 
     # Mark in / out and playhead
     window.player_widget.current_time = 2.5
@@ -210,34 +217,36 @@ def test_project_save_open_and_recent_workflow(isolated_studio, tmp_path):
     assert window._in_point == 1.0
     assert window._out_point == 3.5
     assert abs(window.player_widget.current_time - 2.5) < 0.1
-    assert "beat_driven" in window.timeline_view.get_variants()
-    assert window.timeline_view.get_active_variant_key() == "beat_driven"
+    # Edit timelines restored without re-analysis, including the user's edit
+    restored = window.timeline_view.get_edit_timelines()
+    assert set(restored) == {"master", "beat_driven"}
+    assert window.timeline_view.get_active_timeline_key() == "master"
+    assert [c.label for c in restored["master"].clips] == ["b"]
+    assert restored["master"].clips[0].frames == 90
+    assert len(restored["beat_driven"].clips) == 1
+    assert window._has_edit_timeline() is True
+    assert window.btn_run.isEnabled() is True
     assert window.timeline_view.canvas.audio_analysis is not None
-    assert window.timeline_view.canvas.audio_analysis.tempo_bpm == 124.0
+    assert len(window.timeline_view.canvas.audio_analysis.sections) == 1
 
 
 def test_kaizen_workflow_stepper_and_quick_buttons(isolated_studio):
-    """Verify Kaizen 4-step workflow indicator updates through lifecycle."""
+    """Verify Media -> Edit -> Deliver workflow indicator updates through lifecycle."""
     window, _ = isolated_studio
 
-    # Step 1: Ingest active
+    # Step 1: Media active
     window._update_workflow_stepper(1)
-    assert "● 1. Ingest" in window.lbl_workflow_steps.text()
+    assert "● 1. Media" in window.lbl_workflow_steps.text()
 
-    # Step 2: Media loaded -> AI Edit active
+    # Step 2: Analysis finished -> Edit active
     window._update_workflow_stepper(2)
-    assert "✔ 1. Ingest" in window.lbl_workflow_steps.text()
-    assert "● 2. AI Edit" in window.lbl_workflow_steps.text()
+    assert "✔ 1. Media" in window.lbl_workflow_steps.text()
+    assert "● 2. Edit" in window.lbl_workflow_steps.text()
 
-    # Step 3: Pipeline completed -> NLE Refine active
+    # Step 3: Export -> Deliver active
     window._update_workflow_stepper(3)
-    assert "✔ 2. AI Edit" in window.lbl_workflow_steps.text()
-    assert "● 3. NLE Refine" in window.lbl_workflow_steps.text()
-
-    # Step 4: Export dialog active
-    window._update_workflow_stepper(4)
-    assert "✔ 3. NLE Refine" in window.lbl_workflow_steps.text()
-    assert "● 4. Export" in window.lbl_workflow_steps.text()
+    assert "✔ 2. Edit" in window.lbl_workflow_steps.text()
+    assert "● 3. Deliver" in window.lbl_workflow_steps.text()
 
     # Quick Topbar buttons
     assert window.btn_quick_open.text() == "📁 Open"

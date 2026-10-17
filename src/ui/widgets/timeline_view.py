@@ -10,7 +10,7 @@ Provides an interactive visual representation of assembled video and audio seque
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal, Slot
@@ -27,7 +27,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.types import ScoredScene, SongSection, SongSectionType, TimelineVariant
+from src.core.types import (
+    BeatMarker,
+    EditClip,
+    EditTimeline,
+    ScoredScene,
+    SongSection,
+    SongSectionType,
+    TimelineVariant,
+)
 from src.modules.audio_analyzer import AudioAnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,7 @@ class TimelineClipItem:
     motion_energy: float = 0.5
     is_teaser: bool = False
     scene_ref: ScoredScene | None = None
+    edit_clip: EditClip | None = None  # Backing clip of the EditTimeline (None for legacy items)
 
 
 class TimelineCanvas(QWidget):
@@ -447,12 +456,17 @@ class TimelineViewWidget(QWidget):
     clip_selected = Signal(object)
     section_selected = Signal(object)
     variant_switched = Signal(str, object)
+    timeline_edited = Signal()  # Emitted after a user edit (delete / paste / undo / redo)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._variants: dict[str, TimelineVariant] = {}
         self._active_variant_key: str | None = None
         self._variant_buttons: dict[str, QPushButton] = {}
+        # EditTimeline model (single source of truth for Deliver)
+        self._edit_timelines: dict[str, EditTimeline] = {}
+        self._edit_base: EditTimeline | None = None
+        self._tempo_bpm: float = 0.0
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -566,6 +580,8 @@ class TimelineViewWidget(QWidget):
     ) -> None:
         """Populate variant switcher tabs and activate default variant."""
         self._variants = variants
+        self._edit_timelines = {}
+        self._edit_base = None
         self._variant_buttons.clear()
 
         # Clear existing buttons in variant_buttons_layout
@@ -593,6 +609,9 @@ class TimelineViewWidget(QWidget):
 
     def switch_variant(self, variant_key: str, emit_signal: bool = True) -> None:
         """Switch active narrative variant, updating buttons, canvas, and emitting signal."""
+        if variant_key in self._edit_timelines:
+            self._switch_edit_timeline(variant_key, emit_signal)
+            return
         if variant_key not in self._variants:
             return
 
@@ -622,6 +641,190 @@ class TimelineViewWidget(QWidget):
 
         if emit_signal:
             self.variant_switched.emit(variant_key, var)
+
+    # -------------------------------------------------------------------------
+    # EditTimeline Model API (Edit -> Deliver)
+    # -------------------------------------------------------------------------
+
+    def set_edit_timelines(
+        self,
+        timelines: dict[str, EditTimeline],
+        active_key: str | None = None,
+        tempo_bpm: float = 0.0,
+    ) -> None:
+        """Populate the variant bar from edit timelines and activate one (no signal emitted)."""
+        self._variants = {}
+        self._edit_timelines = dict(timelines)
+        self._edit_base = None
+        self._tempo_bpm = tempo_bpm
+        self._rebuild_variant_buttons()
+        if not self._edit_timelines:
+            self._active_variant_key = None
+            return
+        target = active_key if active_key in self._edit_timelines else next(iter(self._edit_timelines))
+        self.switch_variant(target, emit_signal=False)
+
+    def get_edit_timelines(self) -> dict[str, EditTimeline]:
+        """Return all edit timelines, with the active one reflecting the user's current edits."""
+        out = dict(self._edit_timelines)
+        key = self._active_variant_key
+        if key in out and self._edit_base is not None:
+            out[key] = self.get_edit_timeline()
+        return out
+
+    def get_active_timeline_key(self) -> str | None:
+        """Return the key of the active edit timeline (None when none are loaded)."""
+        return self._active_variant_key if self._edit_timelines else None
+
+    def load_edit_timeline(
+        self,
+        timeline: EditTimeline,
+        audio_result: AudioAnalysisResult | None = None,
+    ) -> None:
+        """Display an EditTimeline on the canvas (V2 teaser / V1 sequence / A1 sections & cuts)."""
+        self._edit_base = timeline
+        fps = timeline.fps if timeline.fps > 0 else 30.0
+        canvas = self.canvas
+        canvas.clips.clear()
+        canvas.selected_clip = None
+        canvas.selected_section = None
+
+        cur_frames = 0
+        teaser_idx = 0
+        main_idx = 0
+        for c in timeline.clips:
+            if c.is_teaser:
+                teaser_idx += 1
+                clip_id = f"TEASER_{teaser_idx - 1}"
+                name = f"Hook {teaser_idx}: {c.label or Path(c.source_path).stem}"
+            else:
+                main_idx += 1
+                clip_id = f"CLIP_{main_idx - 1}"
+                name = f"{main_idx:02d}: {c.label or Path(c.source_path).stem}"
+            start = cur_frames / fps
+            dur = c.frames / fps
+            canvas.clips.append(
+                TimelineClipItem(
+                    clip_id=clip_id,
+                    name=name,
+                    track="V2" if c.is_teaser else "V1",
+                    start_time=start,
+                    end_time=start + dur,
+                    duration=dur,
+                    source_path=Path(c.source_path),
+                    source_start=c.source_in,
+                    source_end=c.source_in + dur * (c.speed if c.speed > 0 else 1.0),
+                    is_teaser=c.is_teaser,
+                    edit_clip=c,
+                )
+            )
+            cur_frames += c.frames
+
+        canvas.has_teaser_track = any(c.is_teaser for c in timeline.clips)
+        if audio_result is None:
+            cuts = timeline.cut_points()
+            audio_result = AudioAnalysisResult(
+                tempo_bpm=self._tempo_bpm,
+                duration=timeline.duration,
+                beats=[BeatMarker(t, int(round(t * fps)), 1.0, False) for t in cuts[1:-1]],
+                cut_timestamps=cuts,
+                sample_rate=0,
+                sections=list(timeline.sections),
+            )
+        canvas.audio_analysis = audio_result
+        canvas.total_duration = max(timeline.duration, audio_result.duration if audio_result else 0.0)
+        canvas.playhead_time = 0.0
+        self.lbl_selected_info.setText("Select a clip or musical section on the timeline to inspect metadata.")
+        self._update_timecode_label()
+        canvas._update_geometry_size()
+
+    def get_edit_timeline(self) -> EditTimeline:
+        """Return the CURRENT edit state (after deletes / pastes) as an EditTimeline."""
+        base = self._edit_base
+        if base is None:
+            base = EditTimeline(name="Edit", fps=30.0, canvas_width=1920, canvas_height=1080)
+        fps = base.fps if base.fps > 0 else 30.0
+        ordered = sorted(self.canvas.clips, key=lambda c: c.start_time)
+        clips = [self._item_to_edit_clip(item, fps) for item in ordered]
+        return replace(base, clips=clips, sections=list(base.sections))
+
+    @staticmethod
+    def _item_to_edit_clip(item: TimelineClipItem, fps: float) -> EditClip:
+        """Return the backing EditClip of an item, synthesizing one for legacy items."""
+        if item.edit_clip is not None:
+            return item.edit_clip
+        avail = max(item.source_end - item.source_start, item.duration)
+        if item.scene_ref is not None:
+            avail = max(avail, item.scene_ref.scene.end_time - item.source_start)
+        return EditClip(
+            source_path=item.source_path,
+            source_in=item.source_start,
+            frames=max(1, int(round(item.duration * fps))),
+            available=avail,
+            is_teaser=item.is_teaser,
+            label=item.name,
+        )
+
+    def _rebuild_variant_buttons(self) -> None:
+        """Recreate the variant switcher buttons from the loaded edit timelines."""
+        self._variant_buttons.clear()
+        while self.variant_buttons_layout.count() > 0:
+            item = self.variant_buttons_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for k, tl in self._edit_timelines.items():
+            btn = QPushButton(f"{tl.name} ({tl.duration:.1f}s)", self)
+            btn.setObjectName("secondaryButton")
+            btn.setToolTip(f"Edit timeline: {k}")
+            btn.clicked.connect(lambda _, key=k: self.switch_variant(key))
+            self.variant_buttons_layout.addWidget(btn)
+            self._variant_buttons[k] = btn
+        self.variant_bar.setVisible(bool(self._edit_timelines))
+
+    def _style_variant_buttons(self, active_key: str) -> None:
+        for k, btn in self._variant_buttons.items():
+            if k == active_key:
+                btn.setObjectName("primaryButton")
+                btn.setStyleSheet(
+                    "background-color: #0284c7; color: #ffffff; font-weight: bold; padding: 4px 10px; border-radius: 4px;"
+                )
+            else:
+                btn.setObjectName("secondaryButton")
+                btn.setStyleSheet(
+                    "background-color: #27272a; color: #a1a1aa; font-weight: normal; padding: 4px 10px; border-radius: 4px;"
+                )
+
+    def _switch_edit_timeline(self, key: str, emit_signal: bool) -> None:
+        """Commit edits of the outgoing timeline, then display the incoming one."""
+        prev = self._active_variant_key
+        if prev in self._edit_timelines and self._edit_base is not None and prev != key:
+            self._edit_timelines[prev] = self.get_edit_timeline()
+        self._active_variant_key = key
+        self._style_variant_buttons(key)
+        tl = self._edit_timelines[key]
+        self.load_edit_timeline(tl)
+        if emit_signal:
+            self.variant_switched.emit(key, tl)
+
+    def _relayout_clips(self) -> None:
+        """Ripple clips back-to-back in list order and refresh canvas geometry."""
+        t = 0.0
+        for c in self.canvas.clips:
+            c.start_time = t
+            c.end_time = t + c.duration
+            t = c.end_time
+        self.canvas.total_duration = t
+        self.canvas._update_geometry_size()
+        self.canvas.update()
+        self._update_timecode_label()
+
+    def _after_edit(self) -> None:
+        """Refresh derived UI after a user edit and notify listeners."""
+        key = self._active_variant_key
+        if self._edit_base is not None and key in self._variant_buttons and key in self._edit_timelines:
+            tl = self.get_edit_timeline()
+            self._variant_buttons[key].setText(f"{tl.name} ({tl.duration:.1f}s)")
+        self.timeline_edited.emit()
 
     def get_variants(self) -> dict[str, TimelineVariant]:
         """Return currently loaded timeline variants dictionary."""
@@ -733,6 +936,11 @@ class TimelineViewWidget(QWidget):
         self.canvas.selected_clip = None
         self.canvas.selected_section = None
         self.lbl_selected_info.setText("Select a clip or musical section on the timeline to inspect metadata.")
+        if self._edit_timelines:
+            self._edit_timelines = {}
+            self._active_variant_key = None
+            self._rebuild_variant_buttons()
+        self._edit_base = None
         self._update_timecode_label()
         self.canvas._update_geometry_size()
 
@@ -762,27 +970,37 @@ class TimelineViewWidget(QWidget):
     def delete_selected_clip(self) -> TimelineClipItem | None:
         """Remove currently selected clip from timeline sequence and return it."""
         clip = self.canvas.selected_clip
-        if clip and clip in self.canvas.clips:
-            self.canvas.clips.remove(clip)
-            self.canvas.selected_clip = None
-            self.lbl_selected_info.setText("Select a clip or musical section on the timeline to inspect metadata.")
-            max_end = max((c.end_time for c in self.canvas.clips), default=0.0)
-            self.canvas.total_duration = max_end
-            self.canvas._update_geometry_size()
-            self.canvas.update()
-            self._update_timecode_label()
+        if clip and self.remove_clip(clip) is not None:
             return clip
         return None
 
-    def insert_clip(self, clip: TimelineClipItem) -> None:
-        """Insert or restore a clip onto the timeline."""
+    def remove_clip(self, clip: TimelineClipItem) -> int | None:
+        """Ripple-delete a clip; returns its former index (None if it was not on the timeline)."""
         if clip not in self.canvas.clips:
-            self.canvas.clips.append(clip)
-            max_end = max((c.end_time for c in self.canvas.clips), default=0.0)
-            self.canvas.total_duration = max(self.canvas.total_duration, max_end)
-            self.canvas._update_geometry_size()
-            self.canvas.update()
-            self._update_timecode_label()
+            return None
+        index = self.canvas.clips.index(clip)
+        self.canvas.clips.remove(clip)
+        if self.canvas.selected_clip == clip:
+            self.canvas.selected_clip = None
+            self.lbl_selected_info.setText("Select a clip or musical section on the timeline to inspect metadata.")
+        self._relayout_clips()
+        self._after_edit()
+        return index
+
+    def insert_clip(self, clip: TimelineClipItem, index: int | None = None) -> None:
+        """Insert or restore a clip (ripple); without ``index`` it goes in start-time order."""
+        if clip in self.canvas.clips:
+            return
+        if index is None:
+            index = len(self.canvas.clips)
+            for i, other in enumerate(self.canvas.clips):
+                if other.start_time >= clip.start_time:
+                    index = i
+                    break
+        self.canvas.clips.insert(max(0, min(index, len(self.canvas.clips))), clip)
+        self.canvas.has_teaser_track = self.canvas.has_teaser_track or clip.track == "V2"
+        self._relayout_clips()
+        self._after_edit()
 
     def deselect_all(self) -> None:
         """Clear active clip or musical section selection."""
@@ -839,5 +1057,6 @@ class TimelineViewWidget(QWidget):
     def _update_timecode_label(self) -> None:
         curr_str = format_timecode(self.canvas.playhead_time)
         tot_str = format_timecode(self.canvas.total_duration)
-        bpm_str = f"{self.canvas.audio_analysis.tempo_bpm:.1f}" if self.canvas.audio_analysis else "--"
+        audio = self.canvas.audio_analysis
+        bpm_str = f"{audio.tempo_bpm:.1f}" if audio and audio.tempo_bpm > 0 else "--"
         self.lbl_timecode.setText(f"Playhead: {curr_str} / {tot_str} (BPM: {bpm_str})")

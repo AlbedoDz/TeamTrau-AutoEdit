@@ -24,6 +24,7 @@ class ExportDialog(QDialog):
     """
 
     start_export_requested = Signal()
+    render_preview_requested = Signal()
 
     def __init__(
         self,
@@ -64,10 +65,17 @@ class ExportDialog(QDialog):
         self.btn_close.clicked.connect(self.accept)
         btn_bar.addWidget(self.btn_close)
 
-        self.btn_run_export = QPushButton("🚀 Start Export / Render", self)
+        self.btn_preview = QPushButton("👁 Render Preview (540p)", self)
+        self.btn_preview.setObjectName("secondaryButton")
+        self.btn_preview.setFixedHeight(32)
+        self.btn_preview.setToolTip("Render a fast 540p proxy of the current edit and load it in the monitor")
+        self.btn_preview.clicked.connect(self._on_preview_clicked)
+        btn_bar.addWidget(self.btn_preview)
+
+        self.btn_run_export = QPushButton("🚀 Export", self)
         self.btn_run_export.setObjectName("primaryButton")
         self.btn_run_export.setFixedHeight(32)
-        self.btn_run_export.setToolTip("Begin rendering master video and exporting NLE drafts")
+        self.btn_run_export.setToolTip("Export the current edit: master video and/or NLE handoff files")
         self.btn_run_export.clicked.connect(self._on_start_clicked)
         btn_bar.addWidget(self.btn_run_export)
 
@@ -75,5 +83,15 @@ class ExportDialog(QDialog):
 
     @Slot()
     def _on_start_clicked(self) -> None:
-        self.btn_run_export.setEnabled(False)
+        self.set_export_enabled(False)
         self.start_export_requested.emit()
+
+    @Slot()
+    def _on_preview_clicked(self) -> None:
+        self.set_export_enabled(False)
+        self.render_preview_requested.emit()
+
+    def set_export_enabled(self, enabled: bool) -> None:
+        """Enable or disable the Export and Preview buttons together."""
+        self.btn_run_export.setEnabled(enabled)
+        self.btn_preview.setEnabled(enabled)

@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import PipelineConfig, check_cuda_available, check_nvenc_available
-from src.core.types import PipelineExecutionResult
+from src.core.types import DeliverResult, PipelineExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class ExportPanelWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._last_result: PipelineExecutionResult | None = None
+        self._last_result: PipelineExecutionResult | DeliverResult | None = None
         self._output_dir: Path = Path("./output")
 
         self._init_ui()
@@ -175,7 +175,7 @@ class ExportPanelWidget(QWidget):
         layout_render = QVBoxLayout(group_render)
         layout_render.setSpacing(8)
 
-        self.chk_enable_render = QCheckBox("Render Standalone Master Video (.mp4)", group_render)
+        self.chk_enable_render = QCheckBox("Include Master Video (.mp4) in this export", group_render)
         self.chk_enable_render.setChecked(True)
         self.chk_enable_render.toggled.connect(self._on_render_toggle)
         layout_render.addWidget(self.chk_enable_render)
@@ -458,6 +458,21 @@ class ExportPanelWidget(QWidget):
             "nvenc_overrides_enabled": self.grp_nvenc_adv.isChecked(),
         }
 
+    def get_selected_formats(self) -> set[str]:
+        """Return the deliverable formats ticked for the next Export.
+
+        Subset of ``{"mp4", "fcpxml", "premiere", "otio", "capcut"}``; ``"mp4"`` means the
+        master video checkbox is ticked.
+        """
+        mapping = (
+            ("mp4", self.chk_enable_render),
+            ("fcpxml", self.chk_fcpxml),
+            ("premiere", self.chk_premiere),
+            ("otio", self.chk_otio),
+            ("capcut", self.chk_capcut),
+        )
+        return {name for name, chk in mapping if chk.isChecked()}
+
     def apply_to_config(self, config: PipelineConfig) -> None:
         """Inject user selections into active PipelineConfig instance."""
         mode_idx = self.combo_workflow.currentIndex()
@@ -586,15 +601,18 @@ class ExportPanelWidget(QWidget):
         self.lbl_gauge_speed.setText("Speed: -- fps")
         self.lbl_render_message.setText("Initializing FFmpeg encoder process...")
 
-    def set_deliverables(self, result: PipelineExecutionResult) -> None:
-        """Update deliverable file paths and enable handoff buttons."""
+    def set_deliverables(self, result: PipelineExecutionResult | DeliverResult) -> None:
+        """Update deliverable file paths and enable handoff buttons after an Export."""
         self._last_result = result
+        total_duration = float(getattr(result, "total_duration", getattr(result, "duration", 0.0)) or 0.0)
+        clip_count = int(getattr(result, "clip_count", 0) or 0)
 
         if result.success:
             self.render_progress.setValue(100)
             self.lbl_gauge_status.setText("Status: Completed Successfully")
             self.lbl_gauge_status.setStyleSheet("font-weight: bold; color: #4ade80;")
-            self.lbl_render_message.setText(f"Export finished in {result.total_duration:.1f}s ({result.clip_count} clips)")
+            clips_txt = f" ({clip_count} clips)" if clip_count else ""
+            self.lbl_render_message.setText(f"Export finished: {total_duration:.1f}s{clips_txt}")
 
             if result.fcpxml_path:
                 self.lbl_deliv_fcpxml.setText(f"DaVinci FCPXML: <b>{result.fcpxml_path.name}</b>")

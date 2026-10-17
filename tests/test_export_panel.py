@@ -246,11 +246,12 @@ def test_main_window_export_panel_integration(qapp, tmp_path, monkeypatch):
 
     window._on_start_pipeline()
 
-    # Verify submit_job was called with force_cpu=True
+    # Verify submit_job was called (analysis only)
     assert mock_adapter.submit_job.called
     call_kwargs = mock_adapter.submit_job.call_args.kwargs
-    assert call_kwargs["force_cpu"] is True
-    assert call_kwargs["no_render"] is False
+    # Analysis never renders or exports: that is the Export button's job.
+    assert call_kwargs["no_render"] is True
+    assert call_kwargs["export_nle"] is False
 
     window.close()
 

@@ -3,7 +3,7 @@
 from PySide6.QtCore import QObject, Signal
 
 from src.core.service import JobCallbacks
-from src.core.types import PipelineExecutionResult, ScoredScene
+from src.core.types import DeliverResult, PipelineExecutionResult, ScoredScene
 
 
 class BackendSignalBridge(QObject):
@@ -15,6 +15,7 @@ class BackendSignalBridge(QObject):
     scenes_tagged = Signal(list)
     log_received = Signal(str, str)
     job_finished = Signal(object)
+    deliver_finished = Signal(object)
 
     def to_job_callbacks(self) -> JobCallbacks:
         """Create a JobCallbacks bundle bound to this bridge's Qt signals."""
@@ -45,3 +46,7 @@ class BackendSignalBridge(QObject):
     def notify_finished(self, result: PipelineExecutionResult) -> None:
         """Emit job completion signal with execution result."""
         self.job_finished.emit(result)
+
+    def notify_deliver_finished(self, result: DeliverResult) -> None:
+        """Emit Export/Preview completion signal with the DeliverResult (thread-safe)."""
+        self.deliver_finished.emit(result)

@@ -36,8 +36,9 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import DEFAULT_PRESET_NAME, PRESETS, PipelineConfig, check_cuda_available
+from src.core.project_io import edit_timeline_to_dict
 from src.core.service import JobHandle, StudioBackendAdapter
-from src.core.types import PipelineExecutionResult, ScoredScene
+from src.core.types import DeliverResult, EditTimeline, PipelineExecutionResult, ScoredScene
 from src.ui.adapter_bridge import BackendSignalBridge
 from src.ui.controllers import (
     ClipDeleteCommand,
@@ -74,6 +75,10 @@ class StudioMainWindow(QMainWindow):
         self._agent_console_dialog: AgentConsoleDialog | None = None
         self._in_point: float | None = None
         self._out_point: float | None = None
+        # Edit state: the EditTimelines produced by analysis (or restored from a project).
+        # The timeline view holds the user's live edits; Export reads them from there.
+        self._edit_timelines: dict[str, EditTimeline] = {}
+        self._active_timeline_key: str = "master"
 
         self._init_window()
         self._init_components()
@@ -83,6 +88,7 @@ class StudioMainWindow(QMainWindow):
         self._init_statusbar()
         self._init_shortcuts()
         self._connect_signals()
+        self._update_export_enabled()
 
     def _init_window(self) -> None:
         """Configure window geometry, title, and initial attributes."""
@@ -130,7 +136,8 @@ class StudioMainWindow(QMainWindow):
         # 6. Export Dispatcher & Modal Dialog
         self.export_panel = ExportPanelWidget(self)
         self.export_dialog = ExportDialog(export_panel=self.export_panel, parent=self)
-        self.export_dialog.start_export_requested.connect(self._on_start_pipeline)
+        self.export_dialog.start_export_requested.connect(self._on_start_deliver)
+        self.export_dialog.render_preview_requested.connect(self._on_render_preview)
 
         # 7. Preferences Modal Dialog
         self.preferences_dialog = PreferencesDialog(backend_adapter=self.adapter, parent=self)
@@ -185,10 +192,17 @@ class StudioMainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        self.action_export = QAction("&Export / Render...", self)
+        self.action_export = QAction("&Export...", self)
         self.action_export.setShortcut("Ctrl+M")
+        self.action_export.setEnabled(False)  # Enabled once an edit timeline exists
         self.action_export.triggered.connect(self._on_open_export_dialog)
         file_menu.addAction(self.action_export)
+
+        self.action_render_preview = QAction("Render &Preview (540p)", self)
+        self.action_render_preview.setShortcut("Ctrl+Shift+M")
+        self.action_render_preview.setEnabled(False)
+        self.action_render_preview.triggered.connect(self._on_render_preview)
+        file_menu.addAction(self.action_render_preview)
 
         file_menu.addSeparator()
 
@@ -360,7 +374,7 @@ class StudioMainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Kaizen 4-Step Workflow Stepper Pill
+        # Workflow Stepper Pill (Media -> Edit -> Deliver)
         self.lbl_workflow_steps = QLabel(self)
         self.lbl_workflow_steps.setStyleSheet(
             "background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 2px 8px; font-size: 11px;"
@@ -429,9 +443,16 @@ class StudioMainWindow(QMainWindow):
         toolbar.addWidget(self.btn_stop)
 
         # Primary Run / Export Button
-        self.btn_run = QPushButton("🚀 Export / Render", self)
+        self.btn_preview = QPushButton("👁 Preview", self)
+        self.btn_preview.setEnabled(False)
+        self.btn_preview.setToolTip("Render a fast 540p preview of the current edit (Ctrl+Shift+M)")
+        self.btn_preview.clicked.connect(self._on_render_preview)
+        toolbar.addWidget(self.btn_preview)
+
+        self.btn_run = QPushButton("🚀 Export", self)
         self.btn_run.setObjectName("primaryButton")
-        self.btn_run.setToolTip("Open Export & Render Dialog (Ctrl+E)")
+        self.btn_run.setEnabled(False)  # Enabled once an edit timeline exists
+        self.btn_run.setToolTip("Export the finished edit: video and/or NLE files (Ctrl+M)")
         self.btn_run.clicked.connect(self._on_open_export_dialog)
         toolbar.addWidget(self.btn_run)
 
@@ -604,6 +625,7 @@ class StudioMainWindow(QMainWindow):
         self.bridge.scenes_tagged.connect(self._on_scenes_tagged)
         self.bridge.log_received.connect(self._on_log_received)
         self.bridge.job_finished.connect(self._on_job_finished)
+        self.bridge.deliver_finished.connect(self._on_deliver_finished)
 
         # Bidirectional Player <-> Timeline playhead sync
         self.player_widget.time_changed.connect(self._on_player_time_changed)
@@ -619,6 +641,7 @@ class StudioMainWindow(QMainWindow):
 
         # Timeline variant switcher -> Monitor live sequence playback
         self.timeline_view.variant_switched.connect(self._on_timeline_variant_switched)
+        self.timeline_view.timeline_edited.connect(self._on_timeline_edited)
 
         # Inspector actions
         self.inspector_panel.analyze_optimize_clicked.connect(self._on_start_pipeline)
@@ -653,7 +676,15 @@ class StudioMainWindow(QMainWindow):
 
     @Slot(str, object)
     def _on_timeline_variant_switched(self, variant_name: str, variant: Any) -> None:
-        """Update Program Monitor live sequence preview when a different variant is clicked."""
+        """Update Program Monitor sequence when a different timeline / variant is clicked."""
+        if isinstance(variant, EditTimeline):
+            self._active_timeline_key = variant_name
+            self.undo_stack.clear()
+            self.player_widget.load_edit_timeline(variant)
+            self.status_bar.showMessage(f"Active Sequence: {variant.name}", 3000)
+            self._append_console(f"[VARIANT] Switched to: {variant.name}")
+            self._set_dirty(True)
+            return
         scenes = getattr(variant, "sequence_scenes", [])
         dur = getattr(variant, "total_duration", 0.0)
         if scenes:
@@ -661,6 +692,13 @@ class StudioMainWindow(QMainWindow):
             disp_name = getattr(variant, "display_name", variant_name)
             self.status_bar.showMessage(f"Active Sequence: {disp_name}", 3000)
             self._append_console(f"[VARIANT] Switched to: {disp_name}")
+
+    @Slot()
+    def _on_timeline_edited(self) -> None:
+        """Mark project dirty and refresh the monitor sequence after a timeline edit."""
+        self._set_dirty(True)
+        if self._edit_timelines:
+            self.player_widget.load_edit_timeline(self.timeline_view.get_edit_timeline())
 
     @Slot(int)
     def _on_preset_changed(self, index: int) -> None:
@@ -673,10 +711,12 @@ class StudioMainWindow(QMainWindow):
 
     @Slot()
     def _on_open_export_dialog(self) -> None:
-        """Display Export Modal Dialog."""
+        """Display Export Modal Dialog (only once an edit timeline exists)."""
+        if not self._has_edit_timeline():
+            self.status_bar.showMessage("Nothing to export yet - run Analyze & Optimize first", 4000)
+            return
         self.export_panel.set_output_dir(self.media_browser.get_output_dir())
-        is_running = bool(self._current_job and self._current_job.is_running())
-        self.export_dialog.btn_run_export.setEnabled(not is_running)
+        self._update_export_enabled()
         self.export_dialog.exec()
 
     @Slot()
@@ -898,55 +938,97 @@ class StudioMainWindow(QMainWindow):
 
     @Slot(object)
     def _on_job_finished(self, result: PipelineExecutionResult) -> None:
-        self.btn_run.setEnabled(True)
+        """Analysis finished: load the edit timelines. Nothing is exported until the user asks."""
         self.btn_stop.setEnabled(False)
         if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
             self.inspector_panel.btn_analyze.setEnabled(True)
-        if hasattr(self, "export_dialog") and hasattr(self.export_dialog, "btn_run_export"):
-            self.export_dialog.btn_run_export.setEnabled(True)
         self._current_job = None
-        self.export_panel.set_deliverables(result)
 
         if result.success:
             if result.scored_scenes:
                 self.scene_grid.set_scenes(result.scored_scenes)
-            self.lbl_stage.setText("Status: Completed Successfully")
-            self.lbl_message.setText(f"Done in {result.total_duration:.1f}s ({result.clip_count} clips)")
+            self.lbl_stage.setText("Status: Timeline ready")
+            self.lbl_message.setText(
+                f"Timeline ready - press Export when you're happy ({result.total_duration:.1f}s, {result.clip_count} clips)"
+            )
             self.progress_bar.setValue(100)
-            self._append_console("\n=== Pipeline Execution Completed Successfully ===")
-            if result.fcpxml_path:
-                self._append_console(f"DaVinci FCPXML: {result.fcpxml_path}")
-            if result.render_path:
-                self._append_console(f"Master Render: {result.render_path}")
+            self._append_console("\n=== Analysis complete: Timeline ready ===")
+            self._append_console("Timeline ready - press Export when you're happy.")
 
-            self.player_widget.set_duration(result.total_duration)
-
-            # Multi-Variant Timeline synchronization
-            if getattr(result, "timeline_variants", None):
-                active_key = result.active_variant_name or "beat_driven"
-                self.timeline_view.set_variants(result.timeline_variants, active_key=active_key)
-                active_variant = result.timeline_variants.get(active_key)
-                if active_variant and active_variant.sequence_scenes:
-                    self.player_widget.load_timeline_sequence(
-                        active_variant.sequence_scenes, total_duration=active_variant.total_duration
-                    )
+            self._edit_timelines = dict(result.edit_timelines)
+            if self._edit_timelines:
+                key = "master" if "master" in self._edit_timelines else next(iter(self._edit_timelines))
+                self._active_timeline_key = key
+                self.timeline_view.set_edit_timelines(
+                    self._edit_timelines, active_key=key, tempo_bpm=result.audio_bpm
+                )
+                self.player_widget.load_edit_timeline(self._edit_timelines[key])
+                self.player_widget.set_duration(self._edit_timelines[key].duration or result.total_duration)
+                self._update_workflow_stepper(2)
+                self._set_dirty(True)
             else:
-                scenes = self.scene_grid.get_included_scenes() or self.scene_grid.get_all_scenes()
-                if scenes:
-                    self.player_widget.load_timeline_sequence(scenes, total_duration=result.total_duration)
-
-            soundtrack = self.media_browser.get_soundtrack_path()
-            scenes = self.scene_grid.get_included_scenes() or self.scene_grid.get_all_scenes()
-            if scenes and soundtrack and soundtrack.exists():
-                try:
-                    audio_res = self.adapter.quick_analyze_audio(soundtrack)
-                    self.timeline_view.load_timeline_data(scenes, audio_res)
-                except Exception as exc:
-                    logger.debug("Auto-loading timeline view skipped: %s", exc)
+                self._append_console("[WARN] Analysis produced no edit timeline - nothing to export.")
+            self.status_bar.showMessage("Timeline ready - press Export when you're happy", 8000)
         else:
             self.lbl_stage.setText("Status: Failed")
             self.lbl_message.setText("Pipeline encountered an error.")
             self._append_console(f"\n[ERROR] Execution failed: {result.error_message}")
+        self._update_export_enabled()
+
+    @Slot(object)
+    def _on_deliver_finished(self, result: DeliverResult) -> None:
+        """Export / preview finished: surface deliverables or load the preview proxy."""
+        self.btn_stop.setEnabled(False)
+        if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
+            self.inspector_panel.btn_analyze.setEnabled(True)
+        self._current_job = None
+        self._update_export_enabled()
+
+        if not result.success:
+            self.lbl_stage.setText("Status: Export failed")
+            self.lbl_message.setText("Export encountered an error.")
+            self._append_console(f"\n[ERROR] Export failed: {result.error_message}")
+            self.export_panel.set_deliverables(result)
+            return
+
+        if result.is_preview:
+            self.lbl_stage.setText("Status: Preview ready")
+            self.lbl_message.setText("540p preview rendered")
+            self.progress_bar.setValue(100)
+            if result.render_path and Path(result.render_path).is_file():
+                ok = self.player_widget.load_source_video(result.render_path)
+                self._append_console(f"[PREVIEW] {result.render_path}" + ("" if ok else " (could not load in monitor)"))
+            return
+
+        self.export_panel.set_deliverables(result)
+        self._set_dirty(True)
+        self._update_workflow_stepper(3)
+        self.lbl_stage.setText("Status: Export complete")
+        self.lbl_message.setText("Export finished")
+        self.progress_bar.setValue(100)
+        self._append_console("\n=== Export Completed Successfully ===")
+        if result.render_path:
+            self._append_console(f"Master Render: {result.render_path} ({result.encoder_used or 'n/a'})")
+        for label, path in (
+            ("DaVinci FCPXML", result.fcpxml_path),
+            ("Premiere XML", result.premiere_xml_path),
+            ("OpenTimelineIO", result.otio_path),
+            ("CapCut Draft", result.capcut_draft_path),
+        ):
+            if path:
+                self._append_console(f"{label}: {path}")
+
+    def _has_edit_timeline(self) -> bool:
+        """True once analysis (or a project) has provided at least one edit timeline."""
+        return bool(self._edit_timelines)
+
+    def _update_export_enabled(self) -> None:
+        """Enable Export / Preview controls only with an edit timeline and no running job."""
+        running = bool(self._current_job and self._current_job.is_running())
+        enabled = self._has_edit_timeline() and not running
+        for widget in (self.action_export, self.action_render_preview, self.btn_run, self.btn_preview):
+            widget.setEnabled(enabled)
+        self.export_dialog.set_export_enabled(enabled)
 
     def _append_console(self, text: str) -> None:
         self.console.appendPlainText(text)
@@ -985,12 +1067,11 @@ class StudioMainWindow(QMainWindow):
         self.timeline_view.clear_timeline()
         self._append_console(f"Initiating pipeline with preset: {preset_name}")
 
-        self.btn_run.setEnabled(False)
+        self._edit_timelines = {}
         self.btn_stop.setEnabled(True)
         if hasattr(self, "inspector_panel") and hasattr(self.inspector_panel, "btn_analyze"):
             self.inspector_panel.btn_analyze.setEnabled(False)
-        if hasattr(self, "export_dialog") and hasattr(self.export_dialog, "btn_run_export"):
-            self.export_dialog.btn_run_export.setEnabled(False)
+        self._update_export_enabled()
         self.progress_bar.setValue(0)
         self.lbl_stage.setText("Status: Starting...")
 
@@ -1021,34 +1102,99 @@ class StudioMainWindow(QMainWindow):
         self.preferences_dialog.apply_to_config(cfg)
 
         self.export_panel.set_output_dir(output_dir)
-        self.export_panel.reset_render_monitor()
 
-        no_render = not self.export_panel.is_render_enabled()
-        force_cpu = self.export_panel.is_force_cpu()
-        resolve = self.export_panel.is_resolve_dispatch_enabled()
-        dry_run_resolve = self.export_panel.is_dry_run_resolve()
-
-        self._current_job = self.adapter.submit_job(
+        # Analysis NEVER renders or exports (DaVinci / CapCut / Premiere workflow):
+        # the user presses Export once the edit is finished.
+        job = self.adapter.submit_job(
             input_dir=input_target,
             soundtrack=soundtrack,
             output_dir=output_dir,
             config=cfg,
             callbacks=callbacks,
             run_async=True,
-            no_render=no_render,
-            force_cpu=force_cpu,
-            resolve=resolve,
-            dry_run_resolve=dry_run_resolve,
+            no_render=True,
+            export_nle=False,
         )
+        self._current_job = job
 
         def _watch_job() -> None:
-            if self._current_job:
-                self._current_job.wait()
-                if self._current_job.result:
-                    self.bridge.notify_finished(self._current_job.result)
+            job.wait()
+            if job.result:
+                self.bridge.notify_finished(job.result)
 
-        watcher = threading.Thread(target=_watch_job, daemon=True)
-        watcher.start()
+        threading.Thread(target=_watch_job, daemon=True).start()
+
+    @Slot()
+    def _on_start_deliver(self) -> None:
+        """Export the current edit (video and/or NLE files). Never re-runs analysis."""
+        self._start_deliver(preview=False)
+
+    @Slot()
+    def _on_render_preview(self) -> None:
+        """Render a fast 540p proxy of the current edit and load it into the monitor."""
+        self._start_deliver(preview=True)
+
+    def _start_deliver(self, preview: bool) -> None:
+        """Submit a deliver job built from the timeline view's CURRENT edit state."""
+        if self._current_job and self._current_job.is_running():
+            QMessageBox.information(
+                self,
+                "Job In Progress",
+                "An editing or rendering job is already actively running. Please wait for completion or click Stop.",
+            )
+            return
+        if not self._has_edit_timeline():
+            self.status_bar.showMessage("Nothing to export yet - run Analyze & Optimize first", 4000)
+            self._update_export_enabled()
+            return
+
+        timeline = self.timeline_view.get_edit_timeline()
+        if not timeline.clips:
+            QMessageBox.warning(self, "Empty Timeline", "The timeline has no clips to export.")
+            self._update_export_enabled()
+            return
+
+        formats = {"mp4"} if preview else self.export_panel.get_selected_formats()
+        if not formats:
+            QMessageBox.information(self, "No Format Selected", "Tick at least one export format.")
+            self._update_export_enabled()
+            return
+
+        output_dir = self.media_browser.get_output_dir()
+        cfg = self.config
+        self.export_panel.set_output_dir(output_dir)
+        self.export_panel.reset_render_monitor()
+        self.progress_bar.setValue(0)
+        self.btn_stop.setEnabled(True)
+        kind = "Preview (540p)" if preview else "Export"
+        self.lbl_stage.setText(f"Status: {kind}...")
+        self._append_console(f"\n[{kind.upper()}] {timeline.name}: {len(timeline.clips)} clips, {timeline.duration:.1f}s")
+        if not preview:
+            self._append_console(f"Formats: {', '.join(sorted(formats))} -> {output_dir}")
+            if self.export_panel.get_export_options().get("variant_export_scope") == "all" and len(self._edit_timelines) > 1:
+                self._append_console("[NOTE] Exporting the active timeline only; switch variants to export the others.")
+
+        job = self.adapter.submit_deliver_job(
+            timeline,
+            output_dir,
+            cfg,
+            formats=formats,
+            callbacks=self.bridge.to_job_callbacks(),
+            run_async=True,
+            force_cpu=self.export_panel.is_force_cpu(),
+            preview=preview,
+            resolve=self.export_panel.is_resolve_dispatch_enabled() and not preview,
+            dry_run_resolve=self.export_panel.is_dry_run_resolve(),
+        )
+        self._current_job = job
+        self._update_export_enabled()
+
+        def _watch_deliver() -> None:
+            job.wait()
+            if job.result:
+                self.bridge.notify_deliver_finished(job.result)
+
+        threading.Thread(target=_watch_deliver, daemon=True).start()
 
     def _on_stop_pipeline(self) -> None:
         """Cancel ongoing pipeline job."""
@@ -1117,8 +1263,8 @@ class StudioMainWindow(QMainWindow):
         self.recent_menu.addAction(clear_action)
 
     def _update_workflow_stepper(self, step: int) -> None:
-        """Update Kaizen 4-step workflow indicator (1: Ingest, 2: AI Edit, 3: NLE Refine, 4: Export)."""
-        names = ["1. Ingest", "2. AI Edit", "3. NLE Refine", "4. Export"]
+        """Update workflow indicator (1: Media, 2: Edit, 3: Deliver)."""
+        names = ["1. Media", "2. Edit", "3. Deliver"]
         styled_parts = []
         for i, name in enumerate(names, start=1):
             if i < step:
@@ -1142,6 +1288,8 @@ class StudioMainWindow(QMainWindow):
         self.media_browser.clear_all()
         self.scene_grid.clear_scenes()
         self.timeline_view.clear_timeline()
+        self._edit_timelines = {}
+        self._active_timeline_key = "master"
         self.player_widget.canvas.set_frame_pixmap(None)
         self.player_widget._mode = "idle"
         self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")
@@ -1150,6 +1298,7 @@ class StudioMainWindow(QMainWindow):
         self.undo_stack.clear()
         self._set_dirty(False)
         self._update_workflow_stepper(1)
+        self._update_export_enabled()
         self._update_ai_badge()
         self._append_console("Created new blank project.")
 
@@ -1215,12 +1364,17 @@ class StudioMainWindow(QMainWindow):
                 self.timeline_view.canvas.audio_analysis
             )
 
-        # 4. Multi-variant timeline synthesis
+        # 4. Edit timelines (single source of truth, incl. the user's live edits)
+        edit_timelines = self.timeline_view.get_edit_timelines() or dict(self._edit_timelines)
+        edit_timelines_data = {k: edit_timeline_to_dict(tl) for k, tl in edit_timelines.items()}
+        active_tl_key = self.timeline_view.get_active_timeline_key() or self._active_timeline_key
+
+        # 4b. Legacy variant switcher state (projects loaded without edit timelines)
         variants_data = {}
         loaded_variants = self.timeline_view.get_variants()
         for v_key, var in loaded_variants.items():
             variants_data[v_key] = self.project_manager.serialize_timeline_variant(var)
-        active_var = self.timeline_view.get_active_variant_key()
+        active_var = self.timeline_view.get_active_variant_key() if loaded_variants else None
 
         # 5. Media ingestion & camera roles
         input_dirs = [str(d) for d in self.media_browser.get_input_dirs()]
@@ -1237,9 +1391,9 @@ class StudioMainWindow(QMainWindow):
                 "capcut_draft_path": str(last_res.capcut_draft_path) if last_res.capcut_draft_path else None,
                 "render_path": str(last_res.render_path) if last_res.render_path else None,
                 "encoder_used": last_res.encoder_used,
-                "total_duration": last_res.total_duration,
-                "clip_count": last_res.clip_count,
-                "scenes_detected": last_res.scenes_detected,
+                "total_duration": getattr(last_res, "total_duration", getattr(last_res, "duration", 0.0)),
+                "clip_count": getattr(last_res, "clip_count", 0),
+                "scenes_detected": getattr(last_res, "scenes_detected", 0),
             }
 
         project_data = ProjectData(
@@ -1261,6 +1415,8 @@ class StudioMainWindow(QMainWindow):
             timeline_variants=variants_data,
             active_variant_name=active_var,
             deliverables=deliverables_data,
+            edit_timelines=edit_timelines_data,
+            active_timeline_key=active_tl_key,
         )
 
         ok = self.project_manager.save_project(path, project_data)
@@ -1351,69 +1507,57 @@ class StudioMainWindow(QMainWindow):
                 if not sd.get("included", True):
                     self.scene_grid.set_scene_included(idx, False)
 
-        # 4. Restore Audio Analysis & Song Structure
-        restored_audio = None
-        if data.audio_analysis:
-            restored_audio = self.project_manager.deserialize_audio_analysis(data.audio_analysis)
-
-        # 5. Restore Timeline Variants
-        restored_variants = {}
-        if data.timeline_variants:
-            for vk, vd in data.timeline_variants.items():
-                restored_variants[vk] = self.project_manager.deserialize_timeline_variant(vd)
-            self.timeline_view.set_variants(
-                restored_variants, active_key=data.active_variant_name or "beat_driven"
-            )
-
-        # 6. Restore Timeline Tracks & Clips
-        if restored_scenes and (restored_audio or self.media_browser.get_soundtrack_path()):
-            soundtrack = self.media_browser.get_soundtrack_path()
-            audio_for_tl = restored_audio
-            if audio_for_tl is None and soundtrack and soundtrack.exists():
-                try:
-                    audio_for_tl = self.adapter.quick_analyze_audio(soundtrack)
-                except Exception as exc:
-                    logger.debug("Quick analyze audio failed on load: %s", exc)
-            if audio_for_tl:
-                self.timeline_view.load_timeline_data(restored_scenes, audio_for_tl)
-        elif data.timeline_clips:
-            restored_clips = []
-            for cd in data.timeline_clips:
-                clip = TimelineClipItem(
-                    clip_id=cd["clip_id"],
-                    name=cd["name"],
-                    track=cd["track"],
-                    start_time=cd["start_time"],
-                    end_time=cd["end_time"],
-                    duration=cd["duration"],
-                    source_path=Path(cd["source_path"]),
-                    source_start=cd["source_start"],
-                    source_end=cd["source_end"],
-                    composite_score=cd.get("composite_score", 0.5),
-                    motion_energy=cd.get("motion_energy", 0.5),
-                    is_teaser=cd.get("is_teaser", False),
+        # 5. Restore Edit Timelines (no re-analysis; v2.0 projects are upgraded from variants)
+        restored_edit = data.get_edit_timelines()
+        restored_variants: dict[str, Any] = {}
+        self._edit_timelines = dict(restored_edit)
+        if restored_edit:
+            active_key = data.active_timeline_key if data.active_timeline_key in restored_edit else next(iter(restored_edit))
+            self._active_timeline_key = active_key
+            bpm = float(data.audio_analysis.get("tempo_bpm", 0.0)) if data.audio_analysis else 0.0
+            self.timeline_view.set_edit_timelines(restored_edit, active_key=active_key, tempo_bpm=bpm)
+            self.player_widget.load_edit_timeline(restored_edit[active_key])
+            self.player_widget.set_duration(restored_edit[active_key].duration)
+        else:
+            self._active_timeline_key = "master"
+            self.timeline_view.clear_timeline()
+            if data.timeline_variants:
+                for vk, vd in data.timeline_variants.items():
+                    restored_variants[vk] = self.project_manager.deserialize_timeline_variant(vd)
+                self.timeline_view.set_variants(
+                    restored_variants, active_key=data.active_variant_name or "beat_driven"
                 )
-                restored_clips.append(clip)
-            self.timeline_view.canvas.clips = restored_clips
-            max_end = max((c.end_time for c in restored_clips), default=0.0)
-            self.timeline_view.canvas.total_duration = max_end
-            self.player_widget.set_duration(max_end)
-            self.timeline_view.canvas.update()
-            self.timeline_view._update_timecode_label()
-
-        # 7. Restore Sequence Playback in Program Monitor Viewport
-        active_var_obj = restored_variants.get(data.active_variant_name or "beat_driven")
-        if active_var_obj and active_var_obj.sequence_scenes:
-            self.player_widget.load_timeline_sequence(
-                active_var_obj.sequence_scenes, total_duration=active_var_obj.total_duration
-            )
-        elif restored_scenes:
-            inc_scenes = self.scene_grid.get_included_scenes() or restored_scenes
-            tot_dur = max(
-                (c.end_time for c in self.timeline_view.canvas.clips),
-                default=sum(s.scene.duration for s in inc_scenes)
-            )
-            self.player_widget.load_timeline_sequence(inc_scenes, total_duration=tot_dur)
+            # 6. Legacy raw clips (very old projects)
+            if data.timeline_clips:
+                restored_clips = []
+                for cd in data.timeline_clips:
+                    restored_clips.append(
+                        TimelineClipItem(
+                            clip_id=cd["clip_id"],
+                            name=cd["name"],
+                            track=cd["track"],
+                            start_time=cd["start_time"],
+                            end_time=cd["end_time"],
+                            duration=cd["duration"],
+                            source_path=Path(cd["source_path"]),
+                            source_start=cd["source_start"],
+                            source_end=cd["source_end"],
+                            composite_score=cd.get("composite_score", 0.5),
+                            motion_energy=cd.get("motion_energy", 0.5),
+                            is_teaser=cd.get("is_teaser", False),
+                        )
+                    )
+                self.timeline_view.canvas.clips = restored_clips
+                max_end = max((c.end_time for c in restored_clips), default=0.0)
+                self.timeline_view.canvas.total_duration = max_end
+                self.player_widget.set_duration(max_end)
+                self.timeline_view.canvas.update()
+                self.timeline_view._update_timecode_label()
+            active_var_obj = restored_variants.get(data.active_variant_name or "beat_driven")
+            if active_var_obj and active_var_obj.sequence_scenes:
+                self.player_widget.load_timeline_sequence(
+                    active_var_obj.sequence_scenes, total_duration=active_var_obj.total_duration
+                )
 
         # 8. Restore Playhead and In/Out Points
         if data.playhead_time > 0.0:
@@ -1444,13 +1588,16 @@ class StudioMainWindow(QMainWindow):
                 scored_scenes=restored_scenes,
                 timeline_variants=restored_variants,
                 active_variant_name=data.active_variant_name,
+                edit_timelines=dict(restored_edit),
             )
             self.export_panel.set_deliverables(deliv_res)
 
         self.undo_stack.clear()
         self._set_dirty(False)
         self._update_recent_menu()
-        self._update_workflow_stepper(3 if (data.timeline_clips or restored_scenes) else (2 if data.input_dir else 1))
+        has_edit = bool(restored_edit or data.timeline_clips)
+        self._update_workflow_stepper(3 if data.deliverables else (2 if has_edit else 1))
+        self._update_export_enabled()
         self._append_console(f"Opened project: {path} (Scenes: {len(restored_scenes)}, Variants: {len(restored_variants)})")
         self.status_bar.showMessage(f"Loaded project {data.project_name}", 4000)
         return True
@@ -1462,7 +1609,8 @@ class StudioMainWindow(QMainWindow):
         if folder:
             self.media_browser.set_input_dir(folder)
             self._set_dirty(True)
-            self._update_workflow_stepper(2)
+            if not self._has_edit_timeline():
+                self._update_workflow_stepper(1)
 
     @Slot()
     def _on_import_soundtrack(self) -> None:
@@ -1548,6 +1696,8 @@ class StudioMainWindow(QMainWindow):
         cleared = IngestDetector(cfg).clear_cache()
         self.scene_grid.clear_scenes()
         self.timeline_view.clear_timeline()
+        self._edit_timelines = {}
+        self._update_export_enabled()
         self.player_widget.canvas.set_frame_pixmap(None)
         self.player_widget._mode = "idle"
         self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")

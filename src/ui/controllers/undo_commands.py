@@ -26,22 +26,17 @@ class ClipDeleteCommand(QUndoCommand):
         super().__init__(f"Delete Clip: {clip.name}", parent)
         self.timeline_view = timeline_view
         self.clip = clip
+        self._index: int | None = None
 
     def redo(self) -> None:
-        """Execute clip deletion."""
-        if self.clip in self.timeline_view.canvas.clips:
-            self.timeline_view.canvas.clips.remove(self.clip)
-            if self.timeline_view.canvas.selected_clip == self.clip:
-                self.timeline_view.canvas.selected_clip = None
-            max_end = max((c.end_time for c in self.timeline_view.canvas.clips), default=0.0)
-            self.timeline_view.canvas.total_duration = max_end
-            self.timeline_view.canvas._update_geometry_size()
-            self.timeline_view.canvas.update()
-            self.timeline_view._update_timecode_label()
+        """Execute clip deletion (ripple), updating the underlying edit timeline."""
+        index = self.timeline_view.remove_clip(self.clip)
+        if index is not None:
+            self._index = index
 
     def undo(self) -> None:
-        """Restore deleted clip to timeline."""
-        self.timeline_view.insert_clip(self.clip)
+        """Restore deleted clip to its original position on the timeline."""
+        self.timeline_view.insert_clip(self.clip, self._index)
         self.timeline_view.canvas.selected_clip = self.clip
 
 
@@ -59,21 +54,13 @@ class ClipPasteCommand(QUndoCommand):
         self.clip = clip
 
     def redo(self) -> None:
-        """Insert clip onto timeline."""
+        """Insert clip onto timeline (ripple), updating the underlying edit timeline."""
         self.timeline_view.insert_clip(self.clip)
         self.timeline_view.canvas.selected_clip = self.clip
 
     def undo(self) -> None:
         """Remove pasted clip from timeline."""
-        if self.clip in self.timeline_view.canvas.clips:
-            self.timeline_view.canvas.clips.remove(self.clip)
-            if self.timeline_view.canvas.selected_clip == self.clip:
-                self.timeline_view.canvas.selected_clip = None
-            max_end = max((c.end_time for c in self.timeline_view.canvas.clips), default=0.0)
-            self.timeline_view.canvas.total_duration = max_end
-            self.timeline_view.canvas._update_geometry_size()
-            self.timeline_view.canvas.update()
-            self.timeline_view._update_timecode_label()
+        self.timeline_view.remove_clip(self.clip)
 
 
 class SceneToggleCommand(QUndoCommand):
