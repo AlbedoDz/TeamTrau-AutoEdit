@@ -189,13 +189,13 @@ class TimelineBuilder:
                 )
             video_track.append(clip)
             if camera_audio:
-                audio_track.append(
-                    otio.schema.Clip(
-                        name=f"{Path(ec.source_path).stem}_audio_{idx + 1:03d}",
-                        media_reference=media_ref.clone(),
-                        source_range=src_range,
-                    )
+                cam = otio.schema.Clip(
+                    name=f"{Path(ec.source_path).stem}_audio_{idx + 1:03d}",
+                    media_reference=media_ref.clone(),
+                    source_range=src_range,
                 )
+                cam.metadata["AutoEdit"] = {"role": "camera_audio"}
+                audio_track.append(cam)
             if pad_frames > 0:
                 video_track.append(otio.schema.Gap(duration=RationalTime(pad_frames, fps)))
                 if camera_audio:
@@ -205,16 +205,16 @@ class TimelineBuilder:
         if not camera_audio and edit_tl.soundtrack_path is not None:
             snd = Path(edit_tl.soundtrack_path)
             audio_ref = _media_reference(snd, edit_tl.soundtrack_in + total_frames / fps, fps)
-            audio_track.append(
-                otio.schema.Clip(
-                    name=snd.stem,
-                    media_reference=audio_ref,
-                    source_range=TimeRange(
-                        start_time=RationalTime(round(edit_tl.soundtrack_in * fps), fps),
-                        duration=RationalTime(total_frames, fps),
-                    ),
-                )
+            music = otio.schema.Clip(
+                name=snd.stem,
+                media_reference=audio_ref,
+                source_range=TimeRange(
+                    start_time=RationalTime(round(edit_tl.soundtrack_in * fps), fps),
+                    duration=RationalTime(total_frames, fps),
+                ),
             )
+            music.metadata["AutoEdit"] = {"role": "music"}
+            audio_track.append(music)
 
         logger.info(
             "Constructed OTIO timeline '%s' with %d clips across %.2f seconds.",
@@ -376,12 +376,27 @@ class TimelineBuilder:
             write(premiere_xml_path, "fcp_xml", "Premiere Pro XML") if "premiere" in wanted else None
         )
 
-        # 3. DaVinci Resolve FCPXML (fcpx_xml, falling back to FCP 7 XML)
+        # 3. DaVinci Resolve / Final Cut FCPXML 1.8 (own writer; OTIO has no FCPXML adapter here)
         exported_resolve = None
         if "fcpxml" in wanted:
-            exported_resolve = write(fcpxml_path, "fcpx_xml", "DaVinci Resolve FCPXML") or write(
-                fcpxml_path, "fcp_xml", "DaVinci Resolve compatible XML"
-            )
+            try:
+                from src.modules.fcpxml_exporter import write_fcpxml
+
+                camera_db = (
+                    self.config.camera_audio_mix_db if self.config.keep_video_audio else -96.0
+                )
+                exported_resolve = write_fcpxml(
+                    timeline,
+                    fcpxml_path,
+                    fps=self.config.fps,
+                    width=self.config.canvas_width,
+                    height=self.config.canvas_height,
+                    camera_audio_db=camera_db,
+                    project_name=base_name,
+                )
+                logger.info("Exported DaVinci Resolve FCPXML: %s", fcpxml_path.name)
+            except Exception as exc:
+                logger.warning("DaVinci Resolve FCPXML export failed (%s)", exc)
 
         # 4. CapCut Desktop Native Draft Export (Phase 4)
         exported_capcut = None

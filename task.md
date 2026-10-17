@@ -255,3 +255,7 @@
   - [x] Benchmark (`scripts/benchmark_pipeline.py`, 6x30s 1080p): total 133.0s -> 57.2s cold, 52.8s -> 20.9s cached; analysis 110.8s -> 38.0s cold, 33.6s -> 1.8s cached. Render ~19s (CPU-filter bound).
   - [x] Full suite: 288 tests passing, 0 ruff errors.
 - [ ] Known follow-ups: GUI manually verified? (only headless-tested); Export of all variants at once; render speed beyond ~19s needs GPU filters (scale_cuda/overlay_cuda); Phase 16 roadmap items (LUT/color, multi-stem audio, Silero VAD, VLM rate limiter).
+- [x] Phase 20: Real DaVinci Resolve FCPXML (`src/modules/fcpxml_exporter.py`)
+  - [x] Own FCPXML 1.8 writer from the OTIO timeline (no adapter dependency): asset-clip spine, exact rational time, timeMap speed ramps, gaps, cross-dissolve, music as connected lane -1, camera-audio duck/mute, rough-cut markers, crop note, unicode file URLs.
+  - [x] `.fcpxml` no longer contains FCP7 xmeml (Premiere export keeps FCP7 XML).
+  - [ ] Not yet verified by importing into a running DaVinci Resolve (only structure/timing unit tests).
