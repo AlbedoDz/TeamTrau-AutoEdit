@@ -249,6 +249,92 @@ class ScoredScene:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+DeliverFormat = Literal["mp4", "fcpxml", "premiere", "otio", "capcut"]
+ALL_DELIVER_FORMATS: tuple[DeliverFormat, ...] = ("mp4", "fcpxml", "premiere", "otio", "capcut")
+
+
+@dataclass
+class EditClip:
+    """One clip placed on the edit timeline (the single source of truth for Deliver).
+
+    ``frames`` is the clip's length on the timeline at ``EditTimeline.fps``; ``available``
+    is how many source seconds exist from ``source_in`` (if the clip needs more, the
+    renderer holds the last frame and NLE exports insert a gap).
+    """
+
+    source_path: Path
+    source_in: float
+    frames: int
+    available: float
+    speed: float = 1.0
+    crop_window: CropWindow | None = None
+    ken_burns: str | None = None
+    transition_in_frames: int = 0
+    is_teaser: bool = False
+    label: str = ""
+    markers: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def source_path_resolved(self) -> Path:
+        return Path(self.source_path).resolve()
+
+    # Backwards-compatible aliases used by the renderer.
+    @property
+    def source(self) -> Path:
+        return self.source_path
+
+
+@dataclass
+class EditTimeline:
+    """Ordered, frame-exact edit decision list produced by analysis and edited by the user."""
+
+    name: str
+    fps: float
+    canvas_width: int
+    canvas_height: int
+    clips: list[EditClip] = field(default_factory=list)
+    soundtrack_path: Path | None = None
+    soundtrack_in: float = 0.0
+    sections: list[SongSection] = field(default_factory=list)
+    variant_key: str = "master"
+    kind: Literal["music", "rough_cut"] = "music"
+
+    @property
+    def total_frames(self) -> int:
+        return sum(c.frames for c in self.clips)
+
+    @property
+    def duration(self) -> float:
+        return self.total_frames / self.fps if self.fps > 0 else 0.0
+
+    def cut_points(self) -> list[float]:
+        """Clip boundaries in timeline seconds (0, ..., duration)."""
+        pts = [0.0]
+        acc = 0
+        for c in self.clips:
+            acc += c.frames
+            pts.append(acc / self.fps)
+        return pts
+
+
+@dataclass
+class DeliverResult:
+    """Outcome of an explicit user-requested Deliver/Export job."""
+
+    success: bool
+    output_dir: Path | None = None
+    render_path: Path | None = None
+    encoder_used: str | None = None
+    duration: float = 0.0
+    fcpxml_path: Path | None = None
+    premiere_xml_path: Path | None = None
+    otio_path: Path | None = None
+    capcut_draft_path: Path | None = None
+    resolve_status: dict[str, Any] | None = None
+    is_preview: bool = False
+    error_message: str | None = None
+
+
 @dataclass
 class TimelineVariant:
     """Distinct narrative timeline cut generated from the same source footage."""
@@ -266,6 +352,7 @@ class TimelineVariant:
     capcut_draft_path: Path | None = None
     render_path: Path | None = None
     sequence_scenes: list["ScoredScene"] = field(default_factory=list)
+    edit_timeline: EditTimeline | None = None
 
 
 @dataclass(frozen=True)
@@ -337,4 +424,9 @@ class PipelineExecutionResult:
     timeline_variants: dict[str, TimelineVariant] = field(default_factory=dict)
     active_variant_name: str | None = None
     failed_files: list[tuple[Path, str]] = field(default_factory=list)
+    edit_timelines: dict[str, EditTimeline] = field(default_factory=dict)
+    active_soundtrack: Path | None = None
+    cut_timestamps: list[float] = field(default_factory=list)
+    sections: list[SongSection] = field(default_factory=list)
+    source_files: list[Path] = field(default_factory=list)
 

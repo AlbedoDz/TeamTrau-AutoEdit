@@ -13,10 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from src.core.config import PipelineConfig
+from src.core.config import PRESETS, PipelineConfig
+from src.core.project_io import edit_timeline_from_dict, edit_timeline_to_dict
 from src.core.types import (
     BeatMarker,
     CropWindow,
+    EditTimeline,
+    PipelineExecutionResult,
     SceneCut,
     SceneVLMAnalysis,
     ScoredScene,
@@ -31,6 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECENT_PROJECTS_PATH = Path.home() / ".teamtrau" / "recent_projects.json"
 PROJECT_FILE_EXTENSION = ".tteproj"
 PROJECT_FILE_FILTER = "TeamTrau Project (*.tteproj);;All Files (*.*)"
+PROJECT_SCHEMA_VERSION = "2.1.0"
 
 
 @dataclass
@@ -38,7 +42,7 @@ class ProjectData:
     """Encapsulates serializable workspace state for a video editing project."""
 
     project_name: str = "Untitled Project"
-    version: str = "2.0.0"
+    version: str = PROJECT_SCHEMA_VERSION
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -62,6 +66,9 @@ class ProjectData:
     timeline_variants: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_variant_name: str | None = None
     deliverables: dict[str, Any] = field(default_factory=dict)
+    # v2.1: edit timelines are the single source of truth for Deliver/Export.
+    edit_timelines: dict[str, dict[str, Any]] = field(default_factory=dict)
+    active_timeline_key: str = "master"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert project data to JSON-serializable dictionary."""
@@ -92,7 +99,16 @@ class ProjectData:
             timeline_variants=data.get("timeline_variants", {}),
             active_variant_name=data.get("active_variant_name"),
             deliverables=data.get("deliverables", {}),
+            edit_timelines=data.get("edit_timelines", {}),
+            active_timeline_key=data.get("active_timeline_key", "master"),
         )
+
+    def get_edit_timelines(self) -> dict[str, EditTimeline]:
+        """Decode stored edit timelines; v2.0 projects are upgraded from their variants."""
+        out = {k: edit_timeline_from_dict(v) for k, v in self.edit_timelines.items()}
+        if out:
+            return out
+        return upgrade_variants_to_edit_timelines(self)
 
 
 class ProjectManager:
@@ -427,3 +443,84 @@ class ProjectManager:
             render_path=Path(d["render_path"]) if d.get("render_path") else None,
             sequence_scenes=scenes,
         )
+
+
+def upgrade_variants_to_edit_timelines(data: ProjectData) -> dict[str, EditTimeline]:
+    """Rebuild edit timelines for legacy (v2.0) projects from stored variant scene lists."""
+    from src.modules.edit_timeline import clip_from_scene
+
+    preset = PRESETS.get(data.preset_name)
+    fps = float(data.config.get("fps") or (preset.fps if preset else 30.0))
+    width = int(data.config.get("canvas_width") or (preset.width if preset else 1920))
+    height = int(data.config.get("canvas_height") or (preset.height if preset else 1080))
+    out: dict[str, EditTimeline] = {}
+    for key, raw in data.timeline_variants.items():
+        scenes = [ProjectManager.deserialize_scored_scene(s)[0] for s in raw.get("sequence_scenes", [])]
+        if not scenes:
+            continue
+        clips = [clip_from_scene(sc, int(round(sc.scene.duration * fps))) for sc in scenes]
+        out[key] = EditTimeline(
+            name=str(raw.get("display_name") or key),
+            fps=fps,
+            canvas_width=width,
+            canvas_height=height,
+            clips=clips,
+            soundtrack_path=Path(data.soundtrack_path) if data.soundtrack_path else None,
+            variant_key=key,
+        )
+    return out
+
+
+def project_from_result(
+    result: PipelineExecutionResult,
+    config: PipelineConfig,
+    project_name: str,
+    input_dirs: list[Path],
+    soundtrack_path: Path | None,
+    output_dir: Path,
+) -> ProjectData:
+    """Build a saveable project (Edit state) from a finished analysis run."""
+    pm = ProjectManager
+    data = ProjectData(
+        project_name=project_name,
+        input_dir=str(input_dirs[0]) if input_dirs else None,
+        input_dirs=[str(p) for p in input_dirs],
+        soundtrack_path=str(soundtrack_path) if soundtrack_path else None,
+        output_dir=str(output_dir),
+        preset_name=config.preset_name,
+        config=ProjectManager().serialize_pipeline_config(config),
+        scored_scenes=[pm.serialize_scored_scene(s) for s in result.scored_scenes],
+        included_scene_indices=list(range(len(result.scored_scenes))),
+        timeline_variants={k: pm.serialize_timeline_variant(v) for k, v in result.timeline_variants.items()},
+        active_variant_name=result.active_variant_name,
+        edit_timelines={k: edit_timeline_to_dict(v) for k, v in result.edit_timelines.items()},
+        active_timeline_key="master",
+    )
+    return data
+
+
+def save_result_as_project(
+    result: PipelineExecutionResult,
+    config: PipelineConfig,
+    path: Path,
+    input_dirs: list[Path],
+    soundtrack_path: Path | None,
+    output_dir: Path,
+) -> Path:
+    """Write a finished analysis run as a .tteproj (no recent-history side effects)."""
+    data = project_from_result(
+        result,
+        config,
+        path.stem,
+        [Path(p).resolve() for p in input_dirs],
+        Path(soundtrack_path).resolve() if soundtrack_path else None,
+        Path(output_dir).resolve(),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def load_project_file(path: Path) -> ProjectData:
+    """Read a .tteproj without touching recent-project history."""
+    return ProjectData.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))

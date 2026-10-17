@@ -236,7 +236,20 @@ def gui_cmd(dry_run: bool) -> None:
 @click.option("--no-cache", is_flag=True, default=False, help="Disable scene detection disk cache.")
 @click.option("--clear-cache", is_flag=True, default=False, help="Clear existing scene detection cache.")
 @click.option("--no-nvenc", is_flag=True, default=False, help="Force CPU libx265 encoding.")
-@click.option("--no-render", is_flag=True, default=False, help="Skip standalone MP4 render.")
+@click.option(
+    "--render",
+    "render_now",
+    is_flag=True,
+    default=False,
+    help="Also render the master MP4 right away (default: stop at 'Timeline ready').",
+)
+@click.option(
+    "--export-nle",
+    is_flag=True,
+    default=False,
+    help="Also export FCPXML / Premiere XML / OTIO / CapCut right away.",
+)
+@click.option("--no-render", is_flag=True, default=False, hidden=True, help="Deprecated: rendering is now opt-in.")
 @click.option("--no-dead-air", is_flag=True, default=False, help="Disable dual silence/freeze dead-air detection.")
 @click.option("--no-dedup", is_flag=True, default=False, help="Disable perceptual dHash scene deduplication.")
 @click.option("--no-teaser", is_flag=True, default=False, help="Disable retention teaser hook at sequence start.")
@@ -368,6 +381,8 @@ def run_pipeline(
     no_cache: bool,
     clear_cache: bool,
     no_nvenc: bool,
+    render_now: bool,
+    export_nle: bool,
     no_render: bool,
     no_dead_air: bool,
     no_dedup: bool,
@@ -393,7 +408,13 @@ def run_pipeline(
     watermark_margin: int = 40,
     no_audio_fix: bool = False,
 ) -> None:
-    """Execute the end-to-end automated editing and delivery pipeline."""
+    """Analyze footage and auto-edit a timeline (saved as a .tteproj project).
+
+    Nothing is exported until you ask for it: run `deliver` on the saved project, or pass
+    --render / --export-nle to do it in one go.
+    """
+    if no_render:
+        click.echo("Note: --no-render is deprecated; rendering is now opt-in via --render.")
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg = PipelineConfig.from_preset(preset)
     if fps is not None and fps > 0:
@@ -453,7 +474,8 @@ def run_pipeline(
         config=cfg,
         callbacks=None,
         run_async=False,
-        no_render=no_render,
+        no_render=not render_now,
+        export_nle=export_nle,
         force_cpu=no_nvenc,
         resolve=resolve,
         dry_run_resolve=dry_run_resolve,
@@ -490,7 +512,105 @@ def run_pipeline(
         click.echo(f"CapCut Draft     : {result.capcut_draft_path}")
     if result.render_path:
         click.echo(f"Headless Master  : {result.render_path} ({result.encoder_used})")
+    for bad, reason in result.failed_files:
+        click.echo(f"Skipped Clip     : {bad.name} ({reason})")
+
+    project_path = output_dir / f"{input_dir.resolve().name or 'project'}.tteproj"
+    _save_cli_project(result, cfg, project_path, [input_dir], soundtrack, output_dir)
+    click.echo(f"Timeline Ready   : {', '.join(result.edit_timelines)}")
+    click.echo(f"Project Saved    : {project_path}")
+    if not result.render_path:
+        click.echo(
+            f'Export when ready: main.py deliver --project "{project_path}" --format mp4,fcpxml'
+        )
     click.echo("==================================\n")
+
+
+def _save_cli_project(
+    result, cfg: PipelineConfig, path: Path, input_dirs: list[Path], soundtrack: Path | None, output_dir: Path
+) -> None:
+    from src.ui.controllers.project_manager import save_result_as_project
+
+    save_result_as_project(result, cfg, path, input_dirs, soundtrack, output_dir)
+
+
+@cli.command("deliver")
+@click.option(
+    "--project",
+    "project_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Saved .tteproj project produced by `run` or the Desktop Studio.",
+)
+@click.option("--variant", default=None, help="Timeline to export (master, beat_driven, cinematic, social_teaser).")
+@click.option(
+    "--format",
+    "formats",
+    default="mp4",
+    show_default=True,
+    help="Comma separated: mp4,fcpxml,premiere,otio,capcut",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help="Deliverables folder (default: the project's output folder).",
+)
+@click.option("--preview", is_flag=True, default=False, help="Fast 540p proxy render instead of the master.")
+@click.option("--no-nvenc", is_flag=True, default=False, help="Force CPU encoding.")
+@click.option("--resolve", is_flag=True, default=False, help="Also push the FCPXML into DaVinci Resolve.")
+def deliver_cmd(
+    project_path: Path,
+    variant: str | None,
+    formats: str,
+    output_dir: Path | None,
+    preview: bool,
+    no_nvenc: bool,
+    resolve: bool,
+) -> None:
+    """Export / render a saved timeline (no re-analysis)."""
+    from src.core.types import ALL_DELIVER_FORMATS
+    from src.ui.controllers.project_manager import ProjectManager, load_project_file
+
+    data = load_project_file(project_path)
+    timelines = data.get_edit_timelines()
+    if not timelines:
+        raise click.ClickException("Project has no edit timeline. Run analysis first.")
+    key = variant or data.active_timeline_key
+    if key not in timelines:
+        raise click.ClickException(f"Unknown timeline '{key}'. Available: {', '.join(timelines)}")
+
+    wanted = {f.strip().lower() for f in formats.split(",") if f.strip()}
+    bad = wanted - set(ALL_DELIVER_FORMATS)
+    if bad:
+        raise click.ClickException(f"Unknown format(s): {', '.join(sorted(bad))}")
+
+    cfg = ProjectManager().deserialize_pipeline_config(data.config) if data.config else PipelineConfig()
+    out_dir = output_dir or Path(data.output_dir or project_path.parent)
+    adapter = StudioBackendAdapter()
+    handle = adapter.submit_deliver_job(
+        timelines[key],
+        out_dir,
+        cfg,
+        formats=wanted,  # type: ignore[arg-type]
+        force_cpu=no_nvenc,
+        preview=preview,
+        resolve=resolve,
+        base_name=f"{project_path.stem}_{key}",
+    )
+    res = handle.result
+    if not res or not res.success:
+        raise click.ClickException(res.error_message if res else "Deliver failed.")
+    click.echo(f"Delivered '{key}' ({res.duration:.2f}s)")
+    for label, path in (
+        ("Master MP4", res.render_path),
+        ("FCPXML", res.fcpxml_path),
+        ("Premiere XML", res.premiere_xml_path),
+        ("OTIO", res.otio_path),
+        ("CapCut Draft", res.capcut_draft_path),
+    ):
+        if path:
+            click.echo(f"{label:<13}: {path}")
 
 
 if __name__ == "__main__":

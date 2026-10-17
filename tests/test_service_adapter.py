@@ -187,7 +187,11 @@ def test_adapter_submit_job_sync_with_callbacks(mock_backend, tmp_path):
                     assert len(stages_visited) > 0
                     assert len(progress_reported) > 0
                     assert len(scenes_seen) == 1
-                    assert (out_dir / "pipeline_summary.json").is_file()
+                    assert (out_dir / ".analysis" / "pipeline_summary.json").is_file()
+                    # Analysis never exports deliverables on its own.
+                    assert handle.result.render_path is None
+                    assert handle.result.fcpxml_path is None
+                    assert "master" in handle.result.edit_timelines
 
 
 def test_adapter_submit_job_async_and_cancel(mock_backend, tmp_path):

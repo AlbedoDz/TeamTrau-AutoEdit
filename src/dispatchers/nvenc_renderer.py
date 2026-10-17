@@ -21,15 +21,14 @@ import tempfile
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from src.core.config import PipelineConfig, check_nvenc_available
 from src.core.ffmpeg_utils import atempo_chain, has_audio_stream, is_hw_encoder_error, popen_tool
-from src.core.types import CropWindow, RenderJobResult, ScoredScene, SongSection
+from src.core.types import EditClip, EditTimeline, RenderJobResult, ScoredScene, SongSection
 from src.dispatchers.watermark_helper import build_watermark_filter_lines
-from src.modules.timeline_builder import select_scenes_for_cuts
+from src.modules.edit_timeline import build_edit_timeline
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +36,8 @@ AUDIO_RATE = 48000
 PREVIEW_HEIGHT = 540
 
 
-@dataclass
-class RenderSegment:
-    """One clip on the output timeline, expressed in source and output terms."""
-
-    source: Path
-    source_in: float
-    frames: int
-    available: float
-    speed: float = 1.0
-    crop_window: CropWindow | None = None
-    ken_burns: str | None = None
+# A render segment is exactly one clip of the edit timeline.
+RenderSegment = EditClip
 
 
 class RenderError(RuntimeError):
@@ -78,56 +68,19 @@ class NvencRenderer:
         cut_timestamps: list[float],
         include_teaser: bool | None = None,
         sections: list[SongSection] | None = None,
-    ) -> list[RenderSegment]:
+    ) -> list[EditClip]:
         """Turn analysed scenes + beat cuts into frame-exact output segments."""
         if not scored_scenes:
             raise ValueError("No scenes provided for rendering.")
         if len(cut_timestamps) < 2:
             raise ValueError("cut_timestamps must have at least 2 boundary timestamps.")
-
-        fps = self.config.fps
-        total_duration = cut_timestamps[-1] - cut_timestamps[0]
-        should_teaser = include_teaser if include_teaser is not None else self.config.enable_teaser
-        has_teaser = should_teaser and (total_duration >= self.config.teaser_duration + 4.0)
-
-        def frame_at(t: float) -> int:
-            return int(round((t - cut_timestamps[0]) * fps))
-
-        def make(sc: ScoredScene, frames: int) -> RenderSegment:
-            return RenderSegment(
-                source=sc.scene.clip_path,
-                source_in=sc.scene.start_time,
-                frames=max(1, frames),
-                available=max(0.04, sc.scene.duration),
-                speed=max(0.1, float(sc.speed or 1.0)),
-                crop_window=sc.crop_window,
-                ken_burns=sc.metadata.get("ken_burns") if sc.metadata else None,
-            )
-
-        segments: list[RenderSegment] = []
-        if has_teaser:
-            teaser_frames = frame_at(cut_timestamps[0] + self.config.teaser_duration)
-            num_teaser = min(5, max(3, len(scored_scenes)))
-            bounds = [round(teaser_frames * j / num_teaser) for j in range(num_teaser + 1)]
-            for j in range(num_teaser):
-                candidate = scored_scenes[j % len(scored_scenes)]
-                segments.append(make(candidate, bounds[j + 1] - bounds[j]))
-            teaser_end = cut_timestamps[0] + self.config.teaser_duration
-            main_cuts = [teaser_end] + [t for t in cut_timestamps if t > teaser_end]
-        else:
-            main_cuts = list(cut_timestamps)
-
-        main_scenes = select_scenes_for_cuts(
-            scored_scenes=scored_scenes,
-            cut_timestamps=main_cuts,
+        return build_edit_timeline(
+            self.config,
+            scored_scenes,
+            cut_timestamps,
             sections=sections,
-            action_drop_threshold=self.config.action_drop_threshold,
-        )
-        for i in range(len(main_cuts) - 1):
-            frames = frame_at(main_cuts[i + 1]) - frame_at(main_cuts[i])
-            if frames > 0:
-                segments.append(make(main_scenes[i], frames))
-        return segments
+            include_teaser=include_teaser,
+        ).clips
 
     # ------------------------------------------------------------------
     # Command builders (pure, unit-testable)
@@ -262,12 +215,12 @@ class NvencRenderer:
     ) -> list[str]:
         canvas = self.canvas_size(preview)
         src_dur = min(seg.available, seg.frames / self.config.fps * seg.speed)
-        src_has_audio = with_audio and has_audio_stream(seg.source)
+        src_has_audio = with_audio and has_audio_stream(seg.source_path)
         wm = self._watermark_path()
 
         cmd = [ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
         cmd += ["-ss", f"{max(0.0, seg.source_in):.3f}", "-t", f"{src_dur + 0.25:.3f}"]
-        cmd += ["-i", str(Path(seg.source).resolve())]
+        cmd += ["-i", str(Path(seg.source_path).resolve())]
         wm_idx = None
         if wm is not None:
             cmd += ["-loop", "1", "-i", str(wm)]
@@ -484,6 +437,47 @@ class NvencRenderer:
                 job_handle._child_process = None
             part_file.unlink(missing_ok=True)
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def render_edit_timeline(
+        self,
+        edit_tl: EditTimeline,
+        output_file: Path,
+        force_cpu: bool = False,
+        preview: bool = False,
+        progress_callback: Callable[[float, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        job_handle: Any | None = None,
+    ) -> RenderJobResult:
+        """Render exactly what is on the edit timeline (canvas and fps come from the timeline)."""
+        renderer = self
+        if (edit_tl.canvas_width, edit_tl.canvas_height, edit_tl.fps) != (
+            self.config.canvas_width,
+            self.config.canvas_height,
+            self.config.fps,
+        ):
+            renderer = NvencRenderer(
+                self.config.model_copy(
+                    update={
+                        "canvas_width": edit_tl.canvas_width,
+                        "canvas_height": edit_tl.canvas_height,
+                        "fps": edit_tl.fps,
+                    }
+                )
+            )
+            renderer.nvenc_available = self.nvenc_available
+        if edit_tl.kind == "rough_cut":
+            renderer.config = renderer.config.model_copy(update={"keep_video_audio": True})
+        return renderer.render_segments(
+            edit_tl.clips,
+            edit_tl.soundtrack_path,
+            output_file,
+            force_cpu=force_cpu,
+            preview=preview,
+            soundtrack_in=edit_tl.soundtrack_in,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            job_handle=job_handle,
+        )
 
     def render_sequence(
         self,

@@ -14,8 +14,12 @@ from typing import Any, Callable
 
 from src.core.config import PipelineConfig
 from src.core.types import (
+    ALL_DELIVER_FORMATS,
     CleanedSegment,
     CropWindow,
+    DeliverFormat,
+    DeliverResult,
+    EditTimeline,
     PipelineExecutionResult,
     SceneCut,
     ScoredScene,
@@ -25,6 +29,7 @@ from src.dispatchers.nvenc_renderer import NvencRenderer
 from src.dispatchers.resolve_dispatcher import ResolveDispatcher
 from src.modules.audio_analyzer import AudioAnalysisResult, AudioAnalyzer
 from src.modules.duration_packer import DurationPacker
+from src.modules.edit_timeline import build_edit_timeline, build_rough_cut_edit_timeline
 from src.modules.ingest_detector import IngestDetector
 from src.modules.smart_reframer import SmartReframer
 from src.modules.timeline_builder import TimelineBuilder
@@ -53,7 +58,7 @@ class JobHandle:
         self.job_id = job_id
         self.cancel_event = cancel_event
         self._thread: threading.Thread | None = None
-        self._result: PipelineExecutionResult | None = None
+        self._result: PipelineExecutionResult | DeliverResult | None = None
         self._completed = threading.Event()
         self._child_process: Any = None
 
@@ -80,7 +85,7 @@ class JobHandle:
         return self._completed.wait(timeout=timeout)
 
     @property
-    def result(self) -> PipelineExecutionResult | None:
+    def result(self) -> Any:
         """Return final execution result if completed, else None."""
         return self._result
 
@@ -226,18 +231,21 @@ class StudioBackendAdapter:
         config: PipelineConfig,
         callbacks: JobCallbacks | None = None,
         run_async: bool = False,
-        no_render: bool = False,
+        no_render: bool = True,
         force_cpu: bool = False,
         resolve: bool = False,
         dry_run_resolve: bool = False,
+        export_nle: bool = False,
     ) -> JobHandle:
-        """Submit a full video editing pipeline job for synchronous or asynchronous execution."""
-        job_id = f"job_{uuid.uuid4().hex[:8]}"
-        cancel_event = threading.Event()
-        handle = JobHandle(job_id, cancel_event)
+        """Submit an analysis + auto-edit job. It stops at "Timeline ready".
 
-        with self._jobs_lock:
-            self._active_jobs[job_id] = handle
+        Like DaVinci Resolve / Premiere / CapCut, nothing is exported or rendered unless
+        explicitly requested: pass ``no_render=False`` / ``export_nle=True`` for a one-shot
+        CLI run, otherwise call :meth:`submit_deliver_job` when the user clicks Export.
+        """
+        handle = self._new_handle()
+        cancel_event = handle.cancel_event
+        job_id = handle.job_id
 
         def _worker() -> None:
             try:
@@ -253,6 +261,7 @@ class StudioBackendAdapter:
                     resolve=resolve,
                     dry_run_resolve=dry_run_resolve,
                     job_handle=handle,
+                    export_nle=export_nle,
                 )
                 handle._result = res
             except Exception as exc:
@@ -277,16 +286,192 @@ class StudioBackendAdapter:
             finally:
                 handle._completed.set()
 
+        return self._launch(handle, _worker, run_async, "AutoEditWorker")
+
+    def _new_handle(self) -> JobHandle:
+        handle = JobHandle(f"job_{uuid.uuid4().hex[:8]}", threading.Event())
+        with self._jobs_lock:
+            self._active_jobs[handle.job_id] = handle
+        return handle
+
+    @staticmethod
+    def _launch(
+        handle: JobHandle, worker: Callable[[], None], run_async: bool, thread_prefix: str
+    ) -> JobHandle:
         if run_async:
             thread = threading.Thread(
-                target=_worker, name=f"AutoEditWorker-{job_id}", daemon=True
+                target=worker, name=f"{thread_prefix}-{handle.job_id}", daemon=True
             )
             handle._thread = thread
             thread.start()
         else:
-            _worker()
-
+            worker()
         return handle
+
+    # ------------------------------------------------------------------
+    # Deliver (explicit export / render)
+    # ------------------------------------------------------------------
+    def submit_deliver_job(
+        self,
+        edit_timeline: EditTimeline,
+        output_dir: Path,
+        config: PipelineConfig,
+        formats: set[DeliverFormat] | None = None,
+        callbacks: JobCallbacks | None = None,
+        run_async: bool = False,
+        force_cpu: bool = False,
+        preview: bool = False,
+        resolve: bool = False,
+        dry_run_resolve: bool = False,
+        base_name: str | None = None,
+    ) -> JobHandle:
+        """Export / render an existing edit timeline. Never re-runs analysis.
+
+        ``preview=True`` renders a fast 540p proxy into ``cache_dir/preview`` instead of
+        a master deliverable.
+        """
+        handle = self._new_handle()
+
+        def _worker() -> None:
+            try:
+                handle._result = self._execute_deliver(
+                    edit_timeline,
+                    output_dir,
+                    config,
+                    formats=set(formats) if formats is not None else {"mp4"},
+                    callbacks=callbacks,
+                    cancel_event=handle.cancel_event,
+                    force_cpu=force_cpu,
+                    preview=preview,
+                    resolve=resolve,
+                    dry_run_resolve=dry_run_resolve,
+                    base_name=base_name,
+                    job_handle=handle,
+                )
+            except Exception as exc:
+                logger.error("Deliver job %s failed: %s", handle.job_id, exc, exc_info=True)
+                handle._result = DeliverResult(
+                    success=False, output_dir=output_dir, is_preview=preview, error_message=str(exc)
+                )
+            finally:
+                handle._completed.set()
+
+        return self._launch(handle, _worker, run_async, "AutoEditDeliver")
+
+    def _execute_deliver(
+        self,
+        edit_tl: EditTimeline,
+        output_dir: Path,
+        config: PipelineConfig,
+        formats: set[DeliverFormat],
+        callbacks: JobCallbacks | None,
+        cancel_event: threading.Event,
+        force_cpu: bool = False,
+        preview: bool = False,
+        resolve: bool = False,
+        dry_run_resolve: bool = False,
+        base_name: str | None = None,
+        job_handle: JobHandle | None = None,
+        render_file_name: str | None = None,
+    ) -> DeliverResult:
+        unknown = set(formats) - set(ALL_DELIVER_FORMATS)
+        if unknown:
+            raise ValueError(f"Unknown deliver format(s): {sorted(unknown)}")
+        if not edit_tl.clips:
+            raise ValueError("Timeline is empty - nothing to deliver.")
+
+        def progress(pct: float, msg: str) -> None:
+            if cancel_event.is_set():
+                raise InterruptedError("Deliver cancelled by user.")
+            if callbacks and callbacks.on_progress:
+                callbacks.on_progress(pct, pct, msg)
+
+        def stage(name: str, idx: int, total: int) -> None:
+            if callbacks and callbacks.on_stage_changed:
+                callbacks.on_stage_changed(name, idx, total)
+
+        result = DeliverResult(success=False, output_dir=output_dir, is_preview=preview)
+        if preview:
+            out_dir = Path(config.cache_dir).resolve() / "preview"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stage("Rendering 540p preview", 1, 1)
+            renderer = NvencRenderer(config)
+            res = renderer.render_edit_timeline(
+                edit_tl,
+                out_dir / f"preview_{edit_tl.variant_key}.mp4",
+                force_cpu=force_cpu,
+                preview=True,
+                progress_callback=progress,
+                cancel_event=cancel_event,
+                job_handle=job_handle,
+            )
+            result.render_path, result.encoder_used = res.output_path, res.encoder_used
+            result.duration, result.success = res.duration, True
+            return result
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        name = base_name or f"{edit_tl.name}"
+        nle_formats = {f for f in formats if f != "mp4"}
+        if resolve or dry_run_resolve:
+            nle_formats.add("fcpxml")
+        total = (1 if nle_formats else 0) + (1 if "mp4" in formats else 0)
+        step = 0
+
+        if nle_formats:
+            step += 1
+            stage("Exporting NLE interchange files", step, total)
+            progress(10.0, "Building OTIO timeline...")
+            builder = TimelineBuilder(config)
+            otio_tl = builder.build_from_edit_timeline(edit_tl)
+            try:
+                from src.modules.timeline_qa import TimelineQA
+
+                for r in TimelineQA(config).validate_and_sanitize(
+                    otio_tl, min_clip_frames=config.min_clip_frames_threshold
+                ):
+                    logger.info("[QA Audit] %s", r)
+            except Exception as qa_err:
+                logger.warning("Timeline QA sanitization warning: %s", qa_err)
+            exp_cfg = config.model_copy(
+                update={"canvas_width": edit_tl.canvas_width, "canvas_height": edit_tl.canvas_height, "fps": edit_tl.fps}
+            )
+            exp = TimelineBuilder(exp_cfg).export_all(otio_tl, output_dir, base_name=name, formats=nle_formats)
+            result.fcpxml_path = exp.fcpxml_path
+            result.premiere_xml_path = exp.premiere_xml_path
+            result.otio_path = exp.otio_path
+            result.capcut_draft_path = exp.capcut_draft_path
+            progress(100.0, "NLE interchange files exported")
+
+            if resolve or dry_run_resolve:
+                dispatcher = ResolveDispatcher(config)
+                result.resolve_status = dispatcher.dispatch_project(
+                    fcpxml_path=exp.fcpxml_path or (output_dir / f"{name}.fcpxml"),
+                    source_media_paths=sorted({Path(c.source_path) for c in edit_tl.clips}),
+                    project_name=name,
+                    render_output_dir=output_dir / "resolve_renders",
+                    dry_run=dry_run_resolve,
+                )
+
+        if "mp4" in formats:
+            step += 1
+            stage("Master Video Rendering (FFmpeg NVENC)", step, total)
+            _enforce_vram_headroom(max_allowed_gb=2.0)
+            renderer = NvencRenderer(config)
+            res = renderer.render_edit_timeline(
+                edit_tl,
+                output_dir / (render_file_name or f"{name}.mp4"),
+                force_cpu=force_cpu,
+                progress_callback=progress,
+                cancel_event=cancel_event,
+                job_handle=job_handle,
+            )
+            result.render_path, result.encoder_used = res.output_path, res.encoder_used
+            result.duration = res.duration
+        else:
+            result.duration = edit_tl.duration
+
+        result.success = True
+        return result
 
     def _execute_pipeline(
         self,
@@ -301,10 +486,14 @@ class StudioBackendAdapter:
         resolve: bool,
         dry_run_resolve: bool,
         job_handle: JobHandle | None,
+        export_nle: bool = False,
     ) -> PipelineExecutionResult:
-        """Synchronously execute the multi-stage pipeline, updating progress callbacks."""
+        """Synchronously execute analysis + auto-edit, ending at "Timeline ready"."""
         total_stages = 7 if not no_render else 6
         output_dir.mkdir(parents=True, exist_ok=True)
+        # Analysis side-products live next to the project, never among deliverables.
+        analysis_dir = output_dir / ".analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
 
         def _check_cancel() -> None:
             if cancel_event.is_set():
@@ -390,9 +579,9 @@ class StudioBackendAdapter:
         if not all_scenes:
             raise ValueError("No usable scene intervals detected from input footage.")
 
-        detector.export_metadata_csv(all_scenes, output_dir / "scenes_metadata.csv")
+        detector.export_metadata_csv(all_scenes, analysis_dir / "scenes_metadata.csv")
         detector.export_metadata_edl(
-            all_scenes, output_dir / "scenes_metadata.edl", config.fps
+            all_scenes, analysis_dir / "scenes_metadata.edl", config.fps
         )
         total_footage_duration = sum(s.duration for s in all_scenes)
         _notify_progress(100.0, 1, f"Discovered {len(all_scenes)} scenes across footage")
@@ -549,7 +738,7 @@ class StudioBackendAdapter:
                     try:
                         from src.modules.kinetic_subtitle import export_kinetic_ass
 
-                        ass_path = output_dir / "subtitles_kinetic.ass"
+                        ass_path = analysis_dir / "subtitles_kinetic.ass"
                         export_kinetic_ass(
                             transcribed_sentences,
                             ass_path,
@@ -582,116 +771,80 @@ class StudioBackendAdapter:
         _notify_progress(100.0, 5, "Speech dialogue and semantic analysis completed")
 
         # -------------------------------------------------------------
-        # Stage 6: Timeline Synthesis & Multi-NLE Export
+        # Stage 6: Edit Timeline Synthesis (no files are exported here)
         # -------------------------------------------------------------
-        _notify_stage("Timeline Synthesis & Multi-NLE Serialization", 6)
-        _notify_progress(25.0, 6, "Assembling OpenTimelineIO sequence tracks...")
-        timeline_engine = TimelineBuilder(config)
+        _notify_stage("Edit Timeline Synthesis & Variants", 6)
+        _notify_progress(25.0, 6, "Assembling edit timeline...")
         if config.workflow_mode == "rough_cut" and cleaned_segments:
-            master_timeline = timeline_engine.build_rough_cut_timeline(
-                cleaned_segments=cleaned_segments,
-                timeline_name=f"RoughCut_{config.preset_name}",
-                fps=config.fps,
+            master_tl = build_rough_cut_edit_timeline(
+                config, cleaned_segments, name=f"RoughCut_{config.preset_name}"
             )
         else:
-            master_timeline = timeline_engine.build_timeline(
-                scored_scenes=ranked_scenes,
-                cut_timestamps=audio_res.cut_timestamps,
-                soundtrack_path=active_soundtrack if active_soundtrack else raw_files[0],
-                timeline_name=f"AutoEdit_{config.preset_name}",
+            master_tl = build_edit_timeline(
+                config,
+                ranked_scenes,
+                audio_res.cut_timestamps,
+                soundtrack_path=active_soundtrack,
                 sections=audio_res.sections,
+                name=f"AutoEdit_{config.preset_name}",
+                variant_key="master",
             )
+        edit_timelines: dict[str, EditTimeline] = {"master": master_tl}
 
-        # Pre-dispatch Timeline QA & Sanitization Hook
-        _notify_progress(45.0, 6, "Auditing sequence integrity (TimelineQA)...")
-        try:
-            from src.modules.timeline_qa import TimelineQA
-
-            qa_engine = TimelineQA(config)
-            qa_reports = qa_engine.validate_and_sanitize(
-                master_timeline,
-                min_clip_frames=getattr(config, "min_clip_frames_threshold", 6),
-            )
-            for r in qa_reports:
-                logger.info("[QA Audit] %s", r)
-        except Exception as qa_err:
-            logger.warning("Timeline QA sanitization warning: %s", qa_err)
-
-        _notify_progress(60.0, 6, "Serializing FCPXML, Premiere XML, OTIO & CapCut...")
-        export_res = timeline_engine.export_all(
-            master_timeline, output_dir, base_name="timeline"
-        )
-        _notify_progress(80.0, 6, f"Exported {export_res.clip_count} clips successfully")
-
-        # Multi-Variant Timeline Synthesis (1-3 Variations)
         variants = {}
         if config.workflow_mode != "rough_cut" and active_soundtrack is not None:
+            _notify_progress(60.0, 6, "Synthesizing creative variants...")
             try:
                 from src.modules.variant_synthesizer import MultiVariantTimelineSynthesizer
 
                 variant_synth = MultiVariantTimelineSynthesizer(config)
-                variant_cnt = getattr(config, "generate_variants", 3)
                 variants = variant_synth.synthesize_variants(
                     scored_scenes=ranked_scenes,
                     beats=audio_res.beats,
                     soundtrack_path=active_soundtrack,
                     song_sections=audio_res.sections,
-                    variant_count=variant_cnt,
-                    output_dir=output_dir / "variants",
+                    variant_count=getattr(config, "generate_variants", 3),
                 )
+                for key, var in variants.items():
+                    if var.edit_timeline is not None:
+                        edit_timelines[key] = var.edit_timeline
                 logger.info("Synthesized %d creative timeline variants.", len(variants))
             except Exception as var_err:
                 logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
 
-        _notify_progress(100.0, 6, f"Multi-variant synthesis ready ({len(variants)} cuts)")
-
-        # DaVinci Resolve Dispatcher (if requested)
-        resolve_info = None
-        if resolve or dry_run_resolve:
-            logger.info("Triggering DaVinci Resolve Studio automation...")
-            dispatcher = ResolveDispatcher(config)
-            resolve_info = dispatcher.dispatch_project(
-                fcpxml_path=export_res.fcpxml_path or (output_dir / "timeline.fcpxml"),
-                source_media_paths=raw_files,
-                project_name=f"AutoEdit_{config.preset_name}",
-                render_output_dir=output_dir / "resolve_renders",
-                dry_run=dry_run_resolve,
-            )
+        _notify_progress(100.0, 6, f"Timeline ready ({len(master_tl.clips)} clips, {len(variants)} variants)")
 
         # -------------------------------------------------------------
-        # Stage 7: Master Video Rendering (if enabled)
+        # Optional one-shot Deliver (CLI --render / --export-nle only)
         # -------------------------------------------------------------
-        render_res = None
+        deliver_res: DeliverResult | None = None
+        formats: set[DeliverFormat] = set()
+        if export_nle:
+            formats |= {"fcpxml", "premiere", "otio"}
+            if config.enable_capcut_export:
+                formats.add("capcut")
         if not no_render:
-            _enforce_vram_headroom(max_allowed_gb=2.0)
-            _notify_stage("Master Video Rendering (FFmpeg NVENC)", 7)
-            renderer = NvencRenderer(config)
-            master_video_path = output_dir / f"master_{config.preset_name}.mp4"
-
-            def _render_prog(pct: float, msg: str) -> None:
-                _notify_progress(pct, 7, msg)
-
-            render_cuts = audio_res.cut_timestamps
-            if config.workflow_mode == "rough_cut":
-                cum_cuts = [0.0]
-                cur = 0.0
-                for s in ranked_scenes:
-                    cur += s.scene.duration
-                    cum_cuts.append(cur)
-                render_cuts = cum_cuts
-
-            render_res = renderer.render_sequence(
-                scored_scenes=ranked_scenes,
-                cut_timestamps=render_cuts,
-                soundtrack_path=active_soundtrack,
-                output_file=master_video_path,
-                force_cpu=force_cpu,
-                sections=audio_res.sections,
-                progress_callback=_render_prog,
+            formats.add("mp4")
+        if formats or resolve or dry_run_resolve:
+            _notify_stage("Deliver: Export & Render", 7)
+            deliver_res = self._execute_deliver(
+                master_tl,
+                output_dir,
+                config,
+                formats=formats,
+                callbacks=JobCallbacks(
+                    on_progress=lambda sp, _tp, msg: _notify_progress(sp, 7, msg)
+                ),
                 cancel_event=cancel_event,
+                force_cpu=force_cpu,
+                resolve=resolve,
+                dry_run_resolve=dry_run_resolve,
+                base_name="timeline",
+                render_file_name=f"master_{config.preset_name}.mp4",
                 job_handle=job_handle,
             )
-            _notify_progress(100.0, 7, "Master video render complete")
+
+        resolve_info = deliver_res.resolve_status if deliver_res else None
 
         # Write pipeline summary JSON
         summary = {
@@ -714,38 +867,41 @@ class StudioBackendAdapter:
             "sections_detected": len(audio_res.sections),
             "audio_bpm": audio_res.tempo_bpm,
             "cut_count": len(audio_res.cut_timestamps) - 1,
-            "total_duration": export_res.total_duration,
-            "fcpxml": str(export_res.fcpxml_path) if export_res.fcpxml_path else None,
+            "total_duration": master_tl.duration,
+            "timeline_clips": len(master_tl.clips),
+            "variants": sorted(variants.keys()),
+            "fcpxml": str(deliver_res.fcpxml_path) if deliver_res and deliver_res.fcpxml_path else None,
             "premiere_xml": (
-                str(export_res.premiere_xml_path)
-                if export_res.premiere_xml_path
+                str(deliver_res.premiere_xml_path)
+                if deliver_res and deliver_res.premiere_xml_path
                 else None
             ),
             "capcut_draft": (
-                str(export_res.capcut_draft_path)
-                if export_res.capcut_draft_path
+                str(deliver_res.capcut_draft_path)
+                if deliver_res and deliver_res.capcut_draft_path
                 else None
             ),
-            "master_render": str(render_res.output_path) if render_res else None,
+            "master_render": str(deliver_res.render_path) if deliver_res and deliver_res.render_path else None,
+            "failed_files": [[str(p), r] for p, r in detector.failed_files],
             "resolve_status": resolve_info,
         }
-        summary_file = output_dir / "pipeline_summary.json"
+        summary_file = analysis_dir / "pipeline_summary.json"
         with summary_file.open("w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
         return PipelineExecutionResult(
             success=True,
-            total_duration=export_res.total_duration,
-            clip_count=export_res.clip_count,
+            total_duration=master_tl.duration,
+            clip_count=len(master_tl.clips),
             scenes_detected=len(all_scenes),
             audio_bpm=audio_res.tempo_bpm,
             sections_detected=len(audio_res.sections),
-            fcpxml_path=export_res.fcpxml_path,
-            premiere_xml_path=export_res.premiere_xml_path,
-            otio_path=export_res.otio_path,
-            capcut_draft_path=export_res.capcut_draft_path,
-            render_path=render_res.output_path if render_res else None,
-            encoder_used=render_res.encoder_used if render_res else None,
+            fcpxml_path=deliver_res.fcpxml_path if deliver_res else None,
+            premiere_xml_path=deliver_res.premiere_xml_path if deliver_res else None,
+            otio_path=deliver_res.otio_path if deliver_res else None,
+            capcut_draft_path=deliver_res.capcut_draft_path if deliver_res else None,
+            render_path=deliver_res.render_path if deliver_res else None,
+            encoder_used=deliver_res.encoder_used if deliver_res else None,
             resolve_status=resolve_info,
             dialogue_sentences=len(transcribed_sentences),
             error_message=None,
@@ -753,4 +909,9 @@ class StudioBackendAdapter:
             timeline_variants=variants,
             active_variant_name="beat_driven" if "beat_driven" in variants else None,
             failed_files=list(detector.failed_files),
+            edit_timelines=edit_timelines,
+            active_soundtrack=active_soundtrack,
+            cut_timestamps=list(audio_res.cut_timestamps),
+            sections=list(audio_res.sections),
+            source_files=list(raw_files),
         )

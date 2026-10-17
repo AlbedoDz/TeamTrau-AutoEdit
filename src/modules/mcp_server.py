@@ -572,10 +572,69 @@ def generate_kinetic_subtitles(
 # =============================================================================
 
 
+def _deliver_from_project(
+    project_path: str,
+    formats: set[str],
+    output_dir: Path | None = None,
+    variant: str | None = None,
+    force_cpu: bool = False,
+    base_name: str | None = None,
+) -> Any:
+    """Deliver an already-edited timeline from a saved .tteproj (no re-analysis)."""
+    from src.ui.controllers.project_manager import ProjectManager, load_project_file
+
+    proj = Path(project_path)
+    data = load_project_file(proj)
+    timelines = data.get_edit_timelines()
+    key = variant or data.active_timeline_key
+    if key not in timelines:
+        raise ValueError(f"Timeline '{key}' not found. Available: {sorted(timelines)}")
+    cfg = ProjectManager().deserialize_pipeline_config(data.config) if data.config else PipelineConfig()
+    out_dir = output_dir or Path(data.output_dir or proj.parent)
+    handle = adapter.submit_deliver_job(
+        timelines[key],
+        out_dir,
+        cfg,
+        formats=formats,  # type: ignore[arg-type]
+        force_cpu=force_cpu,
+        base_name=base_name or f"{proj.stem}_{key}",
+    )
+    res = handle.result
+    if not res or not res.success:
+        raise ValueError(res.error_message if res else "Deliver failed")
+    res.clip_count = len(timelines[key].clips)
+    return res
+
+
+def _analysis_config(
+    preset: str,
+    duration_mode: str = "fixed",
+    target_duration: float | None = None,
+    enable_teaser: bool = True,
+    speed_ramping: bool = False,
+    watermark_path: str | None = None,
+    layout_mode: str = "auto_hybrid",
+    subtitle_style: str = "kinetic_ass",
+    enable_transcription: bool = False,
+) -> PipelineConfig:
+    return PipelineConfig.from_preset(
+        preset,
+        duration_mode=duration_mode,
+        target_duration=target_duration,
+        enable_teaser=enable_teaser,
+        enable_speed_ramping=speed_ramping,
+        watermark_path=Path(watermark_path) if watermark_path else None,
+        watermark_enabled=bool(watermark_path),
+        reframing_mode=layout_mode,
+        subtitle_style=subtitle_style,
+        enable_transcription=enable_transcription,
+    )
+
+
 @mcp_server.tool()
 def export_timeline(
-    input_dir: str,
-    soundtrack: str,
+    input_dir: str = "",
+    soundtrack: str = "",
     output_dir: str = "./output",
     preset: str = "1080p30",
     duration_mode: str = "fixed",
@@ -585,16 +644,19 @@ def export_timeline(
     watermark_path: str | None = None,
     layout_mode: str = "auto_hybrid",
     subtitle_style: str = "kinetic_ass",
+    project_path: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
-    """Execute end-to-end non-destructive timeline synthesis and multi-NLE project export.
+    """Export NLE project files (DaVinci FCPXML, Premiere XML, OTIO, CapCut draft).
 
-    Produces DaVinci Resolve FCPXML, Premiere Pro XML, OpenTimelineIO (.otio),
-    and native CapCut Desktop drafts.
+    ONLY call this when the user explicitly asks to export. Prefer ``project_path``
+    (a .tteproj from execute_pipeline_job) so the exported timeline is exactly the
+    one already edited; passing input_dir + soundtrack re-analyzes the footage.
 
     Args:
-        input_dir: Directory containing raw video footage files.
-        soundtrack: Path to the background audio soundtrack file.
-        output_dir: Target directory for exported project files and metadata.
+        input_dir: Directory containing raw video footage files (when no project_path).
+        soundtrack: Path to the background audio soundtrack file (when no project_path).
+        output_dir: Target directory for exported project files.
         preset: Target canvas resolution and framerate preset.
         duration_mode: Duration decoupling mode ('fixed', 'footage_driven', 'full_track').
         target_duration: Target duration in seconds (optional).
@@ -603,63 +665,50 @@ def export_timeline(
         watermark_path: Optional path to logo watermark image.
         layout_mode: Reframing strategy ('smart_crop', 'blur_backdrop', 'auto_hybrid').
         subtitle_style: Subtitle format ('none', 'clean_srt', 'kinetic_ass').
+        project_path: Saved .tteproj to export without re-analysis.
+        variant: Timeline key inside the project (master, beat_driven, cinematic, social_teaser).
 
     Returns:
         JSON structure with exported project file paths and timeline metrics.
     """
-    in_path = Path(input_dir)
-    audio_path = Path(soundtrack)
     out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    if not in_path.is_dir():
-        raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
-    if not audio_path.is_file():
-        raise FileNotFoundError(f"Soundtrack audio not found: {soundtrack}")
-
-    cfg = PipelineConfig.from_preset(
-        preset,
-        duration_mode=duration_mode,
-        target_duration=target_duration,
-        enable_teaser=enable_teaser,
-        enable_speed_ramping=speed_ramping,
-        watermark_path=Path(watermark_path) if watermark_path else None,
-        enable_watermark=bool(watermark_path),
-        reframing_mode=layout_mode,
-        subtitle_style=subtitle_style,
-    )
-
-    handle = adapter.submit_job(
-        input_dir=in_path,
-        soundtrack=audio_path,
-        output_dir=out_path,
-        config=cfg,
-        run_async=False,
-        no_render=True,
-    )
-    res = handle.result
-    if not res or not res.success:
-        err = res.error_message if res else "Timeline export failed"
-        raise ValueError(err)
+    nle = {"fcpxml", "premiere", "otio", "capcut"}
+    if project_path:
+        res = _deliver_from_project(project_path, nle, out_path, variant)
+        clip_count, total = res.clip_count, res.duration
+    else:
+        in_path, audio_path = Path(input_dir), Path(soundtrack)
+        if not in_path.is_dir():
+            raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Soundtrack audio not found: {soundtrack}")
+        cfg = _analysis_config(
+            preset, duration_mode, target_duration, enable_teaser, speed_ramping,
+            watermark_path, layout_mode, subtitle_style,
+        )
+        handle = adapter.submit_job(
+            input_dir=in_path, soundtrack=audio_path, output_dir=out_path, config=cfg,
+            run_async=False, no_render=True, export_nle=True,
+        )
+        res = handle.result
+        if not res or not res.success:
+            raise ValueError(res.error_message if res else "Timeline export failed")
+        clip_count, total = res.clip_count, res.total_duration
 
     return {
-        "clip_count": res.clip_count,
-        "total_duration": round(res.total_duration, 2),
+        "clip_count": clip_count,
+        "total_duration": round(total, 2),
         "fcpxml_path": str(res.fcpxml_path) if res.fcpxml_path else None,
-        "premiere_xml_path": (
-            str(res.premiere_xml_path) if res.premiere_xml_path else None
-        ),
+        "premiere_xml_path": str(res.premiere_xml_path) if res.premiere_xml_path else None,
         "otio_path": str(res.otio_path) if res.otio_path else None,
-        "capcut_draft_path": (
-            str(res.capcut_draft_path) if res.capcut_draft_path else None
-        ),
+        "capcut_draft_path": str(res.capcut_draft_path) if res.capcut_draft_path else None,
     }
 
 
 @mcp_server.tool()
 def render_master(
-    input_dir: str,
-    soundtrack: str,
+    input_dir: str = "",
+    soundtrack: str = "",
     output_file: str = "./output/master.mp4",
     preset: str = "1080p30",
     no_nvenc: bool = False,
@@ -667,12 +716,18 @@ def render_master(
     watermark_path: str | None = None,
     layout_mode: str = "auto_hybrid",
     subtitle_style: str = "kinetic_ass",
+    project_path: str | None = None,
+    variant: str | None = None,
 ) -> dict[str, Any]:
-    """Execute standalone headless master video rendering using FFmpeg NVENC (with CPU fallback).
+    """Render the master MP4 with FFmpeg NVENC (CPU fallback).
+
+    ONLY call this when the user explicitly asks to render/export the video. Prefer
+    ``project_path`` so the render matches the edited timeline exactly; passing
+    input_dir + soundtrack re-analyzes the footage first.
 
     Args:
-        input_dir: Directory containing raw video footage files.
-        soundtrack: Path to the background soundtrack audio.
+        input_dir: Directory containing raw video footage files (when no project_path).
+        soundtrack: Path to the background soundtrack audio (when no project_path).
         output_file: Master deliverable output video file path.
         preset: Target canvas resolution and framerate preset.
         no_nvenc: Force CPU libx265 rendering instead of NVIDIA NVENC hardware acceleration.
@@ -680,58 +735,50 @@ def render_master(
         watermark_path: Optional path to logo watermark image.
         layout_mode: Reframing mode ('smart_crop', 'blur_backdrop', 'auto_hybrid').
         subtitle_style: Subtitle format ('none', 'clean_srt', 'kinetic_ass').
+        project_path: Saved .tteproj to render without re-analysis.
+        variant: Timeline key inside the project.
 
     Returns:
         JSON structure with output file path, encoder used, duration, and file size.
     """
-    in_path = Path(input_dir)
-    audio_path = Path(soundtrack)
     out_video_path = Path(output_file)
     out_dir = out_video_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not in_path.is_dir():
-        raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
-    if not audio_path.is_file():
-        raise FileNotFoundError(f"Soundtrack audio not found: {soundtrack}")
+    if project_path:
+        res = _deliver_from_project(
+            project_path, {"mp4"}, out_dir, variant, no_nvenc, base_name=out_video_path.stem
+        )
+        render_p, encoder, duration = res.render_path, res.encoder_used, res.duration
+    else:
+        in_path, audio_path = Path(input_dir), Path(soundtrack)
+        if not in_path.is_dir():
+            raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Soundtrack audio not found: {soundtrack}")
+        cfg = _analysis_config(
+            preset, speed_ramping=speed_ramping, watermark_path=watermark_path,
+            layout_mode=layout_mode, subtitle_style=subtitle_style,
+        )
+        handle = adapter.submit_job(
+            input_dir=in_path, soundtrack=audio_path, output_dir=out_dir, config=cfg,
+            run_async=False, no_render=False, force_cpu=no_nvenc,
+        )
+        res = handle.result
+        if not res or not res.success:
+            raise ValueError(res.error_message if res else "Master render failed")
+        render_p = res.render_path or (out_dir / f"master_{cfg.preset_name}.mp4")
+        encoder, duration = res.encoder_used, res.total_duration
 
-    cfg = PipelineConfig.from_preset(
-        preset,
-        enable_speed_ramping=speed_ramping,
-        watermark_path=Path(watermark_path) if watermark_path else None,
-        enable_watermark=bool(watermark_path),
-        reframing_mode=layout_mode,
-        subtitle_style=subtitle_style,
-    )
-
-    handle = adapter.submit_job(
-        input_dir=in_path,
-        soundtrack=audio_path,
-        output_dir=out_dir,
-        config=cfg,
-        run_async=False,
-        no_render=False,
-        force_cpu=no_nvenc,
-    )
-    res = handle.result
-    if not res or not res.success:
-        err = res.error_message if res else "Master render failed"
-        raise ValueError(err)
-
-    render_p = res.render_path or (out_dir / f"master_{cfg.preset_name}.mp4")
-    if (
-        render_p.resolve() != out_video_path.resolve()
-        and render_p.is_file()
-    ):
-        shutil.copy2(render_p, out_video_path)
+    if render_p is not None and render_p.resolve() != out_video_path.resolve() and render_p.is_file():
+        shutil.move(str(render_p), str(out_video_path))
         render_p = out_video_path
 
-    file_size = render_p.stat().st_size if render_p.is_file() else 0
-
+    file_size = render_p.stat().st_size if render_p and render_p.is_file() else 0
     return {
         "output_path": str(render_p),
-        "encoder_used": res.encoder_used or "unknown",
-        "duration": round(res.total_duration, 2),
+        "encoder_used": encoder or "unknown",
+        "duration": round(duration, 2),
         "file_size_bytes": file_size,
         "return_code": 0,
     }
@@ -793,15 +840,18 @@ def execute_pipeline_job(
     watermark_path: str | None = None,
     layout_mode: str = "auto_hybrid",
     subtitle_style: str = "kinetic_ass",
-    no_render: bool = False,
+    no_render: bool = True,
     run_async: bool = False,
 ) -> dict[str, Any]:
-    """Execute full automated video editing pipeline through the service layer.
+    """Analyze footage and auto-edit a timeline, saved as a .tteproj project.
+
+    Stops at "Timeline ready" - nothing is exported. Use render_master / export_timeline
+    with the returned project_path ONLY when the user asks to export.
 
     Args:
         input_dir: Path to directory of raw video footage.
         soundtrack: Background soundtrack audio file.
-        output_dir: Deliverable output directory.
+        output_dir: Project / deliverables directory.
         preset: Target preset (e.g. '1080p30', 'social_vertical', '4k30').
         duration_mode: Decoupling mode ('fixed', 'footage_driven', 'full_track').
         target_duration: Target duration in seconds (optional).
@@ -811,28 +861,28 @@ def execute_pipeline_job(
         watermark_path: Path to watermark image overlay.
         layout_mode: 'smart_crop', 'blur_backdrop', 'auto_hybrid'.
         subtitle_style: 'none', 'clean_srt', 'kinetic_ass'.
-        no_render: Skip final MP4 master render (NLE handoffs only).
+        no_render: Keep True unless the user explicitly asked for the MP4 now.
         run_async: Run job in background thread and return job_id immediately.
 
     Returns:
-        Job handle status or final execution deliverables.
+        Job handle status, timeline summary and the saved project path.
     """
+    from src.ui.controllers.project_manager import save_result_as_project
+
     in_p = Path(input_dir)
     audio_p = Path(soundtrack)
     out_p = Path(output_dir)
+    project_p = out_p / f"{in_p.resolve().name or 'project'}.tteproj"
 
-    cfg = PipelineConfig.from_preset(
-        preset,
-        duration_mode=duration_mode,
-        target_duration=target_duration,
-        enable_transcription=enable_transcription,
-        enable_teaser=enable_teaser,
-        enable_speed_ramping=speed_ramping,
-        watermark_path=Path(watermark_path) if watermark_path else None,
-        enable_watermark=bool(watermark_path),
-        reframing_mode=layout_mode,
-        subtitle_style=subtitle_style,
+    cfg = _analysis_config(
+        preset, duration_mode, target_duration, enable_teaser, speed_ramping,
+        watermark_path, layout_mode, subtitle_style, enable_transcription,
     )
+
+    def _persist(handle) -> None:
+        res = handle.result
+        if res is not None and getattr(res, "success", False):
+            save_result_as_project(res, cfg, project_p, [in_p], audio_p, out_p)
 
     handle = adapter.submit_job(
         input_dir=in_p,
@@ -844,20 +894,29 @@ def execute_pipeline_job(
     )
 
     if run_async:
+        import threading
+
+        threading.Thread(
+            target=lambda: (handle.wait(), _persist(handle)), daemon=True
+        ).start()
         return {
             "job_id": handle.job_id,
             "status": "running",
+            "project_path": str(project_p),
             "message": "Job submitted asynchronously. Check status via get_pipeline_job_status.",
         }
 
+    _persist(handle)
     res = handle.result
+    ok = bool(res and res.success)
     return {
         "job_id": handle.job_id,
-        "success": res.success if res else False,
+        "success": ok,
+        "status": "timeline_ready" if ok else "failed",
+        "project_path": str(project_p) if ok else None,
+        "timelines": sorted(res.edit_timelines) if ok else [],
         "duration": round(res.total_duration, 2) if res else 0.0,
         "clips": res.clip_count if res else 0,
-        "fcpxml": str(res.fcpxml_path) if res and res.fcpxml_path else None,
-        "capcut_draft": str(res.capcut_draft_path) if res and res.capcut_draft_path else None,
         "render_path": str(res.render_path) if res and res.render_path else None,
         "error": res.error_message if res and not res.success else None,
     }

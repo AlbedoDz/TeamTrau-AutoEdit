@@ -73,7 +73,7 @@ def test_cli_check_env():
 
 
 def test_cli_run_full_pipeline_e2e(sample_pipeline_workspace):
-    """Execute the full pipeline from raw media to FCPXML, Premiere XML, and NVENC master."""
+    """`run` stops at Timeline ready (no deliverables); `deliver` exports on request."""
     runner = CliRunner()
     footage = sample_pipeline_workspace["footage_dir"]
     soundtrack = sample_pipeline_workspace["soundtrack_path"]
@@ -91,25 +91,61 @@ def test_cli_run_full_pipeline_e2e(sample_pipeline_workspace):
             str(out_dir),
             "--preset",
             "1080p30",
+        ],
+    )
+    assert result.exit_code == 0, f"Pipeline failed:\n{result.output}"
+
+    # Analysis side-products are kept out of the deliverables folder.
+    assert (out_dir / ".analysis" / "scenes_metadata.csv").is_file()
+    assert (out_dir / ".analysis" / "scenes_metadata.edl").is_file()
+    assert (out_dir / ".analysis" / "pipeline_summary.json").is_file()
+
+    # Nothing is exported automatically.
+    assert not list(out_dir.glob("*.mp4"))
+    assert not list(out_dir.glob("*.fcpxml"))
+    assert not list(out_dir.glob("*.xml"))
+    assert not list(out_dir.glob("*.otio"))
+    projects = list(out_dir.glob("*.tteproj"))
+    assert len(projects) == 1
+
+    # Explicit Deliver renders exactly the saved timeline.
+    deliver = runner.invoke(
+        cli,
+        ["deliver", "--project", str(projects[0]), "--format", "mp4,fcpxml,premiere,otio,capcut"],
+    )
+    assert deliver.exit_code == 0, f"Deliver failed:\n{deliver.output}"
+    masters = list(out_dir.glob("*_master.mp4"))
+    assert len(masters) == 1 and masters[0].stat().st_size > 1024
+    assert list(out_dir.glob("*_master.fcpxml"))
+    assert list(out_dir.glob("*_master_premiere.xml"))
+    assert list(out_dir.glob("*_master.otio"))
+    assert list(out_dir.glob("*_master_capcut_draft/draft_content.json"))
+
+
+def test_cli_run_with_render_flag_is_one_shot(sample_pipeline_workspace):
+    """--render / --export-nle keep the legacy one-shot behaviour available."""
+    runner = CliRunner()
+    out_dir = sample_pipeline_workspace["output_dir"] / "one_shot"
+    result = runner.invoke(
+        cli,
+        [
+            "run",
+            "--input-dir",
+            str(sample_pipeline_workspace["footage_dir"]),
+            "--soundtrack",
+            str(sample_pipeline_workspace["soundtrack_path"]),
+            "--output-dir",
+            str(out_dir),
+            "--render",
+            "--export-nle",
             "--dry-run-resolve",
         ],
     )
-
     assert result.exit_code == 0, f"Pipeline failed:\n{result.output}"
-
-    # Verify generated deliverables
-    assert (out_dir / "scenes_metadata.csv").is_file()
-    assert (out_dir / "scenes_metadata.edl").is_file()
     assert (out_dir / "timeline.fcpxml").is_file()
     assert (out_dir / "timeline_premiere.xml").is_file()
     assert (out_dir / "timeline.otio").is_file()
-    assert (out_dir / "timeline_capcut_draft" / "draft_content.json").is_file()
     assert (out_dir / "master_1080p30.mp4").is_file()
-    assert (out_dir / "pipeline_summary.json").is_file()
-
-    # Check that master MP4 has content and non-zero size
-    master_file = out_dir / "master_1080p30.mp4"
-    assert master_file.stat().st_size > 1024
 
 
 def test_cli_run_pipeline_with_duration_mode(sample_pipeline_workspace):
@@ -135,7 +171,7 @@ def test_cli_run_pipeline_with_duration_mode(sample_pipeline_workspace):
             "footage_driven",
             "--action-drop-threshold",
             "0.75",
-            "--dry-run-resolve",
+            "--render",
         ],
     )
 
@@ -166,7 +202,7 @@ def test_cli_run_pipeline_with_transcription(sample_pipeline_workspace):
             "--enable-transcription",
             "--whisper-model",
             "tiny",
-            "--dry-run-resolve",
+            "--render",
         ],
     )
 

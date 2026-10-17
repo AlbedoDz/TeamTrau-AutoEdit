@@ -15,13 +15,26 @@ import opentimelineio as otio
 from src.core.config import PRESETS, PipelineConfig
 from src.core.types import (
     BeatMarker,
+    EditTimeline,
     ScoredScene,
     SongSection,
     TimelineVariant,
 )
+from src.modules.edit_timeline import build_edit_timeline
 from src.modules.timeline_builder import TimelineBuilder
 
 logger = logging.getLogger(__name__)
+
+
+def _scenes_for_clips(edit_tl: EditTimeline, pool: list[ScoredScene]) -> list[ScoredScene]:
+    """Map timeline clips back to the scored scenes they came from (in timeline order)."""
+    by_key = {(s.scene.clip_path.resolve(), round(s.scene.start_time, 3)): s for s in pool}
+    out: list[ScoredScene] = []
+    for c in edit_tl.clips:
+        sc = by_key.get((Path(c.source_path).resolve(), round(c.source_in, 3)))
+        if sc is not None:
+            out.append(sc)
+    return out
 
 
 class MultiVariantTimelineSynthesizer:
@@ -102,14 +115,17 @@ class MultiVariantTimelineSynthesizer:
         # Prioritize high motion energy scenes
         scenes_pool = sorted(scored_scenes, key=lambda s: s.motion_energy, reverse=True)
 
-        timeline = builder.build_timeline(
-            scored_scenes=scenes_pool,
-            cut_timestamps=cut_ts,
+        edit_tl = build_edit_timeline(
+            cfg,
+            scenes_pool,
+            cut_ts,
             soundtrack_path=soundtrack_path,
-            timeline_name="Variant_1_Beat_Driven",
-            include_teaser=True,
             sections=song_sections,
+            include_teaser=True,
+            name="Variant_1_Beat_Driven",
+            variant_key="beat_driven",
         )
+        timeline = builder.build_from_edit_timeline(edit_tl)
 
         clips = self._extract_clips_from_timeline(timeline)
         total_dur = cut_ts[-1] - cut_ts[0]
@@ -122,7 +138,8 @@ class MultiVariantTimelineSynthesizer:
             clip_count=len(clips),
             total_duration=total_dur,
             otio_timeline=timeline,
-            sequence_scenes=scenes_pool[: len(clips)],
+            sequence_scenes=_scenes_for_clips(edit_tl, scenes_pool),
+            edit_timeline=edit_tl,
         )
 
     def _build_cinematic_variant(
@@ -157,14 +174,17 @@ class MultiVariantTimelineSynthesizer:
             reverse=True,
         )
 
-        timeline = builder.build_timeline(
-            scored_scenes=scenes_pool,
-            cut_timestamps=cut_ts,
+        edit_tl = build_edit_timeline(
+            cfg,
+            scenes_pool,
+            cut_ts,
             soundtrack_path=soundtrack_path,
-            timeline_name="Variant_2_Cinematic",
-            include_teaser=False,
             sections=song_sections,
+            include_teaser=False,
+            name="Variant_2_Cinematic",
+            variant_key="cinematic",
         )
+        timeline = builder.build_from_edit_timeline(edit_tl)
 
         clips = self._extract_clips_from_timeline(timeline)
         total_dur = cut_ts[-1] - cut_ts[0]
@@ -177,7 +197,8 @@ class MultiVariantTimelineSynthesizer:
             clip_count=len(clips),
             total_duration=total_dur,
             otio_timeline=timeline,
-            sequence_scenes=scenes_pool[: len(clips)],
+            sequence_scenes=_scenes_for_clips(edit_tl, scenes_pool),
+            edit_timeline=edit_tl,
         )
 
     def _build_social_teaser_variant(
@@ -214,14 +235,17 @@ class MultiVariantTimelineSynthesizer:
         # Prioritize top composite scoring scenes
         scenes_pool = sorted(scored_scenes, key=lambda s: s.composite_score, reverse=True)
 
-        timeline = builder.build_timeline(
-            scored_scenes=scenes_pool,
-            cut_timestamps=teaser_cuts,
+        edit_tl = build_edit_timeline(
+            cfg,
+            scenes_pool,
+            teaser_cuts,
             soundtrack_path=soundtrack_path,
-            timeline_name="Variant_3_Social_Teaser",
-            include_teaser=True,
             sections=song_sections,
+            include_teaser=True,
+            name="Variant_3_Social_Teaser",
+            variant_key="social_teaser",
         )
+        timeline = builder.build_from_edit_timeline(edit_tl)
 
         clips = self._extract_clips_from_timeline(timeline)
         total_dur = teaser_cuts[-1] - teaser_cuts[0]
@@ -234,7 +258,8 @@ class MultiVariantTimelineSynthesizer:
             clip_count=len(clips),
             total_duration=total_dur,
             otio_timeline=timeline,
-            sequence_scenes=scenes_pool[: len(clips)],
+            sequence_scenes=_scenes_for_clips(edit_tl, scenes_pool),
+            edit_timeline=edit_tl,
         )
 
     def _extract_beat_timestamps(
