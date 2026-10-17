@@ -2,6 +2,34 @@
 
 ---
 
+## [Push 4] `44b4f7b` — 2026-10-17
+**feat: TeamTrau-AutoEdit v1 - automated video editing pipeline**
+
+> Squash commit (orphan branch). Fix HTTP 500 chunked push. Pack size tối thiểu.
+
+### Modules mới
+- `src/dispatchers/watermark_helper.py` — watermark overlay
+- `src/modules/agent_controller.py` — MCP agent controller
+- `src/modules/audio_normalizer.py` — loudness normalization LUFS
+- `src/modules/kinetic_subtitle.py` — kinetic typography subtitles
+- `src/modules/subtitle_formatter.py` — SRT/ASS formatter
+- `src/modules/timeline_qa.py` — timeline QA checks
+- `src/modules/visual_flow.py` — transition scorer
+
+### UI mới
+- `src/ui/controllers/project_manager.py`
+- `src/ui/controllers/shortcut_manager.py`
+- `src/ui/controllers/undo_commands.py`
+- `src/ui/widgets/agent_console_dialog.py`
+- `src/ui/widgets/export_dialog.py`
+- `src/ui/widgets/inspector_panel.py`
+- `src/ui/widgets/player_widget.py`
+- `src/ui/widgets/settings_dialog.py`
+
+### Tests: +13 file mới
+
+---
+
 ## [Push 3] `ccf3624` — 2026-10-17
 **chore: exclude .agent/, .codegraph/ - keep only source code**
 
