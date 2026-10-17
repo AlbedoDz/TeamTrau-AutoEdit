@@ -1174,10 +1174,14 @@ class StudioBackendAdapter:
                 sections=audio_res.sections,
                 name=f"AutoEdit_{config.preset_name}",
                 variant_key="master",
+                bar_grid=audio_res.bar_grid,
+                profile=config.cadence_profile,
+                cadence_seed=config.cadence_seed,
             )
         edit_timelines: dict[str, EditTimeline] = {"master": master_tl}
 
         variants = {}
+        stage_warnings: list[str] = []
         if config.workflow_mode != "rough_cut" and active_soundtrack is not None:
             _notify_progress(60.0, 6, "Synthesizing creative variants...")
             try:
@@ -1190,13 +1194,17 @@ class StudioBackendAdapter:
                     soundtrack_path=active_soundtrack,
                     song_sections=audio_res.sections,
                     variant_count=getattr(config, "generate_variants", 3),
+                    bar_grid=audio_res.bar_grid,
+                    cut_timestamps=audio_res.cut_timestamps,
+                    warnings=stage_warnings,
                 )
                 for key, var in variants.items():
                     if var.edit_timeline is not None:
                         edit_timelines[key] = var.edit_timeline
                 logger.info("Synthesized %d creative timeline variants.", len(variants))
             except Exception as var_err:
-                logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
+                logger.warning("Multi-variant timeline synthesis warning: %s", var_err, exc_info=True)
+                stage_warnings.append(f"Variant synthesis failed: {var_err}")
 
         # Boundary frames were only needed for cut-continuity checks; free the memory.
         for sc in ranked_scenes:
@@ -1306,4 +1314,5 @@ class StudioBackendAdapter:
             cut_timestamps=list(audio_res.cut_timestamps),
             sections=list(audio_res.sections),
             source_files=list(raw_files),
+            warnings=stage_warnings,
         )

@@ -606,4 +606,5 @@ class PipelineExecutionResult:
     cut_timestamps: list[float] = field(default_factory=list)
     sections: list[SongSection] = field(default_factory=list)
     source_files: list[Path] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 

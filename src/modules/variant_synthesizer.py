@@ -12,10 +12,13 @@ from pathlib import Path
 
 import opentimelineio as otio
 
+from src.core.cadence import MIN_GRID_CONFIDENCE, cadence_cuts_with_stats, profile_multiples
 from src.core.config import PRESETS, PipelineConfig
 from src.core.types import (
     BeatMarker,
+    CadenceProfile,
     EditTimeline,
+    MusicalBarGrid,
     ScoredScene,
     SongSection,
     TimelineVariant,
@@ -31,7 +34,8 @@ def _scenes_for_clips(edit_tl: EditTimeline, pool: list[ScoredScene]) -> list[Sc
     by_key = {(s.scene.clip_path.resolve(), round(s.scene.start_time, 3)): s for s in pool}
     out: list[ScoredScene] = []
     for c in edit_tl.clips:
-        sc = by_key.get((Path(c.source_path).resolve(), round(c.source_in, 3)))
+        start = c.scene_start if c.scene_start is not None else c.source_in
+        sc = by_key.get((Path(c.source_path).resolve(), round(start, 3)))
         if sc is not None:
             out.append(sc)
     return out
@@ -42,6 +46,7 @@ class MultiVariantTimelineSynthesizer:
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
+        self.warnings: list[str] = []
 
     def synthesize_variants(
         self,
@@ -51,39 +56,40 @@ class MultiVariantTimelineSynthesizer:
         song_sections: list[SongSection] | None = None,
         variant_count: int = 3,
         output_dir: Path | None = None,
+        *,
+        bar_grid: MusicalBarGrid | None = None,
+        cut_timestamps: list[float] | None = None,
+        warnings: list[str] | None = None,
     ) -> dict[str, TimelineVariant]:
-        """Synthesize 1, 2, or 3 distinct timeline cuts and return mapped by identifier."""
+        """Synthesize 1, 2, or 3 distinct timeline cuts and return mapped by identifier.
+
+        With a trustworthy ``bar_grid`` each variant follows its own cadence profile
+        (beat_driven = fast_syncopated, cinematic = lingering_cinematic, social_teaser =
+        viral_burst); otherwise the legacy beat-interval filters run. A variant that fails is
+        logged and reported in ``warnings`` (also kept in ``self.warnings``) while the others
+        are still produced.
+        """
         if not scored_scenes:
             raise ValueError("Cannot synthesize timeline variants with empty scored_scenes.")
 
         variant_count = max(1, min(3, variant_count))
         variants: dict[str, TimelineVariant] = {}
+        self.warnings = warnings if warnings is not None else []
+        duration = self._track_duration(beats, cut_timestamps)
+        ctx = (bar_grid, duration, song_sections or [])
 
-        # -------------------------------------------------------------
-        # 1. Variant 1: Beat-Driven / Energetic
-        # -------------------------------------------------------------
-        var_beat = self._build_beat_driven_variant(
-            scored_scenes, beats, soundtrack_path, song_sections
-        )
-        variants["beat_driven"] = var_beat
-
-        if variant_count >= 2:
-            # ---------------------------------------------------------
-            # 2. Variant 2: Cinematic / Story-Driven
-            # ---------------------------------------------------------
-            var_cine = self._build_cinematic_variant(
-                scored_scenes, beats, soundtrack_path, song_sections
-            )
-            variants["cinematic"] = var_cine
-
-        if variant_count >= 3:
-            # ---------------------------------------------------------
-            # 3. Variant 3: Social Viral Teaser (30s - 45s)
-            # ---------------------------------------------------------
-            var_social = self._build_social_teaser_variant(
-                scored_scenes, beats, soundtrack_path, song_sections
-            )
-            variants["social_teaser"] = var_social
+        builders = [
+            ("beat_driven", self._build_beat_driven_variant),
+            ("cinematic", self._build_cinematic_variant),
+            ("social_teaser", self._build_social_teaser_variant),
+        ][:variant_count]
+        for key, build in builders:
+            try:
+                variants[key] = build(scored_scenes, beats, soundtrack_path, song_sections, ctx)
+            except Exception as exc:
+                msg = f"Variant '{key}' failed: {exc}"
+                logger.warning(msg, exc_info=True)
+                self.warnings.append(msg)
 
         # Optional: export NLE interchanges for all generated variants if output_dir provided
         if output_dir:
@@ -91,12 +97,46 @@ class MultiVariantTimelineSynthesizer:
 
         return variants
 
+    @staticmethod
+    def _track_duration(beats: list[BeatMarker], cut_timestamps: list[float] | None) -> float | None:
+        if cut_timestamps and len(cut_timestamps) >= 2:
+            return float(cut_timestamps[-1])
+        if beats:
+            return float(max(b.timestamp for b in beats))
+        return None
+
+    def _cadence_kwargs(
+        self,
+        cfg: PipelineConfig,
+        profile: CadenceProfile,
+        ctx: tuple[MusicalBarGrid | None, float | None, list[SongSection]],
+        cap: float | None = None,
+    ) -> tuple[list[float], dict] | None:
+        """``(cut_timestamps, build_edit_timeline kwargs)`` for the cadence path, else ``None``."""
+        bar_grid, duration, sections = ctx
+        if (
+            not cfg.use_cadence_engine
+            or bar_grid is None
+            or duration is None
+            or bar_grid.confidence < MIN_GRID_CONFIDENCE
+        ):
+            return None
+        end = min(duration, cap) if cap else duration
+        cfg.cadence_multiples = None  # each variant uses its own profile's multiples
+        probe = cadence_cuts_with_stats(
+            bar_grid, sections, profile, profile_multiples(profile, cfg), end, cfg.fps, cfg.cadence_seed
+        )
+        if probe is None:
+            return None
+        return [0.0, end], {"bar_grid": bar_grid, "profile": profile}
+
     def _build_beat_driven_variant(
         self,
         scored_scenes: list[ScoredScene],
         beats: list[BeatMarker],
         soundtrack_path: Path,
         song_sections: list[SongSection] | None,
+        ctx: tuple[MusicalBarGrid | None, float | None, list[SongSection]] = (None, None, []),
     ) -> TimelineVariant:
         """Variant 1: High-energy cuts snapped to downbeats with motion acceleration."""
         cfg = copy.deepcopy(self.config)
@@ -107,10 +147,14 @@ class MultiVariantTimelineSynthesizer:
 
         builder = TimelineBuilder(cfg)
 
-        # Use all strong beats, filter minimum interval to 0.4s
-        cut_ts = self._extract_beat_timestamps(beats, min_interval=0.40)
-        if len(cut_ts) < 2:
-            cut_ts = [0.0, 30.0]
+        cadence = self._cadence_kwargs(cfg, CadenceProfile.FAST_SYNCOPATED, ctx)
+        if cadence is not None:
+            cut_ts, extra = cadence
+        else:  # legacy fallback: all strong beats, minimum interval 0.4 s
+            extra = {}
+            cut_ts = self._extract_beat_timestamps(beats, min_interval=0.40)
+            if len(cut_ts) < 2:
+                cut_ts = [0.0, 30.0]
 
         # Prioritize high motion energy scenes
         scenes_pool = sorted(scored_scenes, key=lambda s: s.motion_energy, reverse=True)
@@ -124,6 +168,7 @@ class MultiVariantTimelineSynthesizer:
             include_teaser=True,
             name="Variant_1_Beat_Driven",
             variant_key="beat_driven",
+            **extra,
         )
         timeline = builder.build_from_edit_timeline(edit_tl)
 
@@ -148,6 +193,7 @@ class MultiVariantTimelineSynthesizer:
         beats: list[BeatMarker],
         soundtrack_path: Path,
         song_sections: list[SongSection] | None,
+        ctx: tuple[MusicalBarGrid | None, float | None, list[SongSection]] = (None, None, []),
     ) -> TimelineVariant:
         """Variant 2: Story-driven cuts prioritizing aesthetics, Ken Burns, and dissolves."""
         cfg = copy.deepcopy(self.config)
@@ -160,12 +206,16 @@ class MultiVariantTimelineSynthesizer:
 
         builder = TimelineBuilder(cfg)
 
-        # Relaxed pacing: snap only to major musical downbeats (interval >= 1.5s)
-        downbeats = [b for b in beats if b.is_downbeat]
-        beats_pool = downbeats if len(downbeats) >= 4 else beats
-        cut_ts = self._extract_beat_timestamps(beats_pool, min_interval=1.50)
-        if len(cut_ts) < 2:
-            cut_ts = [0.0, 45.0]
+        cadence = self._cadence_kwargs(cfg, CadenceProfile.LINGERING_CINEMATIC, ctx)
+        if cadence is not None:
+            cut_ts, extra = cadence
+        else:  # legacy fallback: only major downbeats (interval >= 1.5 s)
+            extra = {}
+            downbeats = [b for b in beats if b.is_downbeat]
+            beats_pool = downbeats if len(downbeats) >= 4 else beats
+            cut_ts = self._extract_beat_timestamps(beats_pool, min_interval=1.50)
+            if len(cut_ts) < 2:
+                cut_ts = [0.0, 45.0]
 
         # Prioritize aesthetic and sharpness score
         scenes_pool = sorted(
@@ -183,6 +233,7 @@ class MultiVariantTimelineSynthesizer:
             include_teaser=False,
             name="Variant_2_Cinematic",
             variant_key="cinematic",
+            **extra,
         )
         timeline = builder.build_from_edit_timeline(edit_tl)
 
@@ -207,6 +258,7 @@ class MultiVariantTimelineSynthesizer:
         beats: list[BeatMarker],
         soundtrack_path: Path,
         song_sections: list[SongSection] | None,
+        ctx: tuple[MusicalBarGrid | None, float | None, list[SongSection]] = (None, None, []),
     ) -> TimelineVariant:
         """Variant 3: Compact 30s-45s vertical viral cut with explosive teaser hook."""
         cfg = copy.deepcopy(self.config)
@@ -227,10 +279,15 @@ class MultiVariantTimelineSynthesizer:
         builder = TimelineBuilder(cfg)
 
         # Compact duration limit (maximum 35.0 seconds)
-        all_cuts = self._extract_beat_timestamps(beats, min_interval=0.50)
-        teaser_cuts = [t for t in all_cuts if t <= 35.0]
-        if len(teaser_cuts) < 4:
-            teaser_cuts = [0.0, 4.0, 8.0, 12.0, 18.0, 24.0, 30.0]
+        cadence = self._cadence_kwargs(cfg, CadenceProfile.VIRAL_BURST, ctx, cap=35.0)
+        if cadence is not None:
+            teaser_cuts, extra = cadence
+        else:  # legacy fallback: beats at least 0.5 s apart
+            extra = {}
+            all_cuts = self._extract_beat_timestamps(beats, min_interval=0.50)
+            teaser_cuts = [t for t in all_cuts if t <= 35.0]
+            if len(teaser_cuts) < 4:
+                teaser_cuts = [0.0, 4.0, 8.0, 12.0, 18.0, 24.0, 30.0]
 
         # Prioritize top composite scoring scenes
         scenes_pool = sorted(scored_scenes, key=lambda s: s.composite_score, reverse=True)
@@ -244,6 +301,7 @@ class MultiVariantTimelineSynthesizer:
             include_teaser=True,
             name="Variant_3_Social_Teaser",
             variant_key="social_teaser",
+            **extra,
         )
         timeline = builder.build_from_edit_timeline(edit_tl)
 
