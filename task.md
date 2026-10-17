@@ -262,3 +262,7 @@
   - [x] Found + fixed via Resolve: retimed clips need `start = in-point / speed` with a linear timeMap through the origin (Resolve takes in-point as start*speed); previously the in-point was lost / doubled.
   - [x] `ResolveDispatcher`: always creates a NEW project (saves the open one, never reconfigures it), keeps NTSC frame rates (29.97, not 30), and falls back to `resolve_worker.py` under a compatible Python (3.13 worked here; 3.11/3.12 cannot load fusionscript; override with AUTOEDIT_RESOLVE_PYTHON).
   - [ ] Not verified: camera-audio volume (-12 dB), markers, 9:16 crop (Resolve API does not expose them); FCP itself.
+- [x] Phase 21: NLE sequence compatibility pass
+  - [x] Premiere XML: real audio channels (Link Media fix), sequence format = chosen canvas (was empty -> copied from first clip), Time Remap for speed ramps with correct in/out, Basic Motion scale/center for fit-to-frame and 9:16 crop, silent sources get no audio clipitem.
+  - [x] CapCut draft: real speed (source = output x speed + speed materials), gaps, real source width/height, 9:16 crop transform, camera audio ducked under music and not duplicated as an audio track.
+  - [ ] NOT verified in the real apps: Premiere Pro import, CapCut 8.8 (needs a reference draft made by CapCut to confirm schema; the draft folder was empty). Basic Motion center sign and CapCut transform units follow documented conventions only.

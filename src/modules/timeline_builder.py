@@ -379,7 +379,12 @@ class TimelineBuilder:
             try:
                 from src.modules.premiere_xml_fix import finalize_premiere_xml
 
-                finalize_premiere_xml(exported_premiere)  # real channel/size info for Link Media
+                finalize_premiere_xml(
+                    exported_premiere,
+                    timeline=timeline,
+                    canvas=(self.config.canvas_width, self.config.canvas_height),
+                    fps=self.config.fps,
+                )  # real channel/size info, speed and fit for Premiere
             except Exception as exc:
                 logger.warning("Premiere XML channel fix-up skipped (%s)", exc)
 
