@@ -22,12 +22,12 @@ from PySide6.QtWidgets import (
 
 from src.core.ontology import CameraRole, get_role_display_name, infer_camera_role
 from src.core.service import StudioBackendAdapter
-from src.core.types import VideoMetadata
+from src.core.types import VIDEO_EXTENSIONS, VideoMetadata
 from src.modules.genre_recommender import GenreRecommendation, GenreRecommender
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v"}
+SUPPORTED_VIDEO_EXTS = VIDEO_EXTENSIONS
 SUPPORTED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".aac"}
 
 
@@ -93,7 +93,7 @@ class MediaBrowserWidget(QWidget):
         row_in = QHBoxLayout()
         row_in.addWidget(QLabel("Footage Directory:"))
         self.edit_input_dir = QLineEdit(self)
-        self.edit_input_dir.setPlaceholderText("Select folder containing raw camera clips (.mp4, .mov, .mkv)...")
+        self.edit_input_dir.setPlaceholderText("Select folder containing raw camera clips (.mp4, .mov, .mkv, .mxf, .avi, ...)...")
         self.edit_input_dir.textChanged.connect(self._on_input_dir_text_changed)
         row_in.addWidget(self.edit_input_dir, stretch=1)
         btn_browse_in = QPushButton("📁 Browse...", self)

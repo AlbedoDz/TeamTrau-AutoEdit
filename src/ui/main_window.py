@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import threading
@@ -35,9 +36,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.config import DEFAULT_PRESET_NAME, PRESETS, PipelineConfig, check_cuda_available
-from src.core.project_io import edit_timeline_to_dict
+from src.core.project_io import deliver_settings_to_dict, edit_timeline_to_dict
 from src.core.service import JobHandle, StudioBackendAdapter
-from src.core.types import DeliverResult, EditTimeline, PipelineExecutionResult, ScoredScene
+from src.core.types import (
+    DeliverResult,
+    DeliverSettings,
+    EditTimeline,
+    PipelineExecutionResult,
+    ScoredScene,
+)
 from src.modules.edit_timeline import apply_scene_curation
 from src.ui.adapter_bridge import BackendSignalBridge
 from src.ui.controllers import (
@@ -51,7 +58,7 @@ from src.ui.controllers import (
 from src.ui.controllers.project_manager import PROJECT_FILE_FILTER
 from src.ui.widgets.agent_console_dialog import AgentConsoleDialog
 from src.ui.widgets.export_dialog import ExportDialog
-from src.ui.widgets.export_panel import ExportPanelWidget
+from src.ui.widgets.export_panel import ExportPanelWidget, preset_label
 from src.ui.widgets.inspector_panel import InspectorPanelWidget
 from src.ui.widgets.media_browser import MediaBrowserWidget
 from src.ui.widgets.player_widget import PlayerWidget
@@ -165,6 +172,7 @@ class StudioMainWindow(QMainWindow):
         self.export_dialog = ExportDialog(export_panel=self.export_panel, parent=self)
         self.export_dialog.start_export_requested.connect(self._on_start_deliver)
         self.export_dialog.render_preview_requested.connect(self._on_render_preview)
+        self.export_panel.deliver_settings_changed.connect(lambda: self._set_dirty(True))
 
         # 7. Preferences Modal Dialog
         self.preferences_dialog = PreferencesDialog(backend_adapter=self.adapter, parent=self)
@@ -422,8 +430,7 @@ class StudioMainWindow(QMainWindow):
         toolbar.addWidget(QLabel(" Ratio: "))
         self.preset_combo = QComboBox(self)
         for name, preset in PRESETS.items():
-            ratio_label = "9:16" if preset.width < preset.height else "16:9"
-            self.preset_combo.addItem(f"{preset.name} ({ratio_label} {preset.width}x{preset.height})", name)
+            self.preset_combo.addItem(preset_label(preset), name)
 
         default_idx = self.preset_combo.findData(DEFAULT_PRESET_NAME)
         if default_idx >= 0:
@@ -754,6 +761,7 @@ class StudioMainWindow(QMainWindow):
             self.status_bar.showMessage("Nothing to export yet - run Analyze & Optimize first", 4000)
             return
         self.export_panel.set_output_dir(self.media_browser.get_output_dir())
+        self._refresh_deliver_panel()
         self._update_export_enabled()
         self.export_dialog.exec()
 
@@ -1004,6 +1012,8 @@ class StudioMainWindow(QMainWindow):
                 )
                 self.player_widget.load_edit_timeline(self._edit_timelines[key])
                 self.player_widget.set_duration(self._edit_timelines[key].duration or result.total_duration)
+                self._adopt_timeline_canvas(self._edit_timelines[key])
+                self._refresh_deliver_panel()
                 self._update_workflow_stepper(2)
                 self._set_dirty(True)
             else:
@@ -1069,6 +1079,28 @@ class StudioMainWindow(QMainWindow):
         ):
             if path:
                 self._append_console(f"{label}: {path}")
+
+    def _refresh_deliver_panel(self) -> None:
+        """Offer the current timelines as variants and re-check sources against the Deliver canvas."""
+        if not self._has_edit_timeline():
+            return
+        live = self.timeline_view.get_edit_timelines() or self._edit_timelines
+        active = self.timeline_view.get_active_timeline_key() or self._active_timeline_key
+        keys = list(live) or [active]
+        self.export_panel.set_available_variants(keys, active)
+        self.export_panel.set_source_timeline(self.timeline_view.get_edit_timeline())
+
+    def _adopt_timeline_canvas(self, timeline: EditTimeline) -> None:
+        """Analysis defaults: the Deliver canvas / fps follow the timeline, other choices are kept."""
+        panel = self.export_panel
+        base = DeliverSettings.from_timeline(timeline, self._build_config())
+        current = dataclasses.replace(
+            panel.get_deliver_settings(base),
+            canvas_width=timeline.canvas_width,
+            canvas_height=timeline.canvas_height,
+            fps=timeline.fps,
+        )
+        panel.load_deliver_settings(current)
 
     def _has_edit_timeline(self) -> bool:
         """True once analysis (or a project) has provided at least one edit timeline."""
@@ -1209,6 +1241,12 @@ class StudioMainWindow(QMainWindow):
 
         output_dir = self.media_browser.get_output_dir()
         cfg = self._build_config()
+        try:
+            settings = self.export_panel.get_deliver_settings(DeliverSettings.from_timeline(timeline, cfg))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Deliver Settings", str(exc))
+            self._update_export_enabled()
+            return
         self.export_panel.set_output_dir(output_dir)
         self.export_panel.reset_render_monitor()
         self.progress_bar.setValue(0)
@@ -1218,8 +1256,12 @@ class StudioMainWindow(QMainWindow):
         self._append_console(f"\n[{kind.upper()}] {timeline.name}: {len(timeline.clips)} clips, {timeline.duration:.1f}s")
         if not preview:
             self._append_console(f"Formats: {', '.join(sorted(formats))} -> {output_dir}")
-            if self.export_panel.get_export_options().get("variant_export_scope") == "all" and len(self._edit_timelines) > 1:
-                self._append_console("[NOTE] Exporting the active timeline only; switch variants to export the others.")
+            self._append_console(
+                f"Deliver: {settings.canvas_width}x{settings.canvas_height} @ {settings.fps:g}fps, "
+                f"master {settings.master}, colour {settings.color}, variants {', '.join(settings.variants)}"
+            )
+            if self.export_panel.source_mismatch.affected:
+                self._append_console(f"[NOTE] {self.export_panel.source_mismatch.message}")
 
         job = self.adapter.submit_deliver_job(
             timeline,
@@ -1232,6 +1274,8 @@ class StudioMainWindow(QMainWindow):
             preview=preview,
             resolve=self.export_panel.is_resolve_dispatch_enabled() and not preview,
             dry_run_resolve=self.export_panel.is_dry_run_resolve(),
+            settings=settings,
+            variant_timelines=dict(self.timeline_view.get_edit_timelines()),
         )
         self._current_job = job
         self._update_export_enabled()
@@ -1341,6 +1385,8 @@ class StudioMainWindow(QMainWindow):
         self.player_widget._mode = "idle"
         self.player_widget.lbl_mode.setText("🎬 Idle (No Media)")
         self.export_panel.reset_render_monitor()
+        self.export_panel.load_deliver_settings(DeliverSettings(canvas_width=1920, canvas_height=1080, fps=30.0))
+        self.export_panel.set_source_timeline(None)
         self.console.clear()
         self.undo_stack.clear()
         self._set_dirty(False)
@@ -1440,6 +1486,17 @@ class StudioMainWindow(QMainWindow):
                 "scenes_detected": getattr(last_res, "scenes_detected", 0),
             }
 
+        # 7. Deliver settings (only meaningful once a timeline exists; otherwise derived on load)
+        deliver_settings_data: dict[str, Any] = {}
+        if edit_timelines:
+            active_tl = edit_timelines.get(active_tl_key) or next(iter(edit_timelines.values()))
+            try:
+                deliver_settings_data = deliver_settings_to_dict(
+                    self.export_panel.get_deliver_settings(DeliverSettings.from_timeline(active_tl, cfg))
+                )
+            except ValueError as exc:
+                logger.warning("Deliver settings not saved: %s", exc)
+
         project_data = ProjectData(
             project_name=self.edit_project_name.text().strip(),
             input_dir=str(self.media_browser.get_input_dir()) if self.media_browser.get_input_dir() else None,
@@ -1461,6 +1518,7 @@ class StudioMainWindow(QMainWindow):
             deliverables=deliverables_data,
             edit_timelines=edit_timelines_data,
             active_timeline_key=active_tl_key,
+            deliver_settings=deliver_settings_data,
         )
 
         ok = self.project_manager.save_project(path, project_data)
@@ -1562,6 +1620,13 @@ class StudioMainWindow(QMainWindow):
             self.timeline_view.set_edit_timelines(restored_edit, active_key=active_key, tempo_bpm=bpm)
             self.player_widget.load_edit_timeline(restored_edit[active_key])
             self.player_widget.set_duration(restored_edit[active_key].duration)
+            stored_settings = data.get_deliver_settings()
+            if stored_settings is not None:
+                self.export_panel.set_available_variants(list(restored_edit), active_key)
+                self.export_panel.load_deliver_settings(stored_settings)
+            else:
+                self._adopt_timeline_canvas(restored_edit[active_key])
+            self._refresh_deliver_panel()
         else:
             self._active_timeline_key = "master"
             self.timeline_view.clear_timeline()

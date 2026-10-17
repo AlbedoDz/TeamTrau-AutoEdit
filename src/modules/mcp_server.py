@@ -572,6 +572,12 @@ def generate_kinetic_subtitles(
 # =============================================================================
 
 
+_DELIVER_SETTING_KEYS = (
+    "deliver_preset", "canvas", "fps", "fit", "color", "master", "subtitles",
+    "audio_rate", "audio_channels", "variants", "relink_original", "watermark_in_nle",
+)
+
+
 def _deliver_from_project(
     project_path: str,
     formats: set[str],
@@ -579,8 +585,16 @@ def _deliver_from_project(
     variant: str | None = None,
     force_cpu: bool = False,
     base_name: str | None = None,
+    settings_args: dict[str, Any] | None = None,
 ) -> Any:
-    """Deliver an already-edited timeline from a saved .tteproj (no re-analysis)."""
+    """Deliver an already-edited timeline from a saved .tteproj (no re-analysis).
+
+    ``settings_args`` are the optional Deliver settings given to the tool (see
+    ``_DELIVER_SETTING_KEYS``); they override the project's saved Deliver settings (or the
+    timeline's own canvas / fps). Variants default to the active timeline only.
+    """
+    from src.core.deliver_options import build_deliver_settings
+    from src.core.types import DeliverSettings
     from src.ui.controllers.project_manager import ProjectManager, load_project_file
 
     proj = Path(project_path)
@@ -591,19 +605,72 @@ def _deliver_from_project(
         raise ValueError(f"Timeline '{key}' not found. Available: {sorted(timelines)}")
     cfg = ProjectManager().deserialize_pipeline_config(data.config) if data.config else PipelineConfig()
     out_dir = output_dir or Path(data.output_dir or proj.parent)
+
+    args = {k: v for k, v in (settings_args or {}).items() if v is not None and v != ""}
+    base = data.get_deliver_settings() or DeliverSettings.from_timeline(timelines[key], cfg)
+    base.variants = ["active"]  # tools export the active timeline unless variants is given
+    try:
+        settings = build_deliver_settings(
+            base,
+            preset=args.get("deliver_preset"),
+            canvas=args.get("canvas"),
+            fps=args.get("fps"),
+            fit=args.get("fit"),
+            color=args.get("color"),
+            master=args.get("master"),
+            subtitles=args.get("subtitles"),
+            audio_rate=args.get("audio_rate"),
+            audio_channels=args.get("audio_channels"),
+            variants=args.get("variants"),
+            relink=args.get("relink_original"),
+            watermark_in_nle=args.get("watermark_in_nle"),
+        )
+        keys = adapter.resolve_variant_keys(key, settings, timelines)
+    except ValueError as exc:
+        raise ValueError(f"Invalid deliver settings: {exc}") from exc
+
     handle = adapter.submit_deliver_job(
         timelines[key],
         out_dir,
         cfg,
         formats=formats,  # type: ignore[arg-type]
         force_cpu=force_cpu,
-        base_name=base_name or f"{proj.stem}_{key}",
+        base_name=(base_name or (f"{proj.stem}_{key}" if len(keys) == 1 else proj.stem)),
+        settings=settings,
+        variant_timelines=timelines,
     )
     res = handle.result
     if not res or not res.success:
         raise ValueError(res.error_message if res else "Deliver failed")
     res.clip_count = len(timelines[key].clips)
     return res
+
+
+def _reject_settings_without_project(settings_args: dict[str, Any]) -> None:
+    given = sorted(k for k, v in settings_args.items() if v is not None and v != "")
+    if given:
+        raise ValueError(f"Deliver settings ({', '.join(given)}) need project_path (a saved .tteproj).")
+
+
+def _result_paths(res: Any) -> dict[str, Any]:
+    """Paths produced by a DeliverResult, per variant when several were delivered."""
+
+    def one(r: Any) -> dict[str, Any]:
+        return {
+            "master_path": str(r.render_path) if r.render_path else None,
+            "master_codec": r.master_codec,
+            "fcpxml_path": str(r.fcpxml_path) if r.fcpxml_path else None,
+            "premiere_xml_path": str(r.premiere_xml_path) if r.premiere_xml_path else None,
+            "otio_path": str(r.otio_path) if r.otio_path else None,
+            "capcut_draft_path": str(r.capcut_draft_path) if r.capcut_draft_path else None,
+            "subtitle_paths": [str(x) for x in r.subtitle_paths],
+            "manifest_path": str(r.manifest_path) if r.manifest_path else None,
+        }
+
+    out = one(res)
+    if res.variant_results:
+        out["variants"] = {k: one(v) for k, v in res.variant_results.items()}
+    return out
 
 
 def _analysis_config(
@@ -646,6 +713,18 @@ def export_timeline(
     subtitle_style: str = "kinetic_ass",
     project_path: str | None = None,
     variant: str | None = None,
+    deliver_preset: str | None = None,
+    canvas: str | None = None,
+    fps: str | None = None,
+    fit: str | None = None,
+    color: str | None = None,
+    master: str | None = None,
+    subtitles: str | None = None,
+    audio_rate: int | None = None,
+    audio_channels: int | None = None,
+    variants: str | None = None,
+    relink_original: bool | None = None,
+    watermark_in_nle: bool | None = None,
 ) -> dict[str, Any]:
     """Export NLE project files (DaVinci FCPXML, Premiere XML, OTIO, CapCut draft).
 
@@ -667,16 +746,37 @@ def export_timeline(
         subtitle_style: Subtitle format ('none', 'clean_srt', 'kinetic_ass').
         project_path: Saved .tteproj to export without re-analysis.
         variant: Timeline key inside the project (master, beat_driven, cinematic, social_teaser).
+        deliver_preset: Deliver canvas + frame rate from a preset name (needs project_path).
+        canvas: Deliver canvas as "WxH", e.g. "1080x1920" (needs project_path).
+        fps: Deliver frame rate, e.g. "29.97", "25" or "30000/1001" (needs project_path).
+        fit: Fit mode 'auto', 'fit', 'fill' or 'stretch' (needs project_path).
+        color: 'rec709', 'rec2020_hlg', 'rec2020_pq' or 'passthrough' (needs project_path).
+        master: Master codec 'hevc', 'h264', 'prores_422', 'prores_hq' or 'dnxhr_hqx' (recorded in the manifest).
+        subtitles: 'none', 'srt', 'ass' or 'burn'.
+        audio_rate: Audio sample rate 44100, 48000 or 96000.
+        audio_channels: 1 or 2.
+        variants: 'all' or comma separated timeline keys to export into one subfolder each (default: active only).
+        relink_original: Link NLE files to the original media instead of render proxies (default true).
+        watermark_in_nle: Request the watermark in NLE files (not implemented yet; only recorded).
 
     Returns:
-        JSON structure with exported project file paths and timeline metrics.
+        JSON structure with exported project file paths (also manifest_path) and timeline metrics.
     """
     out_path = Path(output_dir)
     nle = {"fcpxml", "premiere", "otio", "capcut"}
+    settings_args = {
+        "deliver_preset": deliver_preset, "canvas": canvas, "fps": fps, "fit": fit, "color": color,
+        "master": master, "subtitles": subtitles, "audio_rate": audio_rate,
+        "audio_channels": audio_channels, "variants": variants,
+        "relink_original": relink_original, "watermark_in_nle": watermark_in_nle,
+    }
+    paths: dict[str, Any] = {}
     if project_path:
-        res = _deliver_from_project(project_path, nle, out_path, variant)
+        res = _deliver_from_project(project_path, nle, out_path, variant, settings_args=settings_args)
         clip_count, total = res.clip_count, res.duration
+        paths = _result_paths(res)
     else:
+        _reject_settings_without_project(settings_args)
         in_path, audio_path = Path(input_dir), Path(soundtrack)
         if not in_path.is_dir():
             raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
@@ -696,6 +796,7 @@ def export_timeline(
         clip_count, total = res.clip_count, res.total_duration
 
     return {
+        **paths,
         "clip_count": clip_count,
         "total_duration": round(total, 2),
         "fcpxml_path": str(res.fcpxml_path) if res.fcpxml_path else None,
@@ -718,8 +819,20 @@ def render_master(
     subtitle_style: str = "kinetic_ass",
     project_path: str | None = None,
     variant: str | None = None,
+    deliver_preset: str | None = None,
+    canvas: str | None = None,
+    fps: str | None = None,
+    fit: str | None = None,
+    color: str | None = None,
+    master: str | None = None,
+    subtitles: str | None = None,
+    audio_rate: int | None = None,
+    audio_channels: int | None = None,
+    variants: str | None = None,
+    relink_original: bool | None = None,
+    watermark_in_nle: bool | None = None,
 ) -> dict[str, Any]:
-    """Render the master MP4 with FFmpeg NVENC (CPU fallback).
+    """Render the master video with FFmpeg NVENC (CPU fallback) or ProRes / DNxHR / H.264.
 
     ONLY call this when the user explicitly asks to render/export the video. Prefer
     ``project_path`` so the render matches the edited timeline exactly; passing
@@ -737,20 +850,43 @@ def render_master(
         subtitle_style: Subtitle format ('none', 'clean_srt', 'kinetic_ass').
         project_path: Saved .tteproj to render without re-analysis.
         variant: Timeline key inside the project.
+        deliver_preset: Deliver canvas + frame rate from a preset name (needs project_path).
+        canvas: Deliver canvas as "WxH", e.g. "1080x1920" (needs project_path).
+        fps: Deliver frame rate, e.g. "29.97", "25" or "30000/1001" (needs project_path).
+        fit: Fit mode 'auto', 'fit', 'fill' or 'stretch'.
+        color: 'rec709', 'rec2020_hlg', 'rec2020_pq' or 'passthrough'.
+        master: Master codec 'hevc', 'h264', 'prores_422', 'prores_hq' or 'dnxhr_hqx'; ProRes/DNxHR
+            write a .mov, so the output file suffix follows the codec.
+        subtitles: 'none', 'srt', 'ass' or 'burn' (sidecars need a transcript).
+        audio_rate: Audio sample rate 44100, 48000 or 96000.
+        audio_channels: 1 or 2.
+        variants: 'all' or comma separated timeline keys; each goes to its own subfolder of the output folder.
+        relink_original: Link NLE files to the original media instead of render proxies.
+        watermark_in_nle: Request the watermark in NLE files (not implemented yet).
 
     Returns:
-        JSON structure with output file path, encoder used, duration, and file size.
+        JSON structure with output file path, encoder used, master codec, duration, file size and manifest_path.
     """
     out_video_path = Path(output_file)
     out_dir = out_video_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    settings_args = {
+        "deliver_preset": deliver_preset, "canvas": canvas, "fps": fps, "fit": fit, "color": color,
+        "master": master, "subtitles": subtitles, "audio_rate": audio_rate,
+        "audio_channels": audio_channels, "variants": variants,
+        "relink_original": relink_original, "watermark_in_nle": watermark_in_nle,
+    }
+    paths: dict[str, Any] = {}
     if project_path:
         res = _deliver_from_project(
-            project_path, {"mp4"}, out_dir, variant, no_nvenc, base_name=out_video_path.stem
+            project_path, {"mp4"}, out_dir, variant, no_nvenc,
+            base_name=out_video_path.stem if not variants else None, settings_args=settings_args,
         )
         render_p, encoder, duration = res.render_path, res.encoder_used, res.duration
+        paths = _result_paths(res)
     else:
+        _reject_settings_without_project(settings_args)
         in_path, audio_path = Path(input_dir), Path(soundtrack)
         if not in_path.is_dir():
             raise NotADirectoryError(f"Input directory does not exist: {input_dir}")
@@ -770,12 +906,17 @@ def render_master(
         render_p = res.render_path or (out_dir / f"master_{cfg.preset_name}.mp4")
         encoder, duration = res.encoder_used, res.total_duration
 
-    if render_p is not None and render_p.resolve() != out_video_path.resolve() and render_p.is_file():
-        shutil.move(str(render_p), str(out_video_path))
-        render_p = out_video_path
+    if render_p is not None and not paths.get("variants") and render_p.is_file():
+        # ProRes / DNxHR masters are .mov: the requested file name follows the real container.
+        target = out_video_path.with_suffix(render_p.suffix) if render_p.suffix != out_video_path.suffix else out_video_path
+        if render_p.resolve() != target.resolve():
+            shutil.move(str(render_p), str(target))
+            render_p = target
+            paths["master_path"] = str(target)
 
     file_size = render_p.stat().st_size if render_p and render_p.is_file() else 0
     return {
+        **paths,
         "output_path": str(render_p),
         "encoder_used": encoder or "unknown",
         "duration": round(duration, 2),

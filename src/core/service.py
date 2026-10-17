@@ -4,32 +4,42 @@ Decouples UI and API consumers from internal algorithmic modules, providing
 thread-safe job management, incremental progress callbacks, and cancellation.
 """
 
+import dataclasses
 import json
 import logging
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from src.core.config import PipelineConfig
 from src.core.types import (
     ALL_DELIVER_FORMATS,
+    UNSUPPORTED_RAW_EXTENSIONS,
+    VIDEO_EXTENSIONS,
     CleanedSegment,
     CropWindow,
     DeliverFormat,
     DeliverResult,
+    DeliverSettings,
     EditTimeline,
     PipelineExecutionResult,
     SceneCut,
     ScoredScene,
+    SentenceSegment,
     VideoMetadata,
 )
 from src.dispatchers.nvenc_renderer import NvencRenderer
 from src.dispatchers.resolve_dispatcher import ResolveDispatcher
 from src.modules.audio_analyzer import AudioAnalysisResult, AudioAnalyzer
 from src.modules.duration_packer import DurationPacker
-from src.modules.edit_timeline import build_edit_timeline, build_rough_cut_edit_timeline
+from src.modules.edit_timeline import (
+    build_edit_timeline,
+    build_rough_cut_edit_timeline,
+    retarget_timeline,
+)
 from src.modules.ingest_detector import IngestDetector
 from src.modules.keyframe_cache import (
     KeyframeStore,
@@ -147,6 +157,24 @@ def _enforce_vram_headroom(max_allowed_gb: float = 2.0) -> None:
                 )
     except ImportError:
         pass
+
+
+def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[Path]]:
+    """Footage found in a folder / file (or a list of them) and the unsupported RAW files skipped.
+
+    Folders are scanned one level deep; extensions come from ``VIDEO_EXTENSIONS``.
+    """
+    collected: list[Path] = []
+    skipped: list[Path] = []
+    for item in input_dir if isinstance(input_dir, list) else [input_dir]:
+        p = Path(item)
+        if p.is_dir():
+            files = [f for f in p.iterdir() if f.is_file()]
+            collected.extend(f for f in files if f.suffix.lower() in VIDEO_EXTENSIONS)
+            skipped.extend(f for f in files if f.suffix.lower() in UNSUPPORTED_RAW_EXTENSIONS)
+        elif p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
+            collected.append(p)
+    return collected, skipped
 
 
 class StudioBackendAdapter:
@@ -359,17 +387,24 @@ class StudioBackendAdapter:
         resolve: bool = False,
         dry_run_resolve: bool = False,
         base_name: str | None = None,
+        settings: DeliverSettings | None = None,
+        sentences: list[SentenceSegment] | None = None,
+        variant_timelines: dict[str, EditTimeline] | None = None,
     ) -> JobHandle:
         """Export / render an existing edit timeline. Never re-runs analysis.
 
         ``preview=True`` renders a fast 540p proxy into ``cache_dir/preview`` instead of
-        a master deliverable.
+        a master deliverable. ``settings`` (Deliver settings) retargets the timeline to the chosen
+        canvas / frame rate and drives the master codec, colour, audio, subtitles and the NLE files.
+        ``settings.variants`` selects which timelines are delivered (``["active"]`` = ``edit_timeline``
+        only, a list of keys, or ``["all"]``); other variants are looked up in ``variant_timelines``
+        and every variant but a lone active one goes to ``<output_dir>/<variant_key>/``.
         """
         handle = self._new_handle()
 
         def _worker() -> None:
             try:
-                handle._result = self._execute_deliver(
+                handle._result = self._execute_deliver_variants(
                     edit_timeline,
                     output_dir,
                     config,
@@ -382,6 +417,9 @@ class StudioBackendAdapter:
                     dry_run_resolve=dry_run_resolve,
                     base_name=base_name,
                     job_handle=handle,
+                    settings=settings,
+                    sentences=sentences,
+                    variant_timelines=variant_timelines,
                 )
             except Exception as exc:
                 cancelled = isinstance(exc, InterruptedError)
@@ -401,6 +439,195 @@ class StudioBackendAdapter:
 
         return self._launch(handle, _worker, run_async, "AutoEditDeliver")
 
+    @staticmethod
+    def resolve_variant_keys(
+        active_key: str, settings: DeliverSettings | None, available: dict[str, EditTimeline] | None
+    ) -> list[str]:
+        """Timeline keys a deliver job must export: ``["active"]`` -> the active one, ``["all"]``
+        -> every timeline in ``available`` (active first), otherwise the picked keys.
+
+        Raises ValueError for a key that is neither the active timeline nor in ``available``.
+        """
+        requested = list(settings.variants) if settings else ["active"]
+        known = list(available or {})
+        keys: list[str] = []
+        for item in requested:
+            if item == "active":
+                picks = [active_key]
+            elif item == "all":
+                picks = [active_key] + [k for k in known if k != active_key]
+            elif item == active_key or item in known:
+                picks = [item]
+            else:
+                raise ValueError(
+                    f"Unknown variant '{item}'. Available: {sorted({active_key, *known})}"
+                )
+            keys.extend(k for k in picks if k not in keys)
+        return keys or [active_key]
+
+    def _execute_deliver_variants(
+        self,
+        edit_tl: EditTimeline,
+        output_dir: Path,
+        config: PipelineConfig,
+        formats: set[DeliverFormat],
+        callbacks: JobCallbacks | None,
+        cancel_event: threading.Event,
+        force_cpu: bool = False,
+        preview: bool = False,
+        resolve: bool = False,
+        dry_run_resolve: bool = False,
+        base_name: str | None = None,
+        job_handle: JobHandle | None = None,
+        settings: DeliverSettings | None = None,
+        sentences: list[SentenceSegment] | None = None,
+        variant_timelines: dict[str, EditTimeline] | None = None,
+    ) -> DeliverResult:
+        """Deliver the active timeline, or several variants into ``<output>/<variant_key>/``."""
+        common: dict[str, Any] = {
+            "force_cpu": force_cpu,
+            "preview": preview,
+            "resolve": resolve,
+            "dry_run_resolve": dry_run_resolve,
+            "job_handle": job_handle,
+            "settings": settings,
+            "sentences": sentences,
+        }
+        keys = (
+            [edit_tl.variant_key]
+            if preview
+            else self.resolve_variant_keys(edit_tl.variant_key, settings, variant_timelines)
+        )
+        if keys == [edit_tl.variant_key]:
+            return self._execute_deliver(
+                edit_tl, output_dir, config, formats, callbacks, cancel_event, base_name=base_name, **common
+            )
+
+        timelines = dict(variant_timelines or {})
+        timelines[edit_tl.variant_key] = edit_tl  # the live (possibly edited) timeline wins
+        combined = DeliverResult(success=True, output_dir=output_dir, settings=settings)
+        errors: list[str] = []
+        total = len(keys)
+        for idx, key in enumerate(keys):
+            sub_callbacks = callbacks
+            if callbacks is not None:
+                sub_callbacks = self._variant_callbacks(callbacks, key, idx, total)
+            sub = self._execute_deliver(
+                timelines[key],
+                output_dir / key,
+                config,
+                formats,
+                sub_callbacks,
+                cancel_event,
+                base_name=f"{base_name}_{key}" if base_name else None,
+                **common,
+            )
+            combined.variant_results[key] = sub
+            if not sub.success:
+                errors.append(f"{key}: {sub.error_message or 'failed'}")
+        first = combined.variant_results[edit_tl.variant_key if edit_tl.variant_key in keys else keys[0]]
+        for attr in (
+            "render_path", "encoder_used", "duration", "fcpxml_path", "premiere_xml_path",
+            "otio_path", "capcut_draft_path", "resolve_status", "master_codec",
+        ):
+            setattr(combined, attr, getattr(first, attr))
+        combined.subtitle_paths = list(first.subtitle_paths)
+        combined.success = not errors
+        combined.error_message = "; ".join(errors) or None
+        eff = settings or DeliverSettings.from_timeline(edit_tl, config)
+        variant_manifests: dict[str, str | None] = {}
+        for key, sub in combined.variant_results.items():
+            variant_manifests[key] = (
+                (output_dir / key / "deliver_manifest.json").relative_to(output_dir).as_posix()
+                if sub.manifest_path
+                else None
+            )
+        combined.manifest_path = self._write_manifest(
+            output_dir, eff, edit_tl.name, formats, combined, variants=variant_manifests
+        )
+        return combined
+
+    @staticmethod
+    def _variant_callbacks(callbacks: JobCallbacks, key: str, idx: int, total: int) -> JobCallbacks:
+        """Scale one variant's progress into its slice of the whole job and tag messages."""
+
+        def on_stage(name: str, i: int, n: int) -> None:
+            if callbacks.on_stage_changed:
+                callbacks.on_stage_changed(f"[{key}] {name}", i, n)
+
+        def on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
+            if callbacks.on_progress:
+                callbacks.on_progress(stage_pct, (idx * 100.0 + total_pct) / total, f"[{key}] {msg}")
+
+        return dataclasses.replace(callbacks, on_stage_changed=on_stage, on_progress=on_progress)
+
+    @staticmethod
+    def _write_manifest(
+        output_dir: Path,
+        settings: DeliverSettings,
+        timeline_name: str,
+        formats: set[DeliverFormat],
+        result: DeliverResult,
+        variants: dict[str, str | None] | None = None,
+        variant_key: str | None = None,
+    ) -> Path | None:
+        """Write ``deliver_manifest.json`` (settings, files produced, exporter versions)."""
+        from src.core.project_io import deliver_settings_to_dict
+
+        def rel(path: Path | None) -> str | None:
+            if path is None:
+                return None
+            try:
+                return Path(path).resolve().relative_to(output_dir.resolve()).as_posix()
+            except ValueError:
+                return str(path)
+
+        try:
+            import opentimelineio as otio
+
+            otio_version = getattr(otio, "__version__", None) or "unknown"
+        except Exception:  # pragma: no cover - otio is a hard dependency
+            otio_version = "unavailable"
+        manifest: dict[str, Any] = {
+            "manifest_version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "timeline": timeline_name,
+            "variant": variant_key,
+            "success": result.success,
+            "settings": deliver_settings_to_dict(settings),
+            "formats": sorted(formats),
+            "files": {
+                "master": rel(result.render_path),
+                "fcpxml": rel(result.fcpxml_path),
+                "premiere_xml": rel(result.premiere_xml_path),
+                "otio": rel(result.otio_path),
+                "capcut_draft": rel(result.capcut_draft_path),
+                "subtitles": [rel(p) for p in result.subtitle_paths],
+            },
+            "master": {
+                "codec": result.master_codec,
+                "encoder": result.encoder_used,
+                "duration": round(float(result.duration or 0.0), 3),
+            },
+            "exporters": {
+                "fcpxml": "1.8",
+                "premiere_xml": "xmeml (Final Cut Pro 7 XML)",
+                "otio": otio_version,
+                "capcut": "draft_content.json",
+            },
+            "watermark_in_nle": {"requested": settings.watermark_in_nle, "applied": False},
+        }
+        if variants is not None:
+            manifest["variants"] = variants
+        path = output_dir / "deliver_manifest.json"
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write deliver manifest %s: %s", path, exc)
+            return None
+        return path
+
     def _execute_deliver(
         self,
         edit_tl: EditTimeline,
@@ -416,6 +643,8 @@ class StudioBackendAdapter:
         base_name: str | None = None,
         job_handle: JobHandle | None = None,
         render_file_name: str | None = None,
+        settings: DeliverSettings | None = None,
+        sentences: list[SentenceSegment] | None = None,
     ) -> DeliverResult:
         unknown = set(formats) - set(ALL_DELIVER_FORMATS)
         if unknown:
@@ -438,9 +667,19 @@ class StudioBackendAdapter:
             out_dir = Path(config.cache_dir).resolve() / "preview"
             out_dir.mkdir(parents=True, exist_ok=True)
             stage("Rendering 540p preview", 1, 1)
-            renderer = NvencRenderer(config)
+            # The preview keeps the Deliver canvas (aspect ratio, fps) but ignores codec, colour
+            # and subtitles: it is always a 540p H.265 proxy.
+            preview_tl = retarget_timeline(edit_tl, settings) if settings is not None else edit_tl
+            preview_cfg = config.model_copy(
+                update={
+                    "canvas_width": preview_tl.canvas_width,
+                    "canvas_height": preview_tl.canvas_height,
+                    "fps": preview_tl.fps,
+                }
+            )
+            renderer = NvencRenderer(preview_cfg)
             res = renderer.render_edit_timeline(
-                edit_tl,
+                preview_tl,
                 out_dir / f"preview_{edit_tl.variant_key}.mp4",
                 force_cpu=force_cpu,
                 preview=True,
@@ -452,6 +691,12 @@ class StudioBackendAdapter:
             result.duration, result.success = res.duration, True
             return result
 
+        # Effective Deliver settings: the user's, or the timeline's own canvas/fps with defaults.
+        eff = settings or DeliverSettings.from_timeline(edit_tl, config)
+        result.settings = eff
+        if settings is not None:
+            edit_tl = retarget_timeline(edit_tl, settings)
+
         output_dir.mkdir(parents=True, exist_ok=True)
         name = base_name or f"{edit_tl.name}"
         nle_formats = {f for f in formats if f != "mp4"}
@@ -459,26 +704,40 @@ class StudioBackendAdapter:
             nle_formats.add("fcpxml")
         total = (1 if nle_formats else 0) + (1 if "mp4" in formats else 0)
         step = 0
+        exp_cfg = config.model_copy(
+            update={"canvas_width": edit_tl.canvas_width, "canvas_height": edit_tl.canvas_height, "fps": edit_tl.fps}
+        )
+        if eff.watermark_in_nle:
+            # TODO(phase 22): an NLE watermark overlay layer is not implemented; the master render
+            # still burns the watermark when it is enabled in the config.
+            logger.warning(
+                "watermark_in_nle requested but NLE watermark layers are not implemented yet; "
+                "the NLE files are written without a watermark."
+            )
 
         if nle_formats:
             step += 1
             stage("Exporting NLE interchange files", step, total)
             progress(10.0, "Building OTIO timeline...")
-            builder = TimelineBuilder(config)
-            otio_tl = builder.build_from_edit_timeline(edit_tl)
+            builder = TimelineBuilder(exp_cfg)
+            otio_tl = builder.build_from_edit_timeline(edit_tl, relink_original=eff.relink_original)
             try:
                 from src.modules.timeline_qa import TimelineQA
 
-                for r in TimelineQA(config).validate_and_sanitize(
+                # QA runs at the Deliver frame rate (exp_cfg), not the analysis preset's.
+                for r in TimelineQA(exp_cfg).validate_and_sanitize(
                     otio_tl, min_clip_frames=config.min_clip_frames_threshold
                 ):
                     logger.info("[QA Audit] %s", r)
             except Exception as qa_err:
                 logger.warning("Timeline QA sanitization warning: %s", qa_err)
-            exp_cfg = config.model_copy(
-                update={"canvas_width": edit_tl.canvas_width, "canvas_height": edit_tl.canvas_height, "fps": edit_tl.fps}
+            exp = builder.export_all(
+                otio_tl,
+                output_dir,
+                base_name=name,
+                formats=nle_formats,
+                settings=settings,
             )
-            exp = TimelineBuilder(exp_cfg).export_all(otio_tl, output_dir, base_name=name, formats=nle_formats)
             result.fcpxml_path = exp.fcpxml_path
             result.premiere_xml_path = exp.premiere_xml_path
             result.otio_path = exp.otio_path
@@ -486,13 +745,18 @@ class StudioBackendAdapter:
             progress(100.0, "NLE interchange files exported")
 
             if resolve or dry_run_resolve:
-                dispatcher = ResolveDispatcher(config)
+                dispatcher = ResolveDispatcher(exp_cfg)
                 result.resolve_status = dispatcher.dispatch_project(
                     fcpxml_path=exp.fcpxml_path or (output_dir / f"{name}.fcpxml"),
-                    source_media_paths=sorted({Path(c.source_path) for c in edit_tl.clips}),
+                    source_media_paths=sorted(
+                        {c.media_path(eff.relink_original) for c in edit_tl.clips}
+                    ),
                     project_name=name,
                     render_output_dir=output_dir / "resolve_renders",
                     dry_run=dry_run_resolve,
+                    fit_mode=eff.fit_mode,
+                    color=eff.color,
+                    master=eff.master,
                 )
 
         if "mp4" in formats:
@@ -507,13 +771,35 @@ class StudioBackendAdapter:
                 progress_callback=progress,
                 cancel_event=cancel_event,
                 job_handle=job_handle,
+                settings=settings,
+                sentences=sentences,
             )
             result.render_path, result.encoder_used = res.output_path, res.encoder_used
             result.duration = res.duration
+            result.master_codec = eff.master
+            if settings is not None and settings.subtitles != "none" and sentences:
+                # The renderer wrote the sidecars next to the master; list them.
+                result.subtitle_paths = [
+                    p
+                    for p in (res.output_path.with_suffix(".srt"), res.output_path.with_suffix(".ass"))
+                    if p.is_file()
+                ]
         else:
             result.duration = edit_tl.duration
+            if settings is not None and settings.subtitles != "none" and sentences:
+                from src.modules.subtitle_export import write_subtitle_sidecars
+
+                result.subtitle_paths = write_subtitle_sidecars(
+                    sentences,
+                    output_dir / f"{name}.mp4",
+                    settings.subtitles,
+                    (edit_tl.canvas_width, edit_tl.canvas_height),
+                )
 
         result.success = True
+        result.manifest_path = self._write_manifest(
+            output_dir, eff, edit_tl.name, formats, result, variant_key=edit_tl.variant_key
+        )
         return result
 
     def _execute_pipeline(
@@ -559,25 +845,9 @@ class StudioBackendAdapter:
         # Stage 1: Ingestion & Shot Detection (Multi-Source Capable)
         # -------------------------------------------------------------
         _notify_stage("Ingesting & Detecting Scenes", 1)
-        video_exts = {".mp4", ".mov", ".mkv", ".m4v"}
-        collected_files: list[Path] = []
-        if isinstance(input_dir, list):
-            for item in input_dir:
-                p = Path(item)
-                if p.is_dir():
-                    collected_files.extend(
-                        [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in video_exts]
-                    )
-                elif p.is_file() and p.suffix.lower() in video_exts:
-                    collected_files.append(p)
-        else:
-            p = Path(input_dir)
-            if p.is_dir():
-                collected_files = [
-                    f for f in p.iterdir() if f.is_file() and f.suffix.lower() in video_exts
-                ]
-            elif p.is_file() and p.suffix.lower() in video_exts:
-                collected_files = [p]
+        collected_files, skipped_raw = collect_video_files(input_dir)
+        for raw in skipped_raw:
+            logger.warning("Skipping %s: camera RAW format is not supported (transcode it first).", raw.name)
 
         # Deduplicate while preserving order
         seen_paths = set()

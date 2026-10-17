@@ -257,6 +257,16 @@ class ScoredScene:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+# Container extensions the ingest scan, media browser and CLI accept as footage (lowercase).
+VIDEO_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".mp4", ".mov", ".mkv", ".m4v", ".mxf", ".avi", ".mts", ".m2ts",
+        ".webm", ".mpg", ".mpeg", ".wmv", ".3gp", ".flv",
+    }
+)
+# Camera RAW containers ffmpeg cannot decode: skipped during ingest with a warning.
+UNSUPPORTED_RAW_EXTENSIONS: frozenset[str] = frozenset({".braw", ".r3d"})
+
 DeliverFormat = Literal["mp4", "fcpxml", "premiere", "otio", "capcut"]
 ALL_DELIVER_FORMATS: tuple[DeliverFormat, ...] = ("mp4", "fcpxml", "premiere", "otio", "capcut")
 
@@ -456,6 +466,13 @@ class DeliverResult:
     is_preview: bool = False
     error_message: str | None = None
     cancelled: bool = False
+    # Phase 22 step 7
+    manifest_path: Path | None = None
+    subtitle_paths: list[Path] = field(default_factory=list)
+    master_codec: str | None = None  # DeliverSettings.master used for the render
+    settings: "DeliverSettings | None" = None
+    # Per-variant outcomes (key -> result) when several timelines were delivered into subfolders.
+    variant_results: dict[str, "DeliverResult"] = field(default_factory=dict)
 
 
 @dataclass

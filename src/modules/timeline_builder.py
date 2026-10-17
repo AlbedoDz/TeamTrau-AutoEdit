@@ -12,6 +12,7 @@ from src.core.ontology import natural_sort_key
 from src.core.types import (
     CleanedSegment,
     DefectType,
+    DeliverSettings,
     EditTimeline,
     ScoredScene,
     SongSection,
@@ -336,12 +337,24 @@ class TimelineBuilder:
         output_dir: Path,
         base_name: str = "timeline",
         formats: set[str] | None = None,
+        settings: DeliverSettings | None = None,
     ) -> TimelineExportResult:
         """Export timeline to DaVinci Resolve FCPXML, Premiere XML, OTIO and CapCut.
 
-        ``formats`` limits which interchange files are written (None = all).
+        ``formats`` limits which interchange files are written (None = all). ``settings``
+        (Deliver) overrides the canvas and frame rate of the config and selects the FCPXML
+        colour space and fit mode; without it the config values and legacy defaults apply.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
+        canvas = settings.canvas if settings else (self.config.canvas_width, self.config.canvas_height)
+        fps = settings.fps if settings else self.config.fps
+        color = settings.color if settings else None
+        fit_mode = settings.fit_mode if settings else "auto"
+        if settings and settings.fcpxml_version != "1.8":
+            logger.warning(
+                "FCPXML %s requested but only 1.8 (verified on DaVinci Resolve) is written.",
+                settings.fcpxml_version,
+            )
         wanted = set(formats) if formats is not None else {"otio", "premiere", "fcpxml", "capcut"}
 
         fcpxml_path = output_dir / f"{base_name}.fcpxml"
@@ -372,8 +385,8 @@ class TimelineBuilder:
                 finalize_premiere_xml(
                     exported_premiere,
                     timeline=timeline,
-                    canvas=(self.config.canvas_width, self.config.canvas_height),
-                    fps=self.config.fps,
+                    canvas=canvas,
+                    fps=fps,
                 )  # real channel/size info, speed and fit for Premiere
             except Exception as exc:
                 logger.warning("Premiere XML channel fix-up skipped (%s)", exc)
@@ -390,11 +403,13 @@ class TimelineBuilder:
                 exported_resolve = write_fcpxml(
                     timeline,
                     fcpxml_path,
-                    fps=self.config.fps,
-                    width=self.config.canvas_width,
-                    height=self.config.canvas_height,
+                    fps=fps,
+                    width=canvas[0],
+                    height=canvas[1],
                     camera_audio_db=camera_db,
                     project_name=base_name,
+                    color=color,
+                    fit_mode=fit_mode,
                 )
                 logger.info("Exported DaVinci Resolve FCPXML: %s", fcpxml_path.name)
             except Exception as exc:

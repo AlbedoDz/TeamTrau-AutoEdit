@@ -5,15 +5,17 @@ hardware acceleration settings, real-time FFmpeg NVENC render monitoring,
 and final deliverable file handoffs.
 """
 
+import dataclasses
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -26,6 +28,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -35,10 +39,92 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.config import PipelineConfig, check_cuda_available, check_nvenc_available
-from src.core.types import DeliverResult, PipelineExecutionResult
+from src.core.config import PRESETS, PipelineConfig, check_cuda_available, check_nvenc_available
+from src.core.deliver_check import (
+    SourceFormat,
+    SourceMismatch,
+    count_source_mismatch,
+    probe_source_formats,
+)
+from src.core.types import (
+    DeliverResult,
+    DeliverSettings,
+    EditTimeline,
+    PipelineExecutionResult,
+    RenderPreset,
+)
 
 logger = logging.getLogger(__name__)
+
+# Aspect ratios worth naming; anything else is shown as "1.85:1" style. Tolerance 2.5 %.
+_NAMED_RATIOS: tuple[tuple[float, str], ...] = (
+    (16 / 9, "16:9"),
+    (9 / 16, "9:16"),
+    (1.0, "1:1"),
+    (4 / 5, "4:5"),
+    (5 / 4, "5:4"),
+    (4 / 3, "4:3"),
+    (3 / 4, "3:4"),
+    (21 / 9, "21:9"),
+    (9 / 21, "9:21"),
+    (256 / 135, "256:135 DCI"),
+)
+
+FPS_CHOICES: tuple[tuple[float, str], ...] = (
+    (23.976, "23.976 (NTSC film)"),
+    (24.0, "24"),
+    (25.0, "25 (PAL)"),
+    (29.97, "29.97 (NTSC)"),
+    (30.0, "30"),
+    (50.0, "50 (PAL)"),
+    (59.94, "59.94 (NTSC)"),
+    (60.0, "60"),
+    (119.88, "119.88 (NTSC)"),
+)
+FIT_CHOICES: tuple[tuple[str, str], ...] = (
+    ("auto", "Auto (fit, crop when reframed)"),
+    ("fit", "Fit (letterbox / pillarbox)"),
+    ("fill", "Fill (crop to canvas)"),
+    ("stretch", "Stretch (distort)"),
+)
+COLOR_CHOICES: tuple[tuple[str, str], ...] = (
+    ("rec709", "Rec.709 (SDR)"),
+    ("rec2020_hlg", "Rec.2020 HLG (HDR)"),
+    ("rec2020_pq", "Rec.2020 PQ (HDR10)"),
+    ("passthrough", "Passthrough (keep source tags)"),
+)
+MASTER_CHOICES: tuple[tuple[str, str], ...] = (
+    ("hevc", "H.265 / HEVC (.mp4)"),
+    ("h264", "H.264 (.mp4)"),
+    ("prores_422", "ProRes 422 (.mov)"),
+    ("prores_hq", "ProRes 422 HQ (.mov)"),
+    ("dnxhr_hqx", "DNxHR HQX (.mov)"),
+)
+SUBTITLE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("none", "None"),
+    ("srt", "Sidecar .srt"),
+    ("ass", "Sidecar .ass (+ .srt)"),
+    ("burn", "Burn into picture (+ .srt)"),
+)
+AUDIO_RATE_CHOICES: tuple[tuple[int, str], ...] = ((44100, "44.1 kHz"), (48000, "48 kHz"), (96000, "96 kHz"))
+AUDIO_CHANNEL_CHOICES: tuple[tuple[int, str], ...] = ((1, "Mono"), (2, "Stereo"))
+CUSTOM_PRESET = "custom"
+
+
+def aspect_ratio_label(width: int, height: int) -> str:
+    """Human label of the canvas aspect ratio: 16:9, 9:16, 1:1, 4:5, 21:9, 256:135 DCI, else ``1.85:1``."""
+    if width <= 0 or height <= 0:
+        return "?"
+    ratio = width / height
+    for value, label in _NAMED_RATIOS:
+        if abs(ratio - value) / value <= 0.025:
+            return label
+    return f"{ratio:.2f}:1" if ratio >= 1 else f"1:{1 / ratio:.2f}"
+
+
+def preset_label(preset: RenderPreset) -> str:
+    """Combo text of a canvas preset, e.g. ``square_1080 (1:1 1080x1080)``."""
+    return f"{preset.name} ({aspect_ratio_label(preset.width, preset.height)} {preset.width}x{preset.height})"
 
 
 def find_default_capcut_draft_dir() -> Path | None:
@@ -72,14 +158,22 @@ class ExportPanelWidget(QWidget):
     """Multi-NLE Export Configuration & Real-Time NVENC Render Monitor Widget."""
 
     export_options_changed = Signal()
+    deliver_settings_changed = Signal()
     open_directory_requested = Signal(Path)
+    _source_formats_ready = Signal(object)  # dict[Path, SourceFormat] from the probe thread
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._last_result: PipelineExecutionResult | DeliverResult | None = None
         self._output_dir: Path = Path("./output")
+        self._loading_settings = False
+        self._source_timeline: EditTimeline | None = None
+        self._source_formats: dict[Path, SourceFormat] = {}
+        self._source_mismatch = SourceMismatch()
+        self._probe_generation = 0
 
         self._init_ui()
+        self._source_formats_ready.connect(self._on_source_formats_ready)
 
     def _init_ui(self) -> None:
         """Construct export options, live render monitor, and deliverable handoffs."""
@@ -95,6 +189,11 @@ class ExportPanelWidget(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(12)
+
+        # -------------------------------------------------------------
+        # Section 0: Deliver Settings (canvas, timebase, colour, audio, master, extras)
+        # -------------------------------------------------------------
+        layout.addWidget(self._build_deliver_group(content))
 
         # -------------------------------------------------------------
         # Section 1: Multi-NLE Interchange Formats
@@ -154,18 +253,6 @@ class ExportPanelWidget(QWidget):
         self.chk_dry_run_resolve.setEnabled(False)
         layout_nle.addWidget(self.chk_dry_run_resolve)
 
-        # Variant Export Scope
-        row_variant = QHBoxLayout()
-        row_variant.addWidget(QLabel("Timeline Variant Target:"))
-        self.combo_variant_target = QComboBox(group_nle)
-        self.combo_variant_target.addItems([
-            "Active Workspace Variant (Current Cut)",
-            "Batch Export All Generated Variations (1-3 Variations)",
-        ])
-        self.combo_variant_target.currentIndexChanged.connect(lambda: self.export_options_changed.emit())
-        row_variant.addWidget(self.combo_variant_target, stretch=1)
-        layout_nle.addLayout(row_variant)
-
         layout.addWidget(group_nle)
 
         # -------------------------------------------------------------
@@ -175,7 +262,7 @@ class ExportPanelWidget(QWidget):
         layout_render = QVBoxLayout(group_render)
         layout_render.setSpacing(8)
 
-        self.chk_enable_render = QCheckBox("Include Master Video (.mp4) in this export", group_render)
+        self.chk_enable_render = QCheckBox("Include Master Video in this export (codec per Deliver Settings)", group_render)
         self.chk_enable_render.setChecked(True)
         self.chk_enable_render.toggled.connect(self._on_render_toggle)
         layout_render.addWidget(self.chk_enable_render)
@@ -422,6 +509,367 @@ class ExportPanelWidget(QWidget):
         main_layout.addWidget(scroll)
 
     # -------------------------------------------------------------------------
+    # Deliver Settings group
+    # -------------------------------------------------------------------------
+
+    def _build_deliver_group(self, parent: QWidget) -> QGroupBox:
+        group = QGroupBox("Deliver Settings", parent)
+        self._loading_settings = True  # no change signals while the controls are being created
+        outer = QVBoxLayout(group)
+        outer.setSpacing(8)
+        form = QFormLayout()
+        form.setSpacing(6)
+        outer.addLayout(form)
+
+        # Canvas preset + custom size
+        self.combo_deliver_preset = QComboBox(group)
+        self.combo_deliver_preset.addItem("Custom canvas", CUSTOM_PRESET)
+        for name, preset in PRESETS.items():
+            self.combo_deliver_preset.addItem(preset_label(preset), name)
+        self.combo_deliver_preset.setToolTip("Canvas preset: sets width, height and frame rate below")
+        self.combo_deliver_preset.currentIndexChanged.connect(self._on_deliver_preset_changed)
+        form.addRow("Canvas preset:", self.combo_deliver_preset)
+
+        row_size = QHBoxLayout()
+        self.spin_deliver_width = QSpinBox(group)
+        self.spin_deliver_height = QSpinBox(group)
+        for spin in (self.spin_deliver_width, self.spin_deliver_height):
+            spin.setRange(16, 16384)
+            spin.setSingleStep(2)
+            spin.setSuffix(" px")
+            spin.setToolTip("Even values only (video encoders need even sizes)")
+            spin.valueChanged.connect(self._on_deliver_size_changed)
+        self.spin_deliver_width.setValue(1920)
+        self.spin_deliver_height.setValue(1080)
+        row_size.addWidget(self.spin_deliver_width)
+        row_size.addWidget(QLabel("x"))
+        row_size.addWidget(self.spin_deliver_height)
+        self.lbl_deliver_aspect = QLabel("16:9", group)
+        self.lbl_deliver_aspect.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        row_size.addWidget(self.lbl_deliver_aspect)
+        row_size.addStretch()
+        form.addRow("Canvas size:", row_size)
+
+        self.combo_deliver_fps = self._make_combo(group, FPS_CHOICES)
+        self.combo_deliver_fps.setCurrentIndex(self.combo_deliver_fps.findData(30.0))
+        self.combo_deliver_fps.currentIndexChanged.connect(self._on_deliver_fps_changed)
+        form.addRow("Frame rate:", self.combo_deliver_fps)
+
+        self.combo_deliver_fit = self._make_combo(group, FIT_CHOICES)
+        form.addRow("Fit mode:", self.combo_deliver_fit)
+        self.combo_deliver_color = self._make_combo(group, COLOR_CHOICES)
+        form.addRow("Colour space:", self.combo_deliver_color)
+
+        row_audio = QHBoxLayout()
+        self.combo_deliver_audio_rate = self._make_combo(group, AUDIO_RATE_CHOICES)
+        self.combo_deliver_audio_rate.setCurrentIndex(self.combo_deliver_audio_rate.findData(48000))
+        self.combo_deliver_audio_channels = self._make_combo(group, AUDIO_CHANNEL_CHOICES)
+        self.combo_deliver_audio_channels.setCurrentIndex(self.combo_deliver_audio_channels.findData(2))
+        row_audio.addWidget(self.combo_deliver_audio_rate)
+        row_audio.addWidget(self.combo_deliver_audio_channels)
+        row_audio.addStretch()
+        form.addRow("Audio:", row_audio)
+
+        self.combo_deliver_master = self._make_combo(group, MASTER_CHOICES)
+        self.combo_deliver_master.setToolTip("Codec / container of the master render (the 540p preview ignores it)")
+        form.addRow("Master codec:", self.combo_deliver_master)
+        self.combo_deliver_subtitles = self._make_combo(group, SUBTITLE_CHOICES)
+        self.combo_deliver_subtitles.setToolTip("Needs a transcript (enable transcription in Preferences)")
+        form.addRow("Subtitles:", self.combo_deliver_subtitles)
+
+        self.chk_deliver_relink = QCheckBox("Link to original media (not the render proxy cache)", group)
+        self.chk_deliver_relink.setChecked(True)
+        self.chk_deliver_relink.toggled.connect(self._emit_deliver_changed)
+        outer.addWidget(self.chk_deliver_relink)
+        self.chk_deliver_watermark_nle = QCheckBox("Include watermark in NLE files", group)
+        self.chk_deliver_watermark_nle.setToolTip(
+            "Not implemented yet: the master render burns the watermark, NLE files stay clean"
+        )
+        self.chk_deliver_watermark_nle.toggled.connect(self._emit_deliver_changed)
+        outer.addWidget(self.chk_deliver_watermark_nle)
+
+        # Variants: active / all / pick
+        row_variant = QHBoxLayout()
+        row_variant.addWidget(QLabel("Timeline Variant Target:"))
+        self.combo_variant_target = QComboBox(group)
+        self.combo_variant_target.addItems(
+            [
+                "Active Workspace Variant (Current Cut)",
+                "Batch Export All Generated Variations (1-3 Variations)",
+                "Selected Variants (pick below)",
+            ]
+        )
+        self.combo_variant_target.currentIndexChanged.connect(self._on_variant_target_changed)
+        row_variant.addWidget(self.combo_variant_target, stretch=1)
+        outer.addLayout(row_variant)
+        self.list_variants = QListWidget(group)
+        self.list_variants.setMaximumHeight(84)
+        self.list_variants.setVisible(False)
+        self.list_variants.itemChanged.connect(self._emit_deliver_changed)
+        outer.addWidget(self.list_variants)
+
+        self.lbl_source_mismatch = QLabel("", group)
+        self.lbl_source_mismatch.setWordWrap(True)
+        self.lbl_source_mismatch.setStyleSheet("color: #facc15;")
+        self.lbl_source_mismatch.setVisible(False)
+        outer.addWidget(self.lbl_source_mismatch)
+
+        # Every format combo is persisted with the project: any change is a settings change.
+        for combo in (
+            self.combo_deliver_fit, self.combo_deliver_color, self.combo_deliver_audio_rate,
+            self.combo_deliver_audio_channels, self.combo_deliver_master, self.combo_deliver_subtitles,
+        ):
+            combo.currentIndexChanged.connect(self._emit_deliver_changed)
+        self._loading_settings = False
+        self._sync_preset_combo()
+        self._after_canvas_change()
+        return group
+
+    @staticmethod
+    def _make_combo(parent: QWidget, choices: Any) -> QComboBox:
+        combo = QComboBox(parent)
+        for value, text in choices:
+            combo.addItem(text, value)
+        return combo
+
+    def _emit_deliver_changed(self, *_args: Any) -> None:
+        if self._loading_settings:
+            return
+        self.deliver_settings_changed.emit()
+        self.export_options_changed.emit()
+
+    @Slot(int)
+    def _on_deliver_preset_changed(self, _index: int) -> None:
+        name = self.combo_deliver_preset.currentData()
+        if self._loading_settings or name not in PRESETS:
+            return
+        preset = PRESETS[name]
+        self._loading_settings = True
+        try:
+            self.spin_deliver_width.setValue(preset.width)
+            self.spin_deliver_height.setValue(preset.height)
+            self._select_fps(preset.fps)
+        finally:
+            self._loading_settings = False
+        self._after_canvas_change()
+        self._emit_deliver_changed()
+
+    @Slot(int)
+    def _on_deliver_size_changed(self, _value: int) -> None:
+        if self._loading_settings:
+            return
+        # Even sizes only: round an odd entry up (down at the range limit).
+        for spin in (self.spin_deliver_width, self.spin_deliver_height):
+            if spin.value() % 2:
+                self._loading_settings = True
+                try:
+                    spin.setValue(spin.value() + 1 if spin.value() < spin.maximum() else spin.value() - 1)
+                finally:
+                    self._loading_settings = False
+        self._sync_preset_combo()
+        self._after_canvas_change()
+        self._emit_deliver_changed()
+
+    @Slot(int)
+    def _on_deliver_fps_changed(self, _index: int) -> None:
+        if self._loading_settings:
+            return
+        self._sync_preset_combo()
+        self._after_canvas_change()
+        self._emit_deliver_changed()
+
+    def _after_canvas_change(self) -> None:
+        self.lbl_deliver_aspect.setText(
+            aspect_ratio_label(self.spin_deliver_width.value(), self.spin_deliver_height.value())
+        )
+        self._refresh_source_mismatch()
+
+    def _sync_preset_combo(self) -> None:
+        """Select the preset matching the current size and fps, else 'Custom canvas'."""
+        w, h, fps = self.spin_deliver_width.value(), self.spin_deliver_height.value(), self._current_fps()
+        match = CUSTOM_PRESET
+        for name, p in PRESETS.items():
+            if (p.width, p.height) == (w, h) and abs(p.fps - fps) < 0.001:
+                match = name
+                break
+        was_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            self.combo_deliver_preset.setCurrentIndex(self.combo_deliver_preset.findData(match))
+        finally:
+            self._loading_settings = was_loading
+
+    def _current_fps(self) -> float:
+        return float(self.combo_deliver_fps.currentData() or 30.0)
+
+    def _select_fps(self, fps: float) -> None:
+        """Select ``fps`` in the combo, appending an entry for rates outside the standard list."""
+        for i in range(self.combo_deliver_fps.count()):
+            if abs(float(self.combo_deliver_fps.itemData(i)) - fps) < 0.001:
+                self.combo_deliver_fps.setCurrentIndex(i)
+                return
+        self.combo_deliver_fps.addItem(f"{fps:g}", float(fps))
+        self.combo_deliver_fps.setCurrentIndex(self.combo_deliver_fps.count() - 1)
+
+    @Slot(int)
+    def _on_variant_target_changed(self, index: int) -> None:
+        self.list_variants.setVisible(index == 2)
+        self._emit_deliver_changed()
+
+    def _new_variant_item(self, key: str, label: str, checked: bool) -> QListWidgetItem:
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, key)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        return item
+
+    def set_available_variants(self, keys: list[str], active_key: str | None = None) -> None:
+        """Fill the 'Selected Variants' list with the timeline keys (keeps ticks of known keys)."""
+        ticked = set(self._ticked_variants())
+        self._loading_settings = True
+        try:
+            self.list_variants.clear()
+            for key in keys:
+                checked = key in ticked or (not ticked and key == active_key)
+                self.list_variants.addItem(
+                    self._new_variant_item(key, key + ("  (active)" if key == active_key else ""), checked)
+                )
+        finally:
+            self._loading_settings = False
+
+    def _ticked_variants(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self.list_variants.count()):
+            item = self.list_variants.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                out.append(item.data(Qt.ItemDataRole.UserRole))
+        return out
+
+    def get_deliver_variants(self) -> list[str]:
+        """``["active"]``, ``["all"]`` or the ticked timeline keys (falls back to active)."""
+        idx = self.combo_variant_target.currentIndex()
+        if idx == 1:
+            return ["all"]
+        if idx == 2:
+            return self._ticked_variants() or ["active"]
+        return ["active"]
+
+    def get_deliver_settings(self, base: DeliverSettings) -> DeliverSettings:
+        """``base`` with every Deliver Settings control applied (raises ValueError if invalid)."""
+        return dataclasses.replace(
+            base,
+            canvas_width=self.spin_deliver_width.value(),
+            canvas_height=self.spin_deliver_height.value(),
+            fps=self._current_fps(),
+            fit_mode=self.combo_deliver_fit.currentData(),
+            color=self.combo_deliver_color.currentData(),
+            audio_rate=int(self.combo_deliver_audio_rate.currentData()),
+            audio_channels=int(self.combo_deliver_audio_channels.currentData()),
+            master=self.combo_deliver_master.currentData(),
+            subtitles=self.combo_deliver_subtitles.currentData(),
+            watermark_in_nle=self.chk_deliver_watermark_nle.isChecked(),
+            relink_original=self.chk_deliver_relink.isChecked(),
+            variants=self.get_deliver_variants(),
+        )
+
+    def load_deliver_settings(self, settings: DeliverSettings) -> None:
+        """Show ``settings`` in the controls without emitting change signals."""
+        self._loading_settings = True
+        try:
+            self.spin_deliver_width.setValue(settings.canvas_width)
+            self.spin_deliver_height.setValue(settings.canvas_height)
+            self._select_fps(settings.fps)
+            for combo, value in (
+                (self.combo_deliver_fit, settings.fit_mode),
+                (self.combo_deliver_color, settings.color),
+                (self.combo_deliver_audio_rate, settings.audio_rate),
+                (self.combo_deliver_audio_channels, settings.audio_channels),
+                (self.combo_deliver_master, settings.master),
+                (self.combo_deliver_subtitles, settings.subtitles),
+            ):
+                idx = combo.findData(value)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            self.chk_deliver_relink.setChecked(settings.relink_original)
+            self.chk_deliver_watermark_nle.setChecked(settings.watermark_in_nle)
+
+            variants = list(settings.variants)
+            if variants == ["active"]:
+                self.combo_variant_target.setCurrentIndex(0)
+            elif variants == ["all"]:
+                self.combo_variant_target.setCurrentIndex(1)
+            else:
+                known = {
+                    self.list_variants.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(self.list_variants.count())
+                }
+                for key in variants:
+                    if key != "active" and key not in known:
+                        self.list_variants.addItem(self._new_variant_item(key, key, True))
+                for i in range(self.list_variants.count()):
+                    item = self.list_variants.item(i)
+                    key = item.data(Qt.ItemDataRole.UserRole)
+                    item.setCheckState(Qt.CheckState.Checked if key in variants else Qt.CheckState.Unchecked)
+                self.combo_variant_target.setCurrentIndex(2)
+            self.list_variants.setVisible(self.combo_variant_target.currentIndex() == 2)
+            self._sync_preset_combo()
+        finally:
+            self._loading_settings = False
+        self._after_canvas_change()
+
+    # -- source / canvas mismatch warning -----------------------------------
+    def set_source_timeline(self, timeline: EditTimeline | None, background: bool = True) -> None:
+        """Probe the timeline's media (cached) and show how many clips will be scaled/conformed.
+
+        ``background=True`` probes on a worker thread so the UI never blocks on ffprobe; tests use
+        ``background=False``.
+        """
+        self._source_timeline = timeline
+        self._probe_generation += 1
+        if timeline is None or not timeline.clips:
+            self._source_formats = {}
+            self._refresh_source_mismatch()
+            return
+        generation = self._probe_generation
+        if not background:
+            self._source_formats = probe_source_formats(timeline)
+            self._refresh_source_mismatch()
+            return
+
+        def _probe() -> None:
+            formats = probe_source_formats(timeline)
+            self._source_formats_ready.emit((generation, formats))
+
+        threading.Thread(target=_probe, name="DeliverSourceProbe", daemon=True).start()
+
+    @Slot(object)
+    def _on_source_formats_ready(self, payload: object) -> None:
+        generation, formats = payload  # type: ignore[misc]
+        if generation != self._probe_generation:
+            return  # a newer timeline was set meanwhile
+        self._source_formats = formats
+        self._refresh_source_mismatch()
+
+    def _refresh_source_mismatch(self) -> None:
+        tl = self._source_timeline
+        if tl is None or not self._source_formats:
+            self._source_mismatch = SourceMismatch()
+        else:
+            w, h = self.spin_deliver_width.value(), self.spin_deliver_height.value()
+            probe_settings = DeliverSettings(
+                canvas_width=w + w % 2, canvas_height=h + h % 2, fps=self._current_fps()
+            )
+            self._source_mismatch = count_source_mismatch(tl, self._source_formats, probe_settings)
+        text = self._source_mismatch.message
+        self.lbl_source_mismatch.setText(text)
+        self.lbl_source_mismatch.setVisible(bool(text))
+
+    @property
+    def source_mismatch(self) -> SourceMismatch:
+        """Latest mismatch report for the timeline set with :meth:`set_source_timeline`."""
+        return self._source_mismatch
+
+    # -------------------------------------------------------------------------
     # Public Configuration API
     # -------------------------------------------------------------------------
 
@@ -452,7 +900,7 @@ class ExportPanelWidget(QWidget):
             "watermark_path": self.edit_watermark_path.text().strip() or None,
             "watermark_position": self.combo_wm_pos.currentText(),
             "watermark_opacity": self.spin_wm_opacity.value(),
-            "variant_export_scope": "all" if self.combo_variant_target.currentIndex() == 1 else "active",
+            "variant_export_scope": ("active", "all", "selected")[self.combo_variant_target.currentIndex()],
             "nvenc_bitrate": f"{self.spin_nvenc_bitrate.value()}M",
             "nvenc_cq": self.spin_nvenc_cq.value(),
             "nvenc_overrides_enabled": self.grp_nvenc_adv.isChecked(),
@@ -621,14 +1069,25 @@ class ExportPanelWidget(QWidget):
                 self.btn_open_capcut.setEnabled(True)
 
             if result.render_path and result.render_path.exists():
-                self.lbl_deliv_master.setText(f"Master MP4: <b>{result.render_path.name}</b> ({result.encoder_used or 'NVENC'})")
+                kind = result.render_path.suffix.lstrip(".").upper() or "MP4"
+                codec = dict(MASTER_CHOICES).get(getattr(result, "master_codec", None) or "", "")
+                detail = f"{codec}, " if codec else ""
+                self.lbl_deliv_master.setText(
+                    f"Master {kind}: <b>{result.render_path.name}</b> ({detail}{result.encoder_used or 'NVENC'})"
+                )
                 self.btn_play_master.setEnabled(True)
             elif not self.is_render_enabled():
                 self.lbl_deliv_master.setText("Master MP4: (Render skipped by user)")
             else:
                 self.lbl_deliv_master.setText("Master MP4: (Not rendered)")
 
-            if getattr(result, "timeline_variants", None):
+            if getattr(result, "variant_results", None):
+                keys = list(result.variant_results)
+                self.lbl_deliv_variants.setText(
+                    f"Variants delivered ({len(keys)}): <b>{' | '.join(keys)}</b> (one subfolder each)"
+                )
+                self.lbl_deliv_variants.setVisible(True)
+            elif getattr(result, "timeline_variants", None):
                 var_names = [v.display_name for v in result.timeline_variants.values()]
                 self.lbl_deliv_variants.setText(f"Timeline Variants ({len(var_names)}): <b>{' | '.join(var_names)}</b>")
                 self.lbl_deliv_variants.setVisible(True)

@@ -542,7 +542,7 @@ def _save_cli_project(
     required=True,
     help="Saved .tteproj project produced by `run` or the Desktop Studio.",
 )
-@click.option("--variant", default=None, help="Timeline to export (master, beat_driven, cinematic, social_teaser).")
+@click.option("--variant", default=None, help="Active timeline to export (master, beat_driven, cinematic, social_teaser).")
 @click.option(
     "--format",
     "formats",
@@ -559,6 +559,42 @@ def _save_cli_project(
 @click.option("--preview", is_flag=True, default=False, help="Fast 540p proxy render instead of the master.")
 @click.option("--no-nvenc", is_flag=True, default=False, help="Force CPU encoding.")
 @click.option("--resolve", is_flag=True, default=False, help="Also push the FCPXML into DaVinci Resolve.")
+@click.option("--preset", default=None, help="Deliver canvas + frame rate from a preset (see list-presets).")
+@click.option("--canvas", default=None, help="Deliver canvas as WxH, e.g. 1080x1920 (even sizes).")
+@click.option("--fps", default=None, help="Deliver frame rate: 23.976, 24, 25, 29.97, 30, 50, 59.94, 60, 119.88 or 30000/1001.")
+@click.option(
+    "--fit",
+    type=click.Choice(["auto", "fit", "fill", "stretch"], case_sensitive=False),
+    default=None,
+    help="How footage fills a canvas of another aspect ratio.",
+)
+@click.option(
+    "--color",
+    type=click.Choice(["rec709", "rec2020_hlg", "rec2020_pq", "passthrough"], case_sensitive=False),
+    default=None,
+    help="Colour space of the master and NLE timeline.",
+)
+@click.option(
+    "--master",
+    type=click.Choice(["hevc", "h264", "prores_422", "prores_hq", "dnxhr_hqx"], case_sensitive=False),
+    default=None,
+    help="Master codec (ProRes / DNxHR write .mov).",
+)
+@click.option(
+    "--subtitles",
+    type=click.Choice(["none", "srt", "ass", "burn"], case_sensitive=False),
+    default=None,
+    help="Subtitle sidecars / burn-in (needs a transcript).",
+)
+@click.option("--audio-rate", type=click.Choice(["44100", "48000", "96000"]), default=None, help="Master audio sample rate.")
+@click.option("--audio-channels", type=click.Choice(["1", "2"]), default=None, help="Master audio channels.")
+@click.option("--variants", default=None, help="Timelines to deliver: 'active', 'all' or a comma list of keys (one subfolder each).")
+@click.option("--no-relink", is_flag=True, default=False, help="Link NLE files to the render proxies instead of the original media.")
+@click.option(
+    "--watermark-in-nle/--no-watermark-in-nle",
+    default=None,
+    help="Request the watermark in NLE files (not implemented yet; recorded in the manifest).",
+)
 def deliver_cmd(
     project_path: Path,
     variant: str | None,
@@ -567,9 +603,26 @@ def deliver_cmd(
     preview: bool,
     no_nvenc: bool,
     resolve: bool,
+    preset: str | None,
+    canvas: str | None,
+    fps: str | None,
+    fit: str | None,
+    color: str | None,
+    master: str | None,
+    subtitles: str | None,
+    audio_rate: str | None,
+    audio_channels: str | None,
+    variants: str | None,
+    no_relink: bool,
+    watermark_in_nle: bool | None,
 ) -> None:
-    """Export / render a saved timeline (no re-analysis)."""
-    from src.core.types import ALL_DELIVER_FORMATS
+    """Export / render a saved timeline (no re-analysis).
+
+    Deliver settings default to the ones saved in the project (or the timeline's own canvas and
+    frame rate); every option above overrides one of them for this export only.
+    """
+    from src.core.deliver_options import build_deliver_settings
+    from src.core.types import ALL_DELIVER_FORMATS, DeliverSettings
     from src.ui.controllers.project_manager import ProjectManager, load_project_file
 
     data = load_project_file(project_path)
@@ -583,9 +636,30 @@ def deliver_cmd(
     wanted = {f.strip().lower() for f in formats.split(",") if f.strip()}
     bad = wanted - set(ALL_DELIVER_FORMATS)
     if bad:
-        raise click.ClickException(f"Unknown format(s): {', '.join(sorted(bad))}")
+        raise click.BadParameter(f"Unknown format(s): {', '.join(sorted(bad))}", param_hint="--format")
 
     cfg = ProjectManager().deserialize_pipeline_config(data.config) if data.config else PipelineConfig()
+    base = data.get_deliver_settings() or DeliverSettings.from_timeline(timelines[key], cfg)
+    try:
+        settings = build_deliver_settings(
+            base,
+            preset=preset,
+            canvas=canvas,
+            fps=fps,
+            fit=fit,
+            color=color,
+            master=master,
+            subtitles=subtitles,
+            audio_rate=int(audio_rate) if audio_rate else None,
+            audio_channels=int(audio_channels) if audio_channels else None,
+            variants=variants,
+            relink=False if no_relink else None,
+            watermark_in_nle=watermark_in_nle,
+        )
+        keys = StudioBackendAdapter.resolve_variant_keys(key, settings, timelines)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
     out_dir = output_dir or Path(data.output_dir or project_path.parent)
     adapter = StudioBackendAdapter()
     handle = adapter.submit_deliver_job(
@@ -596,21 +670,41 @@ def deliver_cmd(
         force_cpu=no_nvenc,
         preview=preview,
         resolve=resolve,
-        base_name=f"{project_path.stem}_{key}",
+        # One variant keeps the historic "<project>_<key>" file names; several go to <key>/ subfolders.
+        base_name=f"{project_path.stem}_{key}" if len(keys) == 1 or preview else project_path.stem,
+        settings=settings,
+        variant_timelines=timelines,
     )
     res = handle.result
     if not res or not res.success:
         raise click.ClickException(res.error_message if res else "Deliver failed.")
-    click.echo(f"Delivered '{key}' ({res.duration:.2f}s)")
-    for label, path in (
-        ("Master MP4", res.render_path),
-        ("FCPXML", res.fcpxml_path),
-        ("Premiere XML", res.premiere_xml_path),
-        ("OTIO", res.otio_path),
-        ("CapCut Draft", res.capcut_draft_path),
-    ):
-        if path:
-            click.echo(f"{label:<13}: {path}")
+    _print_deliver_summary(res, key if len(keys) == 1 else ", ".join(keys), settings, preview)
+
+
+def _print_deliver_summary(res, label: str, settings, preview: bool) -> None:
+    """Echo the produced files, naming the master's codec."""
+    click.echo(f"Delivered '{label}' ({res.duration:.2f}s)")
+    if not preview:
+        click.echo(
+            f"Deliver settings : {settings.canvas_width}x{settings.canvas_height} @ {settings.fps:g}fps, "
+            f"colour {settings.color}, audio {settings.audio_rate}Hz/{settings.audio_channels}ch"
+        )
+    results = res.variant_results or {"": res}
+    for variant_key, sub in results.items():
+        prefix = f"[{variant_key}] " if variant_key else ""
+        master_label = f"Master ({sub.master_codec})" if sub.master_codec and not preview else "Master MP4"
+        for name, path in (
+            (master_label, sub.render_path),
+            ("FCPXML", sub.fcpxml_path),
+            ("Premiere XML", sub.premiere_xml_path),
+            ("OTIO", sub.otio_path),
+            ("CapCut Draft", sub.capcut_draft_path),
+            ("Manifest", sub.manifest_path),
+        ):
+            if path:
+                click.echo(f"{prefix}{name:<22}: {path}")
+        for sub_path in sub.subtitle_paths:
+            click.echo(f"{prefix}{'Subtitles':<22}: {sub_path}")
 
 
 if __name__ == "__main__":
