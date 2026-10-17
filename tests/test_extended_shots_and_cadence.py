@@ -504,3 +504,27 @@ def test_curve_time_budget_is_reasonable(long25: Path) -> None:
     t = time.perf_counter()
     assert compute_quality_curve(long25, 0.0, 25.0) is not None
     assert time.perf_counter() - t < 30.0
+
+
+@pytest.mark.parametrize(
+    "profile", [CadenceProfile.LINGERING_CINEMATIC, CadenceProfile.BALANCED_NARRATIVE]
+)
+@pytest.mark.parametrize("fps", [24.0, 29.97, 30.0])
+def test_teaser_length_follows_config_and_is_uneven(
+    profile: CadenceProfile, fps: float, tmp_path: Path
+) -> None:
+    config = cfg(fps, enable_teaser=True, teaser_duration=6.0)
+    tl = build(config, mixed_pool(tmp_path), profile)
+    flags = [c.is_teaser for c in tl.clips]
+    n = sum(flags)
+    assert flags == [True] * n + [False] * (len(flags) - n)  # teaser clips only at the start
+    assert 3 <= n <= 5
+    rate = frame_rate_fraction(fps)
+    lens = [float(Fraction(c.frames) / rate) for c in tl.clips[:n]]
+    total = sum(lens)
+    assert abs(total - 6.0) <= BAR + 1e-6 and total <= 0.25 * TRACK
+    assert len({c.frames for c in tl.clips[:n]}) > 1  # not all equal
+    beat = BAR / 4
+    for t in clip_times(tl, fps)[: n + 1]:
+        assert min(abs(t / beat - round(t / beat)) * beat, 1.0) <= 0.5 / float(rate) + 1e-6
+    assert all(x >= beat - 1.0 / fps for x in lens)

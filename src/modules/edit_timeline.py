@@ -398,6 +398,54 @@ def allocate_cadence_slots(
     return out
 
 
+def _teaser_cuts(
+    config: PipelineConfig,
+    bar_grid: MusicalBarGrid,
+    t0: float,
+    end: float,
+    num_scenes: int,
+) -> list[float] | None:
+    """Cut times ``[t0, ..., teaser_end]`` for the hook: 3-5 uneven clips of whole beats.
+
+    ``teaser_end`` is the half-bar point nearest ``teaser_duration`` (at most one bar beyond it and
+    within 25 % of the timeline); every inner cut sits on a beat. All times are frame snapped.
+    """
+    fps = config.fps
+    bar_len = _bar_length(bar_grid)
+    bpb = max(2, int(bar_grid.beats_per_bar))
+    beat = bar_len / bpb
+    bars = [b for b in bar_grid.bar_times if b >= 0.0]
+    if not bars or beat <= 0:
+        return None
+    beats = [b + k * beat for b in bars for k in range(bpb) if b + k * beat < end - _EPS]
+    half_bars = [b + k * bar_len / 2.0 for b in bars for k in range(2) if b + k * bar_len / 2.0 < end - _EPS]
+    target = t0 + config.teaser_duration
+    limit = min(target + bar_len, t0 + 0.25 * (end - t0))
+    ends = [h for h in half_bars if t0 + 3 * beat - 0.05 <= h <= limit + _EPS]
+    if not ends:
+        return None
+    teaser_end = min(ends, key=lambda h: (abs(h - target), h))
+    inner = [b for b in beats if t0 + _EPS < b <= teaser_end + 0.02]
+    n_beats = len(inner)
+    if n_beats < 3:
+        return None
+    n = min(5, max(3, num_scenes), n_beats)
+    lens = [n_beats // n + (1 if i < n_beats % n else 0) for i in range(n)]
+    for i in range(0, n - 1, 2):  # vary by a beat: e.g. 1,2,1,2,1
+        if lens[i] > 1 and lens[i] == lens[i + 1]:
+            lens[i] -= 1
+            lens[i + 1] += 1
+    cuts = [snap_to_frame(t0, fps)]
+    acc = 0
+    for length in lens:
+        acc += length
+        cuts.append(snap_to_frame(inner[acc - 1], fps))
+    cuts[-1] = snap_to_frame(teaser_end, fps)
+    if any(b - a <= _EPS for a, b in zip(cuts, cuts[1:], strict=False)):
+        return None
+    return cuts
+
+
 def _cadence_plan(
     config: PipelineConfig,
     bar_grid: MusicalBarGrid | None,
@@ -489,15 +537,20 @@ def build_edit_timeline(
     clips: list[EditClip] = []
     teaser_end = t0 + config.teaser_duration
     if plan is not None and has_teaser:
-        later = [c for c in base_cuts if c >= t0 + config.teaser_duration - _EPS]
-        if later and later[0] < base_cuts[-1] - _EPS:
-            teaser_end = later[0]  # keep the hook's end on the bar grid
-        else:
+        assert bar_grid is not None
+        t_cuts = _teaser_cuts(config, bar_grid, t0, cut_timestamps[-1], len(scored_scenes))
+        if t_cuts is None:
             has_teaser = False
+        else:
+            teaser_end = t_cuts[-1]
     if has_teaser:
         teaser_frames = frame_at(teaser_end)
-        num_teaser = min(5, max(3, len(scored_scenes)))
-        bounds = [round(teaser_frames * j / num_teaser) for j in range(num_teaser + 1)]
+        if plan is not None:
+            bounds = [frame_at(t) for t in t_cuts]  # whole-beat cuts on the grid
+            num_teaser = len(bounds) - 1
+        else:
+            num_teaser = min(5, max(3, len(scored_scenes)))
+            bounds = [round(teaser_frames * j / num_teaser) for j in range(num_teaser + 1)]
         for j in range(num_teaser):
             cand = scored_scenes[j % len(scored_scenes)]
             t_frames = bounds[j + 1] - bounds[j]
