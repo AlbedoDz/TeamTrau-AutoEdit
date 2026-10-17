@@ -6,10 +6,17 @@
 Why a separate process: Resolve's ``fusionscript`` only loads under the Python versions the
 installed Resolve was built for (Resolve Studio 21 needs 3.13 here, while the project venv is
 3.11). The dispatcher therefore falls back to running this file with a compatible interpreter.
+
+Phase 22 / step 4 note: the project/timeline settings, ``sourceClipsPath`` import option and the
+render format/codec selection below were written while Resolve was NOT running, so the setting
+KEY NAMES that are not part of the documented scripting README (drop-frame, "Mismatched
+resolution files", codec ids) are discovered at run time from ``GetSetting("")`` /
+``GetRenderCodecs`` and every miss is reported in ``result["warnings"]`` instead of failing.
 """
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -19,6 +26,34 @@ EXIT_NOT_CONNECTED = 4
 
 DEFAULT_SCRIPT_API = r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"
 DEFAULT_SCRIPT_LIB = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"
+
+# Project "Mismatched resolution files" (Image Scaling) values, by AutoEdit fit mode. "auto" maps
+# to fit because the exporter's adjust-transform scale is relative to the fit-conformed size.
+SCALING_PRESETS: dict[str, str] = {
+    "auto": "Scale entire image to fit",
+    "fit": "Scale entire image to fit",
+    "fill": "Scale full frame with crop",
+    "stretch": "Stretch frame to all corners",
+}
+# Setting-name candidates (tried after any key discovered via GetSetting("")).
+_SCALING_KEY_CANDIDATES = ("timelineInputResMismatchMode", "inputScalingPreset", "timelineInputResMismatch")
+_DROP_FRAME_KEY_CANDIDATES = ("timelineDropFrame", "timelineDropFrameTimecode")
+_SCALING_KEY_RE = re.compile(r"mismatch|inputscal", re.IGNORECASE)
+
+# master -> (render format id, acceptable codec names/ids). Aliases: mp4/h265, mov+prores.
+_HEVC = ("mp4", ("H265", "H.265", "HEVC"))
+_PRORES_HQ = ("mov", ("ProRes422HQ", "Apple ProRes 422 HQ"))
+MASTER_FORMATS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "hevc": _HEVC,
+    "h265": _HEVC,
+    "mp4": _HEVC,
+    "h264": ("mp4", ("H264", "H.264")),
+    "prores_422": ("mov", ("ProRes422", "Apple ProRes 422")),
+    "prores_hq": _PRORES_HQ,
+    "prores": _PRORES_HQ,
+    "mov+prores": _PRORES_HQ,
+    "dnxhr_hqx": ("mov", ("DNxHRHQX", "DNxHR HQX")),
+}
 
 
 def frame_rate_setting(fps: float) -> str:
@@ -31,15 +66,128 @@ def unique_project_name(existing: Any, name: str) -> str:
     return name if name not in names else f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
 
 
+def source_clips_path(media: list[str]) -> str | None:
+    """Folder Resolve should search for source clips: the media folder (or their common parent)."""
+    dirs = sorted({os.path.dirname(os.path.abspath(p)) for p in media})
+    if not dirs:
+        return None
+    if len(dirs) == 1:
+        return dirs[0]
+    try:
+        common = os.path.commonpath(dirs)
+    except ValueError:  # different drives
+        return dirs[0]
+    return common if os.path.dirname(common) != common else dirs[0]  # never a drive root
+
+
+def master_format_codec(master: str | None) -> tuple[str, tuple[str, ...]]:
+    """Render (format, codec candidates) for a master name; unknown names fall back to HEVC/mp4."""
+    return MASTER_FORMATS.get(str(master or "hevc").strip().lower(), _HEVC)
+
+
+def _norm(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def resolve_render_codec(proj: Any, fmt: str, candidates: tuple[str, ...]) -> str | None:
+    """Pick the codec id Resolve offers for ``fmt`` matching one of ``candidates``.
+
+    Without a usable ``GetRenderCodecs`` listing the first candidate is used as-is.
+    """
+    try:
+        codecs = proj.GetRenderCodecs(fmt)
+    except Exception:
+        codecs = None
+    if not isinstance(codecs, dict):
+        return candidates[0]
+    wanted = {_norm(c) for c in candidates}
+    for display, code in codecs.items():
+        if _norm(display) in wanted or _norm(code) in wanted:
+            return str(code)
+    return None
+
+
+def _all_settings(proj: Any) -> dict[str, Any]:
+    try:
+        data = proj.GetSetting("")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _set_first(proj: Any, keys: tuple[str, ...], value: str, known: dict[str, Any]) -> str | None:
+    """SetSetting on the first key Resolve accepts; returns the key used (None if none worked)."""
+    present = [k for k in keys if k in known] if known else []
+    for key in present or list(keys):
+        try:
+            if proj.SetSetting(key, value):
+                return key
+        except Exception:
+            continue
+    return None
+
+
+def apply_timeline_settings(proj: Any, payload: dict[str, Any], info: dict[str, Any]) -> None:
+    """Canvas, frame rate, drop-frame and image scaling for a freshly created project."""
+    warnings: list[str] = info.setdefault("warnings", [])
+    proj.SetSetting("timelineResolutionWidth", str(payload["width"]))
+    proj.SetSetting("timelineResolutionHeight", str(payload["height"]))
+    proj.SetSetting("timelineFrameRate", frame_rate_setting(payload["fps"]))
+    known = _all_settings(proj)
+    if _set_first(proj, _DROP_FRAME_KEY_CANDIDATES, "0", known) is None:
+        warnings.append("could not set timeline drop-frame (setting not exposed by this Resolve)")
+
+    fit_mode = str(payload.get("fit_mode") or "auto").lower()
+    scaling = SCALING_PRESETS.get(fit_mode)
+    if scaling is None:
+        warnings.append(f"unknown fit_mode {fit_mode!r}; image scaling left at the Resolve default")
+        return
+    discovered = tuple(k for k in known if _SCALING_KEY_RE.search(k))
+    key = _set_first(proj, discovered + _SCALING_KEY_CANDIDATES, scaling, known if discovered else {})
+    if key is None:
+        warnings.append("could not set 'Mismatched resolution files' (key not exposed by this Resolve)")
+    else:
+        info["image_scaling"] = {key: scaling}
+
+
+def configure_render(proj: Any, payload: dict[str, Any], name: str, render_dir: str, info: dict[str, Any]) -> None:
+    """Format/codec, frame rate and output location for the queued render."""
+    warnings: list[str] = info.setdefault("warnings", [])
+    fmt, candidates = master_format_codec(payload.get("master"))
+    codec = resolve_render_codec(proj, fmt, candidates)
+    if codec is None:
+        warnings.append(f"codec {candidates[0]!r} not offered for {fmt!r}; render keeps Resolve's default codec")
+    elif proj.SetCurrentRenderFormatAndCodec(fmt, codec):
+        info["render_format"], info["render_codec"] = fmt, codec
+    else:
+        warnings.append(f"SetCurrentRenderFormatAndCodec({fmt!r}, {codec!r}) was rejected")
+    proj.SetRenderSettings(
+        {
+            "SelectAllFrames": 1,
+            "TargetDir": render_dir,
+            "CustomName": f"{name}_master",
+            "FormatWidth": payload["width"],
+            "FormatHeight": payload["height"],
+            "FrameRate": float(frame_rate_setting(payload["fps"])),
+            "ExportVideo": True,
+            "ExportAudio": True,
+        }
+    )
+
+
 def run_dispatch(app: Any, payload: dict[str, Any]) -> dict[str, Any]:
     """Create a NEW Resolve project, import media + FCPXML, optionally queue a render.
 
     The currently open project is saved and left untouched (never reused or reconfigured).
+    Optional payload keys: ``fit_mode`` (auto|fit|fill|stretch), ``color``, ``master``.
     """
     info: dict[str, Any] = {
         "connected": True,
         "project_name": payload["project_name"],
         "canvas": f"{payload['width']}x{payload['height']}@{payload['fps']}fps",
+        "fit_mode": payload.get("fit_mode") or "auto",
+        "color": payload.get("color"),
+        "master": payload.get("master") or "hevc",
         "imported_timeline": False,
         "queued_render": False,
         "dry_run": False,
@@ -54,18 +202,20 @@ def run_dispatch(app: Any, payload: dict[str, Any]) -> dict[str, Any]:
         return info
     info["project_name"] = name
 
-    proj.SetSetting("timelineResolutionWidth", str(payload["width"]))
-    proj.SetSetting("timelineResolutionHeight", str(payload["height"]))
-    proj.SetSetting("timelineFrameRate", frame_rate_setting(payload["fps"]))
+    apply_timeline_settings(proj, payload, info)
 
     media_pool = proj.GetMediaPool()
     valid = [p for p in payload.get("media", []) if os.path.exists(p)]
     if valid:
         media_pool.ImportMedia(valid)
 
-    timeline = media_pool.ImportTimelineFromFile(
-        payload["fcpxml"], {"timelineName": name, "importSourceClips": True}
-    )
+    options: dict[str, Any] = {"timelineName": name, "importSourceClips": True}
+    clips_dir = source_clips_path(valid)
+    timeline = None
+    if clips_dir:
+        timeline = media_pool.ImportTimelineFromFile(payload["fcpxml"], {**options, "sourceClipsPath": clips_dir})
+    if not timeline:  # builds that reject sourceClipsPath: retry with the verified options
+        timeline = media_pool.ImportTimelineFromFile(payload["fcpxml"], options)
     if timeline:
         info["imported_timeline"] = True
         proj.SetCurrentTimeline(timeline)
@@ -73,15 +223,7 @@ def run_dispatch(app: Any, payload: dict[str, Any]) -> dict[str, Any]:
     render_dir = payload.get("render_dir")
     if render_dir and timeline:
         os.makedirs(render_dir, exist_ok=True)
-        proj.SetRenderSettings(
-            {
-                "SelectAllFrames": 1,
-                "TargetDir": render_dir,
-                "CustomName": f"{name}_master",
-                "FormatWidth": payload["width"],
-                "FormatHeight": payload["height"],
-            }
-        )
+        configure_render(proj, payload, name, render_dir, info)
         job_id = proj.AddRenderJob()
         if job_id:
             info["queued_render"] = True
