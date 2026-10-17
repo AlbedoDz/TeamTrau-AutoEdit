@@ -247,14 +247,18 @@ def timeline_to_fcpxml(
         if notes:
             ET.SubElement(clip_el, "note").text = "; ".join(notes)
         if abs(speed - 1.0) > 1e-6:
+            # Retimed clips live in a LOCAL timeline where media = local * speed (verified
+            # pixel-exact by importing into DaVinci Resolve Studio 21: Resolve takes the
+            # in-point as start * speed). So `start` is the in-point divided by the speed and
+            # timeMap is the pure linear map through the origin.
+            sp = Fraction(speed).limit_denominator(1000)
+            local_start = src_in / sp
+            clip_el.set("start", fmt_time(local_start))
             tm = ET.SubElement(clip_el, "timeMap")
-            ET.SubElement(tm, "timept", time="0s", value=fmt_time(src_in), interp="linear")
+            ET.SubElement(tm, "timept", time="0s", value="0s", interp="linear")
+            local_end = local_start + out_dur
             ET.SubElement(
-                tm,
-                "timept",
-                time=fmt_time(out_dur),
-                value=fmt_time(src_in + out_dur * Fraction(speed).limit_denominator(1000)),
-                interp="linear",
+                tm, "timept", time=fmt_time(local_end), value=fmt_time(local_end * sp), interp="linear"
             )
         if soundtrack is not None and camera_audio_db is not None:
             ET.SubElement(clip_el, "adjust-volume", amount=f"{camera_audio_db:g}dB")

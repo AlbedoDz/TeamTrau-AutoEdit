@@ -33,8 +33,9 @@ def test_resolve_dispatcher_offline_fallback():
     cfg = PipelineConfig()
     dispatcher = ResolveDispatcher(cfg)
 
-    # Force connection failure
+    # Force connection failure (in-process and worker fallback)
     dispatcher.connect = MagicMock(return_value=False)
+    dispatcher._dispatch_in_subprocess = MagicMock(return_value=None)
 
     res = dispatcher.dispatch_project(
         fcpxml_path=Path("timeline.fcpxml"),
@@ -58,7 +59,9 @@ def test_resolve_dispatcher_mock_api_execution(tmp_path):
     mock_media_pool = MagicMock()
 
     mock_app.GetProjectManager.return_value = mock_pm
-    mock_pm.GetCurrentProject.return_value = mock_proj
+    mock_pm.GetCurrentProject.return_value = MagicMock(name="user_open_project")
+    mock_pm.GetProjectListInCurrentFolder.return_value = ["Other"]
+    mock_pm.CreateProject.return_value = mock_proj
     mock_proj.GetMediaPool.return_value = mock_media_pool
     mock_proj.AddRenderJob.return_value = "Job_999"
 
@@ -84,3 +87,51 @@ def test_resolve_dispatcher_mock_api_execution(tmp_path):
     mock_proj.SetSetting.assert_any_call("timelineResolutionWidth", "3840")
     mock_proj.SetSetting.assert_any_call("timelineResolutionHeight", "2160")
     mock_proj.SetSetting.assert_any_call("timelineFrameRate", "60")
+
+    # The user's open project is saved, never reused: a NEW project is created instead.
+    mock_pm.SaveProject.assert_called_once()
+    mock_pm.CreateProject.assert_called_once_with("MockAutoEdit")
+    assert not mock_pm.GetCurrentProject.return_value.SetSetting.called
+
+
+def test_frame_rate_setting_keeps_ntsc_rates():
+    from src.dispatchers.resolve_worker import frame_rate_setting
+
+    assert frame_rate_setting(29.97) == "29.97"
+    assert frame_rate_setting(23.976) == "23.976"
+    assert frame_rate_setting(30.0) == "30"
+
+
+def test_unique_project_name_avoids_collision():
+    from src.dispatchers.resolve_worker import unique_project_name
+
+    assert unique_project_name(["A"], "B") == "B"
+    assert unique_project_name(["B"], "B").startswith("B_")
+
+
+def test_worker_fallback_skips_wrong_python_versions():
+    cfg = PipelineConfig()
+    d = ResolveDispatcher(cfg)
+    d.connect = MagicMock(return_value=False)
+    d._worker_interpreters = MagicMock(return_value=[["py", "-3.11"], ["py", "-3.13"]])  # type: ignore[method-assign]
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[:2])
+        out = (
+            'RESULT:{"fusion_import_failed": true, "error": "x"}'
+            if cmd[1] == "-3.11"
+            else 'RESULT:{"imported_timeline": true, "project_name": "P"}'
+        )
+        return MagicMock(stdout=out, returncode=0)
+
+    import src.dispatchers.resolve_dispatcher as mod
+
+    orig = mod.subprocess.run
+    mod.subprocess.run = fake_run  # type: ignore[assignment]
+    try:
+        res = d.dispatch_project(Path("t.fcpxml"), [], "P", dry_run=False)
+    finally:
+        mod.subprocess.run = orig  # type: ignore[assignment]
+    assert calls == [["py", "-3.11"], ["py", "-3.13"]]
+    assert res["imported_timeline"] is True and res["connected"] is True

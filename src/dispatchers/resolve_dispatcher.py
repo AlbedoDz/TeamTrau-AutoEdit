@@ -1,12 +1,16 @@
 """DaVinci Resolve Studio API automation dispatcher on Windows 11."""
 
+import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from src.core.config import PipelineConfig
+from src.dispatchers.resolve_worker import run_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -80,64 +84,73 @@ class ResolveDispatcher:
             result_info["queued_render"] = True
             return result_info
 
-        if not self.connect() or self._resolve_app is None:
-            msg = (
-                "DaVinci Resolve is not running or external scripting is disabled. "
-                "Enable in Resolve: Preferences -> System -> General -> External scripting using: Local"
-            )
-            logger.error(msg)
-            result_info["error"] = msg
-            return result_info
+        payload = {
+            "fcpxml": str(Path(fcpxml_path).resolve()),
+            "media": [str(Path(p).resolve()) for p in source_media_paths if Path(p).exists()],
+            "project_name": project_name,
+            "width": self.config.canvas_width,
+            "height": self.config.canvas_height,
+            "fps": self.config.fps,
+            "render_dir": str(render_output_dir.resolve()) if render_output_dir is not None else None,
+            "script_api": os.environ.get("RESOLVE_SCRIPT_API"),
+            "script_lib": os.environ.get("RESOLVE_SCRIPT_LIB"),
+        }
 
-        result_info["connected"] = True
-        pm = self._resolve_app.GetProjectManager()
-        proj = pm.GetCurrentProject()
-        if not proj:
-            proj = pm.CreateProject(project_name)
-        if not proj:
-            proj = pm.LoadProject(project_name)
+        # 1) In-process when fusionscript loads under this interpreter.
+        if self._resolve_app is not None or self.connect():
+            if self._resolve_app is not None:
+                return run_dispatch(self._resolve_app, payload)
 
-        if not proj:
-            result_info["error"] = f"Failed to create or load project '{project_name}'"
-            return result_info
+        # 2) Otherwise run the worker with a Python version Resolve supports.
+        worker_result = self._dispatch_in_subprocess(payload)
+        if worker_result is not None:
+            return {**result_info, **worker_result}
 
-        # Configure sequence canvas dimensions and framerate
-        proj.SetSetting("timelineResolutionWidth", str(self.config.canvas_width))
-        proj.SetSetting("timelineResolutionHeight", str(self.config.canvas_height))
-        proj.SetSetting("timelineFrameRate", str(int(round(self.config.fps))))
-
-        media_pool = proj.GetMediaPool()
-
-        # Import raw footage to Media Pool
-        valid_media = [str(p.resolve()) for p in source_media_paths if p.exists()]
-        if valid_media:
-            media_pool.ImportMedia(valid_media)
-
-        # Import FCPXML Timeline
-        imported_tl = media_pool.ImportTimelineFromFile(str(fcpxml_path.resolve()))
-        if imported_tl:
-            result_info["imported_timeline"] = True
-            logger.info("Imported timeline into Resolve Media Pool: %s", fcpxml_path.name)
-        else:
-            logger.warning("Resolve returned null when importing timeline: %s", fcpxml_path.name)
-
-        # Append to Render Queue if target directory is specified
-        if render_output_dir is not None:
-            render_output_dir.mkdir(parents=True, exist_ok=True)
-            export_name = f"{project_name}_master"
-            proj.SetRenderSettings(
-                {
-                    "SelectAllFrames": 1,
-                    "TargetDir": str(render_output_dir.resolve()),
-                    "CustomName": export_name,
-                    "FormatWidth": self.config.canvas_width,
-                    "FormatHeight": self.config.canvas_height,
-                }
-            )
-            job_id = proj.AddRenderJob()
-            if job_id:
-                result_info["queued_render"] = True
-                result_info["render_job_id"] = str(job_id)
-                logger.info("Appended job to Resolve Render Queue (Job ID: %s)", job_id)
-
+        msg = (
+            "DaVinci Resolve is not running or external scripting is disabled. "
+            "Enable in Resolve: Preferences -> System -> General -> External scripting using: Local "
+            "(Resolve's fusionscript may also need a different Python version: set AUTOEDIT_RESOLVE_PYTHON)."
+        )
+        logger.error(msg)
+        result_info["error"] = msg
         return result_info
+
+    @staticmethod
+    def _worker_interpreters() -> list[list[str]]:
+        """Interpreters to try for the Resolve worker: env override, then py launcher versions."""
+        cands: list[list[str]] = []
+        override = os.environ.get("AUTOEDIT_RESOLVE_PYTHON")
+        if override:
+            cands.append([override])
+        launcher = shutil.which("py")
+        if launcher:
+            cands += [[launcher, f"-3.{minor}"] for minor in (13, 12, 11, 10)]
+        cands.append([sys.executable])
+        return cands
+
+    def _dispatch_in_subprocess(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        worker = Path(__file__).with_name("resolve_worker.py")
+        for cmd in self._worker_interpreters():
+            try:
+                proc = subprocess.run(
+                    [*cmd, str(worker), json.dumps(payload)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=300,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.debug("Resolve worker %s failed to start: %s", cmd, exc)
+                continue
+            line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT:")), None)
+            if line is None:
+                continue
+            data = json.loads(line[len("RESULT:"):])
+            if data.get("fusion_import_failed"):
+                continue  # wrong Python version for this Resolve build; try the next one
+            if data.get("not_connected"):
+                return None
+            data.setdefault("connected", True)
+            return data
+        return None

@@ -69,15 +69,21 @@ def test_structure_and_spine_is_contiguous(tmp_path):
     assert items[0].get("ref") == assets[0].get("id")
 
 
-def test_speed_ramp_uses_timemap_with_source_consumed(tmp_path):
+def test_speed_ramp_uses_local_timeline_verified_on_resolve(tmp_path):
+    """Retimed clips: media = local * speed, start = in-point / speed (pixel-verified in Resolve 21)."""
     src = tmp_path / "media" / "a.mp4"
-    clips = [EditClip(src, 1.0, 30, 10.0, speed=3.0, label="fast")]
+    clips = [EditClip(src, 2.0, 30, 10.0, speed=2.0, label="fast")]
     root, _ = _build(tmp_path, clips)
     el = root.find("library/event/project/sequence/spine/asset-clip")
-    pts = el.findall("timeMap/timept")
     assert _t(el.get("duration")) == 1
-    assert (_t(pts[0].get("time")), _t(pts[0].get("value"))) == (0, 1)
-    assert (_t(pts[1].get("time")), _t(pts[1].get("value"))) == (1, 4)  # 1 s out consumes 3 s src
+    assert _t(el.get("start")) == 1  # in-point 2 s / speed 2
+    pts = el.findall("timeMap/timept")
+    assert (_t(pts[0].get("time")), _t(pts[0].get("value"))) == (0, 0)
+    local_end = _t(pts[1].get("time"))
+    assert local_end == 2  # local start 1 s + 1 s of output
+    assert _t(pts[1].get("value")) == local_end * 2  # slope == speed
+    # media time at the clip's first frame equals the requested in-point
+    assert _t(el.get("start")) * 2 == 2
 
 
 def test_music_is_connected_lane_and_camera_audio_ducked(tmp_path):

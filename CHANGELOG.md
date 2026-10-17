@@ -13,7 +13,8 @@ Itemized by commit. Summary for the unlisted range; Phase 17-19 below covers the
 ---
 
 ## Phase 17-20 (2026-10-17)
-- **FCPXML**: real FCPXML 1.8 for DaVinci Resolve (own writer; previously an FCP7 XML was written into a `.fcpxml` file).
+- **FCPXML**: real FCPXML 1.8 for DaVinci Resolve (own writer; previously an FCP7 XML was written into a `.fcpxml` file). Verified by importing into DaVinci Resolve Studio 21; speed ramps fixed after pixel comparison.
+- **Resolve dispatch**: imports into a new project (never your open one), keeps 29.97/23.976 rates, auto-uses a Python version Resolve supports.
 - **Edit/Deliver split**: analysis ends at "Timeline ready"; nothing is rendered or exported until the user asks (GUI Export button, `main.py deliver`, MCP `render_master`/`export_timeline` with `project_path`). Exports match the edited timeline exactly. New 540p preview render.
 - **Fixes**: unicode filenames, speed-ramp audio sync, clips without audio, native-quality music, rotated phone footage, NLE source ranges, beat alignment, failed-clip reporting.
 - **Speed**: ~2.3x faster cold, ~2.5x cached overall (analysis 33.6s -> 1.8s cached): shared keyframes, analysis cache, merged dead-air pass, GPU batching, concurrent stages.

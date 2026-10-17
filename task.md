@@ -258,4 +258,7 @@
 - [x] Phase 20: Real DaVinci Resolve FCPXML (`src/modules/fcpxml_exporter.py`)
   - [x] Own FCPXML 1.8 writer from the OTIO timeline (no adapter dependency): asset-clip spine, exact rational time, timeMap speed ramps, gaps, cross-dissolve, music as connected lane -1, camera-audio duck/mute, rough-cut markers, crop note, unicode file URLs.
   - [x] `.fcpxml` no longer contains FCP7 xmeml (Premiere export keeps FCP7 XML).
-  - [ ] Not yet verified by importing into a running DaVinci Resolve (only structure/timing unit tests).
+  - [x] Verified on real DaVinci Resolve Studio 21.0.4.5 (Python 3.13 API): 42-clip timeline imports with exact length (1139f = 37.967s), contiguous V1, camera audio on A1, music on A2, unicode media paths, cross-dissolve at the right frames, gaps; pixel-exact still comparison at 5 positions.
+  - [x] Found + fixed via Resolve: retimed clips need `start = in-point / speed` with a linear timeMap through the origin (Resolve takes in-point as start*speed); previously the in-point was lost / doubled.
+  - [x] `ResolveDispatcher`: always creates a NEW project (saves the open one, never reconfigures it), keeps NTSC frame rates (29.97, not 30), and falls back to `resolve_worker.py` under a compatible Python (3.13 worked here; 3.11/3.12 cannot load fusionscript; override with AUTOEDIT_RESOLVE_PYTHON).
+  - [ ] Not verified: camera-audio volume (-12 dB), markers, 9:16 crop (Resolve API does not expose them); FCP itself.
