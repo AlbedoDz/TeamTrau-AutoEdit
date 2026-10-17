@@ -60,12 +60,24 @@ class ResolveDispatcher:
         project_name: str = "AutoEdit_Project",
         render_output_dir: Path | None = None,
         dry_run: bool = False,
+        fit_mode: str = "auto",
+        color: str | None = None,
+        master: str = "hevc",
     ) -> dict[str, Any]:
-        """Initialize project, set canvas dimensions, import media & timeline, and append to render queue."""
+        """Initialize project, set canvas dimensions, import media & timeline, and append to render queue.
+
+        ``fit_mode`` (auto|fit|fill|stretch) selects Resolve's "Mismatched resolution files"
+        scaling; ``color`` (rec709|rec2020_hlg|rec2020_pq|passthrough) is passed through;
+        ``master`` (hevc|h264|prores_422|prores_hq|dnxhr_hqx, or mp4/h265/mov+prores) selects the
+        render format/codec when ``render_output_dir`` is given.
+        """
         result_info: dict[str, Any] = {
             "connected": False,
             "project_name": project_name,
             "canvas": f"{self.config.canvas_width}x{self.config.canvas_height}@{self.config.fps}fps",
+            "fit_mode": fit_mode,
+            "color": color,
+            "master": master,
             "imported_timeline": False,
             "queued_render": False,
             "dry_run": dry_run,
@@ -91,6 +103,9 @@ class ResolveDispatcher:
             "width": self.config.canvas_width,
             "height": self.config.canvas_height,
             "fps": self.config.fps,
+            "fit_mode": fit_mode,
+            "color": color,
+            "master": master,
             "render_dir": str(render_output_dir.resolve()) if render_output_dir is not None else None,
             "script_api": os.environ.get("RESOLVE_SCRIPT_API"),
             "script_lib": os.environ.get("RESOLVE_SCRIPT_LIB"),
