@@ -1,3 +1,17 @@
+## Commits 4b2de02..7ea75d2 (2026-10-17)
+Itemized by commit. Summary for the unlisted range; Phase 17-19 below covers the same work at feature level.
+
+- `4b2de02` **fix: real-footage robustness** for render, ingest, audio, NLE export. Adds `src/core/ffmpeg_utils.py`, real-footage integration tests (`tests/integration/`), robustness tests. Renderer rewritten (`nvenc_renderer.py`).
+- `e86c80d` **feat: split Edit and Deliver.** Analysis stops at "Timeline ready". New `src/modules/edit_timeline.py`, `src/core/project_io.py`. `main.py deliver` command. MCP `render_master` / `export_timeline` take `project_path`.
+- `51f824d` **perf(ingest):** single-pass dead-air detection, sequential motion sampling, metadata reuse. Adds `scripts/benchmark_pipeline.py`.
+- `d2dcbfd` **perf(render):** NVENC preset p5 default, optional NVDEC hwaccel with software fallback.
+- `ccce241` **feat(ui): Edit/Deliver workflow** in Desktop Studio. Main window, timeline view, export panel and dialog updated; undo commands; new GUI tests.
+- `b13cd2f` **perf(pipeline):** shared keyframe sweep (`keyframe_cache.py`), analysis disk cache (`analysis_cache.py`), GPU batching in visual scorer and reframer, concurrent audio/whisper stages.
+- `1ab4fa4` **test(pipeline):** concurrency tests for audio/whisper overlap and cancellation.
+- `7ea75d2` **Merge** `perf/pipeline-speed`.
+
+---
+
 ## Phase 17-19 (2026-10-17)
 - **Edit/Deliver split**: analysis ends at "Timeline ready"; nothing is rendered or exported until the user asks (GUI Export button, `main.py deliver`, MCP `render_master`/`export_timeline` with `project_path`). Exports match the edited timeline exactly. New 540p preview render.
 - **Fixes**: unicode filenames, speed-ramp audio sync, clips without audio, native-quality music, rotated phone footage, NLE source ranges, beat alignment, failed-clip reporting.
