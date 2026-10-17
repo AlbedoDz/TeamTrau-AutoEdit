@@ -1,7 +1,7 @@
 """Unit tests for AI Smart 9:16 Re-framing module and EMA jitter smoothing."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import cv2
 import numpy as np
@@ -158,51 +158,21 @@ def test_reframe_all_scenes_fallback_when_no_detections(synthetic_video_clip: Pa
 
 def test_nvenc_renderer_applies_crop_window_in_filter(tmp_path: Path):
     """Verify NvencRenderer inserts dynamic crop filter when crop_window is provided on vertical canvas."""
-    cfg = PipelineConfig(canvas_width=1080, canvas_height=1920, fps=30.0)
+    cfg = PipelineConfig(canvas_width=1080, canvas_height=1920, fps=30.0, reframing_mode="smart_crop")
     renderer = NvencRenderer(cfg)
 
     crop_win = CropWindow(x=200, y=0, width=608, height=1080, confidence=0.9, tracking_subject="person")
-    scene = SceneCut(Path("e:/footage/clip1.mp4"), 0.0, 2.0, 0, 60, 2.0)
     scored_scene = ScoredScene(
-        scene=scene,
+        scene=SceneCut(Path("e:/footage/clip1.mp4"), 0.0, 2.0, 0, 60, 2.0),
         sharpness_score=95.0,
         aesthetic_score=0.9,
         composite_score=0.92,
         crop_window=crop_win,
     )
-
-    cut_timestamps = [0.0, 2.0]
-    soundtrack = Path("e:/music/bgm.wav")
-    output_mp4 = tmp_path / "vertical_render.mp4"
-
-    mock_process = MagicMock()
-    mock_process.returncode = 0
-    mock_process.stdout = []
-    mock_process.stderr = []
-    captured_filter: list[str] = []
-
-    def fake_popen(cmd, **kwargs):
-        script_idx = cmd.index("-filter_complex_script") + 1
-        script_file = Path(cmd[script_idx])
-        if script_file.is_file():
-            captured_filter.append(script_file.read_text(encoding="utf-8"))
-        return mock_process
-
-    with patch("subprocess.Popen", side_effect=fake_popen):
-        output_mp4.touch()
-        res = renderer.render_sequence(
-            scored_scenes=[scored_scene],
-            cut_timestamps=cut_timestamps,
-            soundtrack_path=soundtrack,
-            output_file=output_mp4,
-        )
-
-        assert res.return_code == 0
-        assert len(captured_filter) == 1
-        filter_str = captured_filter[0]
-        # Must contain dynamic crop coordinates crop=608:1080:200:0
-        assert "crop=608:1080:200:0" in filter_str
-        assert "scale=1080:1920" in filter_str
+    seg = renderer.build_segments([scored_scene], [0.0, 2.0], include_teaser=False)[0]
+    filter_str = renderer.build_segment_filter(seg, renderer.canvas_size(), False, False)
+    assert "crop=608:1080:200:0" in filter_str
+    assert "scale=1080:1920" in filter_str
 
 
 def test_generate_backdrop_filter():
@@ -239,4 +209,3 @@ def test_reframe_scene_blur_backdrop_and_auto_hybrid(synthetic_video_clip: Path)
     # 3. SMART_CROP with no subjects: falls back to center crop
     cw_smart = reframer.reframe_scene(scene, layout_mode=LayoutMode.SMART_CROP)
     assert cw_smart.tracking_subject == "center"
-

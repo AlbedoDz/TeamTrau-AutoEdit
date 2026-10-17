@@ -3,11 +3,13 @@
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Final
 
 from pydantic import BaseModel, Field
 
+from src.core.ffmpeg_utils import run_tool
 from src.core.types import RenderPreset, WatermarkPosition, WorkflowMode
 
 # Predefined standard industry presets. Default is 1080p30.
@@ -136,21 +138,15 @@ def check_cuda_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
 def check_nvenc_available() -> bool:
-    """Verify if FFmpeg has hevc_nvenc hardware encoder available."""
+    """Verify if FFmpeg has hevc_nvenc hardware encoder available (probed once per process)."""
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         return False
     try:
-        res = subprocess.run(
-            [ffmpeg_bin, "-hide_banner", "-encoders"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        return "hevc_nvenc" in res.stdout
+        res = run_tool([ffmpeg_bin, "-hide_banner", "-encoders"], timeout=10)
+        return "hevc_nvenc" in (res.stdout or "")
     except (FileNotFoundError, subprocess.SubprocessError):
         return False
 
@@ -288,6 +284,9 @@ class PipelineConfig(BaseModel):
     nvenc_maxrate: str = Field(default="80M")
     nvenc_bufsize: str = Field(default="120M")
     nvenc_pix_fmt: str = Field(default="yuv420p")
+    cpu_encoder_preset: str = Field(default="medium")
+    render_workers: int = Field(default=2, ge=1, le=8)
+    camera_audio_mix_db: float = Field(default=-12.0)
 
     # Rough-Cut & Defect Pruning Constants
     enable_head_tail_trim: bool = Field(default=True)

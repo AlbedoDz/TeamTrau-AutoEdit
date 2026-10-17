@@ -1,12 +1,15 @@
 """OpenTimelineIO sequence synthesizer exporting FCPXML and Premiere XML."""
 
 import logging
+from functools import lru_cache
 from pathlib import Path
 
 import opentimelineio as otio
 from opentimelineio.opentime import RationalTime, TimeRange
 
 from src.core.config import PipelineConfig
+from src.core.ffmpeg_utils import ffprobe_json
+from src.core.ontology import natural_sort_key
 from src.core.types import (
     CleanedSegment,
     DefectType,
@@ -47,15 +50,30 @@ def select_scenes_for_cuts(
     pool_scenic = scenic if scenic else scored_scenes
     pool_dynamic = dynamic if dynamic else scored_scenes
 
-    idx_drop = 0
-    idx_scenic = 0
-    idx_dynamic = 0
-    idx_default = 0
+    cursors = {"drop": 0, "scenic": 0, "dynamic": 0, "default": 0}
+
+    def pick(pool: list[ScoredScene], key: str, slot_dur: float) -> ScoredScene:
+        """Round-robin through the pool, preferring a scene long enough to fill the slot.
+
+        A scene shorter than its beat slot would otherwise leave a hole that pushes every
+        later cut off the beat.
+        """
+        start = cursors[key]
+        n = len(pool)
+        for k in range(n):
+            cand = pool[(start + k) % n]
+            needed = slot_dur * max(0.1, float(cand.speed or 1.0))
+            if cand.scene.duration + 1e-6 >= needed:
+                cursors[key] = start + k + 1
+                return cand
+        cursors[key] = start + 1
+        return max(pool, key=lambda c: c.scene.duration / max(0.1, float(c.speed or 1.0)))
 
     selected: list[ScoredScene] = []
     for i in range(num_slots):
         slot_start = cut_timestamps[i]
         slot_end = cut_timestamps[i + 1]
+        slot_dur = slot_end - slot_start
         mid_t = (slot_start + slot_end) / 2.0
 
         if sections:
@@ -71,21 +89,80 @@ def select_scenes_for_cuts(
                 )
 
             if sec.section_type == SongSectionType.DROP or sec.is_climax:
-                candidate = pool_drop[idx_drop % len(pool_drop)]
-                idx_drop += 1
+                candidate = pick(pool_drop, "drop", slot_dur)
             elif sec.section_type in (SongSectionType.INTRO, SongSectionType.OUTRO):
-                candidate = pool_scenic[idx_scenic % len(pool_scenic)]
-                idx_scenic += 1
+                candidate = pick(pool_scenic, "scenic", slot_dur)
             else:
-                candidate = pool_dynamic[idx_dynamic % len(pool_dynamic)]
-                idx_dynamic += 1
+                candidate = pick(pool_dynamic, "dynamic", slot_dur)
         else:
-            candidate = scored_scenes[idx_default % len(scored_scenes)]
-            idx_default += 1
+            candidate = pick(scored_scenes, "default", slot_dur)
 
         selected.append(candidate)
 
     return selected
+
+
+def _media_reference(path: Path, fallback_duration: float, fps: float) -> otio.schema.ExternalReference:
+    """External reference whose available_range covers the WHOLE source file at its own rate.
+
+    NLEs treat a clip whose source_range falls outside available_range as offline/clamped,
+    so this must describe the real media, not the scene slice.
+    """
+    duration, rate = media_duration_and_rate(path)
+    if duration <= 0:
+        duration = fallback_duration
+    if rate <= 0:
+        rate = fps
+    return otio.schema.ExternalReference(
+        target_url=Path(path).resolve().as_uri(),
+        available_range=TimeRange(
+            start_time=RationalTime(0, rate),
+            duration=RationalTime(int(round(duration * rate)), rate),
+        ),
+    )
+
+
+def media_duration_and_rate(path: Path) -> tuple[float, float]:
+    """(duration_sec, video_fps) of a media file via cached ffprobe; zeros when unknown."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return 0.0, 0.0
+    return _probe_media_cached(str(p.resolve()), st.st_size, st.st_mtime_ns)
+
+
+@lru_cache(maxsize=1024)
+def _probe_media_cached(path_str: str, size: int, mtime_ns: int) -> tuple[float, float]:
+    data = ffprobe_json(Path(path_str))
+    if not data:
+        return 0.0, 0.0
+    rate = 0.0
+    duration = 0.0
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    for st in data.get("streams", []):
+        if st.get("codec_type") == "video":
+            r = str(st.get("avg_frame_rate") or st.get("r_frame_rate") or "0/1")
+            try:
+                n, d = (r.split("/", 1) + ["1"])[:2]
+                rate = float(n) / float(d) if float(d) else 0.0
+            except ValueError:
+                rate = 0.0
+            break
+    return duration, rate
+
+
+def _source_range(source_in: float, frames_out: int, timeline_fps: float, media_rate: float) -> TimeRange:
+    """Source range expressed at the media's own rate (23.976/29.97/59.94...)."""
+    rate = media_rate if media_rate > 0 else timeline_fps
+    dur_sec = frames_out / timeline_fps
+    return TimeRange(
+        start_time=RationalTime(round(source_in * rate), rate),
+        duration=RationalTime(max(1, round(dur_sec * rate)), rate),
+    )
 
 
 class TimelineBuilder:
@@ -131,24 +208,13 @@ class TimelineBuilder:
             for j in range(num_teaser):
                 candidate = scored_scenes[j % len(scored_scenes)]
                 sc = candidate.scene
-                clip_dur = min(sub_dur, max(1.0 / fps, sc.duration))
-                start_frame = int(round(sc.start_time * fps))
-                dur_frames = int(round(clip_dur * fps))
-
-                media_ref = otio.schema.ExternalReference(
-                    target_url=sc.clip_path.resolve().as_uri(),
-                    available_range=TimeRange(
-                        start_time=RationalTime(0, fps),
-                        duration=RationalTime(int(round(sc.duration * fps)), fps),
-                    ),
-                )
+                frames_out = max(1, int(round(min(sub_dur, max(1.0 / fps, sc.duration)) * fps)))
+                media_ref = _media_reference(sc.clip_path, sc.end_time, fps)
+                media_rate = media_ref.available_range.duration.rate
                 clip = otio.schema.Clip(
                     name=f"TEASER_{sc.clip_path.stem}_{j:02d}",
                     media_reference=media_ref,
-                    source_range=TimeRange(
-                        start_time=RationalTime(start_frame, fps),
-                        duration=RationalTime(dur_frames, fps),
-                    ),
+                    source_range=_source_range(sc.start_time, frames_out, fps, media_rate),
                 )
                 autoedit_meta: dict[str, object] = {"speed": candidate.speed}
                 if candidate.crop_window is not None:
@@ -179,32 +245,23 @@ class TimelineBuilder:
         for i in range(len(main_cuts) - 1):
             slot_start = main_cuts[i]
             slot_end = main_cuts[i + 1]
-            slot_duration = max(1.0 / fps, slot_end - slot_start)
 
             candidate = main_scenes[i]
             sc = candidate.scene
-            # Clip duration cannot exceed available source scene length
-            clip_dur = min(slot_duration, max(1.0 / fps, sc.duration))
+            # Frame-exact slot length; the clip fills what the source allows and any
+            # remainder becomes a Gap so later cuts stay on the beat.
+            slot_frames = int(round(slot_end * fps)) - int(round(slot_start * fps))
+            speed = max(0.1, float(candidate.speed or 1.0))
+            src_frames = int(round(sc.duration / speed * fps))
+            clip_frames = max(1, min(slot_frames, src_frames)) if slot_frames > 0 else 0
+            pad_frames = max(0, slot_frames - clip_frames)
 
-            # Non-destructive source range
-            start_frame = int(round(sc.start_time * fps))
-            dur_frames = int(round(clip_dur * fps))
-
-            media_ref = otio.schema.ExternalReference(
-                target_url=sc.clip_path.resolve().as_uri(),
-                available_range=TimeRange(
-                    start_time=RationalTime(0, fps),
-                    duration=RationalTime(int(round(sc.duration * fps)), fps),
-                ),
-            )
-
+            media_ref = _media_reference(sc.clip_path, sc.end_time, fps)
+            media_rate = media_ref.available_range.duration.rate
             clip = otio.schema.Clip(
                 name=f"{sc.clip_path.stem}_beat_{i:03d}",
                 media_reference=media_ref,
-                source_range=TimeRange(
-                    start_time=RationalTime(start_frame, fps),
-                    duration=RationalTime(dur_frames, fps),
-                ),
+                source_range=_source_range(sc.start_time, clip_frames, fps, media_rate),
             )
             autoedit_meta: dict[str, object] = {"speed": candidate.speed}
             if candidate.crop_window is not None:
@@ -260,6 +317,8 @@ class TimelineBuilder:
                     video_track.append(trans)
 
             video_track.append(clip)
+            if pad_frames > 0:
+                video_track.append(otio.schema.Gap(duration=RationalTime(pad_frames, fps)))
 
         # Total timeline duration
         total_timeline_sec = cut_timestamps[-1] - cut_timestamps[0]
@@ -319,7 +378,7 @@ class TimelineBuilder:
         # Enforce chronological ordering
         sorted_segments = sorted(
             cleaned_segments,
-            key=lambda s: (str(s.clip_path), s.start_time),
+            key=lambda s: (natural_sort_key(s.clip_path), s.source_start_time),
         )
 
         for i, seg in enumerate(sorted_segments):

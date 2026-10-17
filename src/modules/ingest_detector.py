@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -16,9 +17,29 @@ import cv2
 from scenedetect import AdaptiveDetector, SceneManager, open_video
 
 from src.core.config import PipelineConfig
+from src.core.ffmpeg_utils import ffprobe_json, run_tool, stream_rotation
 from src.core.types import ActiveSegment, SceneCut, VideoMetadata
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_rate(s: str) -> float:
+    """Parse an ffprobe rational like '30000/1001' into frames per second."""
+    try:
+        if "/" in s:
+            n, d = s.split("/", 1)
+            den = float(d)
+            return float(n) / den if den != 0.0 else 0.0
+        return float(s) if s else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _to_float(v: object) -> float:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class IngestDetector:
@@ -26,6 +47,7 @@ class IngestDetector:
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
+        self.failed_files: list[tuple[Path, str]] = []
 
     def probe_video(
         self,
@@ -33,69 +55,65 @@ class IngestDetector:
         camera_role: str | None = None,
         source_folder: Path | None = None,
     ) -> VideoMetadata:
-        """Extract frame dimensions, framerate, duration, and camera role from video file."""
+        """Extract display dimensions, framerate, duration, audio presence and camera role.
+
+        ffprobe is authoritative (display rotation, container duration, VFR flag, audio
+        stream); OpenCV is only a fallback when ffprobe is unavailable.
+        """
         if not video_path.is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise ValueError(f"Unable to open video stream via OpenCV: {video_path}")
+        width = height = total_frames = 0
+        fps = duration = 0.0
+        is_vfr = False
+        rotation = 0
+        has_audio = True
+        codec = "unknown"
 
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
+        data = ffprobe_json(video_path)
+        if data is not None:
+            streams = data.get("streams", []) or []
+            video_streams = [s for s in streams if s.get("codec_type", "video") == "video"]
+            if video_streams:
+                vs = video_streams[0]
+                r_fps = _parse_rate(vs.get("r_frame_rate", ""))
+                avg_fps = _parse_rate(vs.get("avg_frame_rate", ""))
+                if r_fps > 0 and avg_fps > 0 and abs(r_fps - avg_fps) > 0.05:
+                    is_vfr = True
+                fps = avg_fps or r_fps
+                width = int(vs.get("width") or 0)
+                height = int(vs.get("height") or 0)
+                rotation = stream_rotation(vs)
+                if rotation in (90, 270):
+                    width, height = height, width
+                codec = str(vs.get("codec_name") or codec)
+                duration = _to_float(vs.get("duration")) or _to_float(
+                    (data.get("format") or {}).get("duration")
+                )
+                total_frames = int(_to_float(vs.get("nb_frames")))
+            if any("codec_type" in s for s in streams):
+                has_audio = any(s.get("codec_type") == "audio" for s in streams)
+
+        if width <= 0 or height <= 0 or fps <= 0 or duration <= 0:
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                if width > 0 and fps > 0:
+                    cap = None
+                else:
+                    raise ValueError(f"Unable to open video stream: {video_path}")
+            if cap is not None:
+                width = width or int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = height or int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = fps if fps > 0 else float(cap.get(cv2.CAP_PROP_FPS))
+                total_frames = total_frames or int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
 
         if fps <= 0:
             fps = self.config.fps
-
-        duration = total_frames / fps if fps > 0 else 0.0
-
-        is_vfr = False
-        ffprobe_bin = shutil.which("ffprobe")
-        if ffprobe_bin:
-            try:
-                cmd = [
-                    ffprobe_bin,
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=r_frame_rate,avg_frame_rate",
-                    "-of",
-                    "json",
-                    str(video_path),
-                ]
-                res = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                    timeout=5.0,
-                )
-                if res.returncode == 0 and res.stdout:
-                    data = json.loads(res.stdout)
-                    streams = data.get("streams", [])
-                    if streams:
-                        r_fr_str = streams[0].get("r_frame_rate", "")
-                        avg_fr_str = streams[0].get("avg_frame_rate", "")
-
-                        def _parse_fps(s: str) -> float:
-                            if "/" in s:
-                                n, d = s.split("/", 1)
-                                den = float(d)
-                                return float(n) / den if den != 0.0 else 0.0
-                            return float(s) if s else 0.0
-
-                        r_fps = _parse_fps(r_fr_str)
-                        avg_fps = _parse_fps(avg_fr_str)
-                        if r_fps > 0 and avg_fps > 0 and abs(r_fps - avg_fps) > 0.05:
-                            is_vfr = True
-            except Exception as exc:
-                logger.debug("ffprobe VFR probe failed for %s: %s", video_path, exc)
+        if duration <= 0:
+            duration = total_frames / fps if fps > 0 else 0.0
+        if total_frames <= 0:
+            total_frames = int(round(duration * fps))
 
         from src.core.ontology import infer_camera_role
 
@@ -108,11 +126,19 @@ class IngestDetector:
             fps=fps,
             duration=duration,
             total_frames=total_frames,
-            codec="raw",
+            codec=codec,
             camera_role=inferred_role,
             source_folder=source_folder or video_path.parent,
             is_vfr=is_vfr,
+            rotation=rotation,
+            has_audio=has_audio,
         )
+
+    def _cfr_cache_path(self, video_path: Path, target_fps: float) -> Path:
+        st = video_path.stat()
+        key = f"{video_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{target_fps}"
+        h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        return Path(self.config.cache_dir) / "cfr" / f"{video_path.stem}_{h}_cfr{int(round(target_fps))}.mkv"
 
     def normalize_to_cfr(
         self,
@@ -122,7 +148,9 @@ class IngestDetector:
     ) -> Path:
         """Execute fast FFmpeg pass to convert VFR footage to Constant Frame Rate (CFR).
 
-        Uses fast encoding: -c:v libx264 -preset ultrafast -crf 17 -vsync cfr -r {target_fps} -c:a copy.
+        Uses fast encoding: -c:v libx264 -preset ultrafast -crf 17 -vsync cfr -r {target_fps}.
+        Output is cached under ``config.cache_dir/cfr`` keyed by path+size+mtime and written
+        atomically (temp file then rename) so interrupted runs never poison the cache.
         """
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
@@ -133,15 +161,14 @@ class IngestDetector:
             return video_path
 
         if output_path is None:
-            cache_dir = Path(".cache/cfr_normalized")
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            output_path = cache_dir / f"{video_path.stem}_cfr_{int(target_fps)}fps{video_path.suffix}"
+            output_path = self._cfr_cache_path(video_path, target_fps)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists() and output_path.stat().st_size > 0:
             logger.info("Reusing existing CFR normalized video: %s", output_path)
             return output_path
 
+        tmp_path = output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
         logger.info(
             "Normalizing VFR video %s to CFR (target %s fps) -> %s",
             video_path.name,
@@ -152,8 +179,13 @@ class IngestDetector:
             ffmpeg_bin,
             "-y",
             "-hide_banner",
+            "-nostdin",
             "-i",
             str(video_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
             "-c:v",
             "libx264",
             "-preset",
@@ -165,23 +197,20 @@ class IngestDetector:
             "-r",
             str(target_fps),
             "-c:a",
-            "copy",
-            str(output_path),
+            "aac",
+            "-b:a",
+            "256k",
+            str(tmp_path),
         ]
-        res = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if res.returncode != 0:
-            logger.error(
-                "FFmpeg CFR normalization failed for %s: %s",
-                video_path,
-                res.stderr,
-            )
-            raise RuntimeError(f"CFR normalization failed: {res.stderr}")
+        try:
+            res = run_tool(cmd)
+            if res.returncode != 0:
+                logger.error("FFmpeg CFR normalization failed for %s: %s", video_path, res.stderr)
+                raise RuntimeError(f"CFR normalization failed: {(res.stderr or '')[-800:]}")
+            if tmp_path.exists():
+                os.replace(tmp_path, output_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         return output_path
 
     def detect_scenes(self, video_path: Path) -> list[SceneCut]:
@@ -246,8 +275,10 @@ class IngestDetector:
         cmd = [
             ffmpeg_bin,
             "-hide_banner",
+            "-nostdin",
             "-i",
             str(video_path),
+            "-vn",
             "-af",
             f"silencedetect=noise={self.config.silence_threshold_db}dB:d={self.config.dead_air_min_duration}",
             "-f",
@@ -255,15 +286,13 @@ class IngestDetector:
             "-",
         ]
         try:
-            res = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=60
-            )
+            res = run_tool(cmd)
         except (subprocess.SubprocessError, OSError):
             return []
 
         ranges: list[tuple[float, float]] = []
         current_start: float | None = None
-        for line in res.stderr.splitlines():
+        for line in (res.stderr or "").splitlines():
             if "silence_start:" in line:
                 try:
                     current_start = float(line.split("silence_start:")[1].strip().split()[0])
@@ -289,22 +318,21 @@ class IngestDetector:
             "-hide_banner",
             "-i",
             str(video_path),
+            "-an",
             "-vf",
-            f"freezedetect=n={self.config.freeze_threshold}:d={self.config.dead_air_min_duration}",
+            f"scale=320:-2,freezedetect=n={self.config.freeze_threshold}:d={self.config.dead_air_min_duration}",
             "-f",
             "null",
             "-",
         ]
         try:
-            res = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False, timeout=60
-            )
+            res = run_tool(cmd)
         except (subprocess.SubprocessError, OSError):
             return []
 
         ranges: list[tuple[float, float]] = []
         current_start: float | None = None
-        for line in res.stderr.splitlines():
+        for line in (res.stderr or "").splitlines():
             if "freeze_start:" in line:
                 try:
                     current_start = float(line.split("freeze_start:")[1].strip().split()[0])
@@ -375,14 +403,7 @@ class IngestDetector:
                 self.config.auto_editor_margin,
                 "--no-color",
             ]
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-                timeout=60,
-            )
+            res = run_tool(cmd, timeout=600)
 
             if res.returncode == 0 and tmp_json.is_file() and tmp_json.stat().st_size > 0:
                 with tmp_json.open("r", encoding="utf-8") as f:
@@ -733,7 +754,9 @@ class IngestDetector:
         completed_count = 0
         total_videos = len(video_paths)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        self.failed_files = []
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             future_to_path = {
                 executor.submit(self.process_single_video, vp, cancel_event): vp
                 for vp in video_paths
@@ -745,17 +768,24 @@ class IngestDetector:
                     cuts = future.result()
                     video_results[vp] = cuts
                     logger.info("Completed %s: %d scenes", vp.name, len(cuts))
+                except InterruptedError:
+                    raise
                 except Exception as exc:
                     logger.error("Processing failed for %s: %s", vp.name, exc)
+                    self.failed_files.append((vp, str(exc)))
                     video_results[vp] = []
+
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("Batch ingestion cancelled by user.")
 
                 if progress_callback:
                     pct = (completed_count / total_videos) * 100.0
                     progress_callback(pct, f"Processed {vp.name} ({completed_count}/{total_videos})")
-
-                if cancel_event and cancel_event.is_set():
-                    logger.info("Batch ingestion cancelled by user.")
-                    break
+        except BaseException:
+            # Don't wait for queued PySceneDetect jobs on cancel/failure.
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        executor.shutdown(wait=True)
 
         # Assemble in original file order
         for vp in video_paths:

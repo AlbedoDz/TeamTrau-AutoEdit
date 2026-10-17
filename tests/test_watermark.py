@@ -2,7 +2,6 @@
 
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -51,8 +50,8 @@ def test_build_watermark_filter_lines():
 
 
 def test_nvenc_renderer_watermark_integration(tmp_path: Path):
-    """Verify NvencRenderer includes watermark input and overlay filter lines when enabled."""
-    wm_img = tmp_path / "brand_logo.png"
+    """Verify the watermark image is looped as an input and overlaid in each segment."""
+    wm_img = tmp_path / "logo.png"
     wm_img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
 
     cfg = PipelineConfig(
@@ -65,62 +64,19 @@ def test_nvenc_renderer_watermark_integration(tmp_path: Path):
         watermark_margin=50,
     )
     renderer = NvencRenderer(cfg)
-
-    fake_video = tmp_path / "scene.mp4"
-    fake_video.write_bytes(b"\x00" * 100)
-    fake_audio = tmp_path / "track.wav"
-    fake_audio.write_bytes(b"\x00" * 100)
-
     scene = ScoredScene(
-        scene=SceneCut(
-            clip_path=fake_video,
-            start_time=0.0,
-            end_time=5.0,
-            start_frame=0,
-            end_frame=150,
-            duration=5.0,
-        ),
+        scene=SceneCut(tmp_path / "scene.mp4", 0.0, 5.0, 0, 150, 5.0),
         sharpness_score=0.8,
         aesthetic_score=0.8,
         composite_score=0.8,
     )
+    seg = renderer.build_segments([scene], [0.0, 2.0])[0]
+    cmd = renderer.build_segment_command("ffmpeg", seg, tmp_path / "s.mkv", False, with_audio=False)
 
-    out_mp4 = tmp_path / "wm_rendered.mp4"
-    captured_filter: list[str] = []
-    captured_cmd: list[list[str]] = []
-
-    def mock_popen(cmd, *args, **kwargs):
-        captured_cmd.append(list(cmd))
-        script_idx = cmd.index("-filter_complex_script") + 1
-        script_path = Path(cmd[script_idx])
-        if script_path.exists():
-            captured_filter.append(script_path.read_text(encoding="utf-8"))
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        proc.returncode = 0
-        proc.stderr.readline.return_value = ""
-        out_mp4.write_bytes(b"MP4_DATA")
-        return proc
-
-    with patch("subprocess.Popen", side_effect=mock_popen):
-        renderer.render_sequence(
-            scored_scenes=[scene],
-            cut_timestamps=[0.0, 2.0],
-            soundtrack_path=fake_audio,
-            output_file=out_mp4,
-            include_teaser=False,
-            force_cpu=True,
-        )
-
-    # Check watermark was added as input
-    assert len(captured_cmd) == 1
-    cmd = captured_cmd[0]
     assert str(wm_img.resolve()) in cmd
-
-    # Check filter script has watermark overlay
-    assert len(captured_filter) == 1
-    content = captured_filter[0]
-    assert "[vconcat];" in content
+    assert cmd[cmd.index(str(wm_img.resolve())) - 3] == "-loop"
+    content = cmd[cmd.index("-filter_complex") + 1]
+    assert "[vbase]" in content
     assert "colorchannelmixer=aa=0.90" in content
     assert "overlay=x=W-w-50:y=H-h-50" in content
 

@@ -1,13 +1,16 @@
-"""Unit tests for headless NVENC video renderer and dynamic filter graph construction."""
+"""Unit tests for the segment-based NVENC renderer command and filter builders.
+
+Real end-to-end ffmpeg execution is covered in tests/integration/test_render_real.py.
+"""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.core.config import PipelineConfig
-from src.core.types import SceneCut, ScoredScene
-from src.dispatchers.nvenc_renderer import NvencRenderer
+from src.core.types import SceneCut, ScoredScene, SongSection, SongSectionType
+from src.dispatchers.nvenc_renderer import NvencRenderer, RenderSegment
 
 
 @pytest.fixture
@@ -30,8 +33,7 @@ def sample_scenes():
 
 def test_nvenc_renderer_validates_empty_inputs():
     """Verify ValueError is raised on empty scene or cut list."""
-    cfg = PipelineConfig()
-    renderer = NvencRenderer(cfg)
+    renderer = NvencRenderer(PipelineConfig())
 
     with pytest.raises(ValueError, match="No scenes provided"):
         renderer.render_sequence([], [0.0, 2.0], Path("bgm.wav"), Path("out.mp4"))
@@ -40,152 +42,87 @@ def test_nvenc_renderer_validates_empty_inputs():
         renderer.render_sequence([MagicMock()], [0.0], Path("bgm.wav"), Path("out.mp4"))
 
 
-def test_nvenc_renderer_command_construction(tmp_path, sample_scenes):
-    """Verify FFmpeg arguments, encoder flags, and filter_complex_script generation."""
-    cfg = PipelineConfig(
-        canvas_width=1920,
-        canvas_height=1080,
-        fps=30.0,
-        nvenc_preset="p7",
-        nvenc_cq=18,
-        nvenc_bitrate="60M",
+def test_segments_are_frame_exact(sample_scenes):
+    """Beat cuts are quantised to whole frames so long timelines never drift."""
+    cfg = PipelineConfig(fps=30.0, enable_teaser=False)
+    segs = NvencRenderer(cfg).build_segments(sample_scenes, [0.0, 0.517, 1.033, 3.0])
+    assert sum(s.frames for s in segs) == 90
+    assert [s.frames for s in segs] == [16, 15, 59]
+
+
+def test_nvenc_encoder_args_use_config():
+    cfg = PipelineConfig(nvenc_preset="p7", nvenc_cq=18, nvenc_bitrate="60M")
+    enc, args = NvencRenderer(cfg).encoder_args(use_nvenc=True)
+    assert enc == "hevc_nvenc"
+    assert args[args.index("-preset") + 1] == "p7"
+    assert args[args.index("-cq") + 1] == "18"
+    assert args[args.index("-b:v") + 1] == "60M"
+
+
+def test_cpu_fallback_encoder_is_libx265():
+    enc, args = NvencRenderer(PipelineConfig()).encoder_args(use_nvenc=False)
+    assert enc == "libx265"
+    assert "libx265" in args
+
+
+def test_preview_uses_fast_h264_at_540p():
+    cfg = PipelineConfig(canvas_width=1920, canvas_height=1080)
+    r = NvencRenderer(cfg)
+    assert r.canvas_size(preview=True) == (960, 540)
+    enc, _ = r.encoder_args(use_nvenc=True, preview=True)
+    assert enc == "h264_nvenc"
+
+
+def test_segment_command_fast_seeks_each_clip(sample_scenes):
+    """Each segment seeks its own input instead of trimming from frame 0."""
+    cfg = PipelineConfig(enable_teaser=False)
+    r = NvencRenderer(cfg)
+    seg = r.build_segments(sample_scenes, [0.0, 1.5, 3.0])[1]
+    cmd = r.build_segment_command("ffmpeg", seg, Path("seg.mkv"), True, with_audio=False)
+    assert cmd.index("-ss") < cmd.index("-i")
+    assert cmd[cmd.index("-ss") + 1] == f"{seg.source_in:.3f}"
+    assert "hevc_nvenc" in cmd
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert f"trim=end_frame={seg.frames}" in graph
+
+
+def test_teaser_adds_leading_segments(sample_scenes):
+    cfg = PipelineConfig(enable_teaser=True, teaser_duration=4.0, fps=30.0)
+    segs = NvencRenderer(cfg).build_segments(
+        sample_scenes, [0.0, 3.0, 6.0, 9.0, 12.0, 15.0], include_teaser=True
     )
-    renderer = NvencRenderer(cfg)
-    renderer.nvenc_available = True
-
-    cut_timestamps = [0.0, 1.5, 3.0]
-    soundtrack = Path("e:/music/bgm.wav")
-    output_mp4 = tmp_path / "master.mp4"
-
-    mock_process = MagicMock()
-    mock_process.returncode = 0
-    mock_process.stdout = []
-    mock_process.stderr = []
-
-    with patch("subprocess.Popen", return_value=mock_process) as mock_run:
-        # Create dummy file to simulate output
-        output_mp4.touch()
-        res = renderer.render_sequence(
-            scored_scenes=sample_scenes,
-            cut_timestamps=cut_timestamps,
-            soundtrack_path=soundtrack,
-            output_file=output_mp4,
-        )
-
-        assert res.encoder_used == "hevc_nvenc"
-        assert res.return_code == 0
-
-        # Inspect executed command
-        called_cmd = mock_run.call_args[0][0]
-        assert "-filter_complex_script" in called_cmd
-        assert "hevc_nvenc" in called_cmd
-        assert "-preset" in called_cmd
-        assert "p7" in called_cmd
-        assert "-cq" in called_cmd
-        assert "18" in called_cmd
-        assert "-b:v" in called_cmd
-        assert "60M" in called_cmd
+    assert sum(s.frames for s in segs) == 450
+    assert len(segs) >= 3 + 4
 
 
-def test_nvenc_renderer_fallback_to_libx265(tmp_path, sample_scenes):
-    """Verify automatic fallback to libx265 when NVENC is unavailable or errors."""
-    cfg = PipelineConfig()
-    renderer = NvencRenderer(cfg)
-    renderer.nvenc_available = False  # Simulating hardware unavailable
-
-    cut_timestamps = [0.0, 1.5, 3.0]
-    soundtrack = Path("e:/music/bgm.wav")
-    output_mp4 = tmp_path / "master_cpu.mp4"
-
-    mock_process = MagicMock()
-    mock_process.returncode = 0
-    mock_process.stdout = []
-    mock_process.stderr = []
-
-    with patch("subprocess.Popen", return_value=mock_process) as mock_run:
-        output_mp4.touch()
-        res = renderer.render_sequence(
-            scored_scenes=sample_scenes,
-            cut_timestamps=cut_timestamps,
-            soundtrack_path=soundtrack,
-            output_file=output_mp4,
-        )
-
-        assert res.encoder_used == "libx265"
-        called_cmd = mock_run.call_args[0][0]
-        assert "libx265" in called_cmd
-
-
-def test_nvenc_renderer_with_teaser(tmp_path, sample_scenes):
-    """Verify teaser clips are included in the filter complex script when teaser is enabled."""
-    cfg = PipelineConfig(enable_teaser=True, teaser_duration=4.0)
-    renderer = NvencRenderer(cfg)
-
-    # 15s timeline, long enough for teaser
-    cut_timestamps = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0]
-    soundtrack = Path("e:/music/bgm.wav")
-    output_mp4 = tmp_path / "teaser_master.mp4"
-
-    mock_process = MagicMock()
-    mock_process.returncode = 0
-    mock_process.stdout = []
-    mock_process.stderr = []
-
-    captured_content: list[str] = []
-
-    def fake_popen(cmd, **kwargs):
-        script_idx = cmd.index("-filter_complex_script") + 1
-        script_file = Path(cmd[script_idx])
-        if script_file.is_file():
-            captured_content.append(script_file.read_text(encoding="utf-8"))
-        return mock_process
-
-    with patch("subprocess.Popen", side_effect=fake_popen):
-        output_mp4.touch()
-        res = renderer.render_sequence(
-            scored_scenes=sample_scenes,
-            cut_timestamps=cut_timestamps,
-            soundtrack_path=soundtrack,
-            output_file=output_mp4,
-            include_teaser=True,
-        )
-
-        assert res.return_code == 0
-        assert len(captured_content) == 1
-        # Should have concat with multiple clips (teaser + main cuts)
-        assert "concat=n=" in captured_content[0]
-
-
-def test_nvenc_renderer_with_sections(tmp_path, sample_scenes):
-    """Verify render_sequence properly utilizes sections for structural alignment."""
-    from src.core.types import SongSection, SongSectionType
-
-    cfg = PipelineConfig()
-    renderer = NvencRenderer(cfg)
-
-    cut_timestamps = [0.0, 2.0, 4.0]
-    soundtrack = Path("e:/music/bgm.wav")
-    output_mp4 = tmp_path / "structured_master.mp4"
+def test_sections_drive_scene_selection(sample_scenes):
+    cfg = PipelineConfig(enable_teaser=False)
     sections = [
         SongSection(SongSectionType.INTRO, 0.0, 2.0, 2.0, 0.2, is_climax=False),
         SongSection(SongSectionType.DROP, 2.0, 4.0, 2.0, 0.9, is_climax=True),
     ]
+    segs = NvencRenderer(cfg).build_segments(sample_scenes, [0.0, 2.0, 4.0], sections=sections)
+    assert len(segs) == 2
 
-    mock_process = MagicMock()
-    mock_process.returncode = 0
-    mock_process.stdout = []
-    mock_process.stderr = []
 
-    with patch("subprocess.Popen", return_value=mock_process):
-        output_mp4.touch()
-        res = renderer.render_sequence(
-            scored_scenes=sample_scenes,
-            cut_timestamps=cut_timestamps,
-            soundtrack_path=soundtrack,
-            output_file=output_mp4,
-            sections=sections,
-        )
+def test_audio_filter_speed_ramp_and_silent_sources():
+    cfg = PipelineConfig(fps=30.0)
+    r = NvencRenderer(cfg)
+    seg = RenderSegment(Path("a.mp4"), 0.0, frames=30, available=5.0, speed=3.0)
+    graph = r.build_segment_filter(seg, (320, 180), with_audio=True, source_has_audio=True)
+    assert "setpts=(PTS-STARTPTS)/3.0000" in graph
+    assert "atempo=2.000000,atempo=1.500000" in graph
+    assert "aresample=48000" in graph
+    silent = r.build_segment_filter(seg, (320, 180), with_audio=True, source_has_audio=False)
+    assert "anullsrc=r=48000:cl=stereo" in silent
 
-        assert res.return_code == 0
-        assert res.output_path == output_mp4
 
+def test_concat_command_mixes_soundtrack_and_copies_video():
+    r = NvencRenderer(PipelineConfig(workflow_mode="standard"))
+    cmd = r.build_concat_command(
+        "ffmpeg", Path("list.txt"), Path("out.mp4.part"), 10.0, True, Path("music.wav")
+    )
+    assert cmd[cmd.index("-c:v") + 1] == "copy"
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "amix=inputs=2" in graph
+    assert cmd[cmd.index("-f", cmd.index("-t")) + 1] == "mp4"

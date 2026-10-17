@@ -20,6 +20,8 @@ class VideoMetadata:
     camera_role: str = "cam_a"
     source_folder: Path | None = None
     is_vfr: bool = False
+    rotation: int = 0
+    has_audio: bool = True
 
     @property
     def aspect_ratio(self) -> float:
@@ -334,4 +336,5 @@ class PipelineExecutionResult:
     scored_scenes: list[ScoredScene] = field(default_factory=list)
     timeline_variants: dict[str, TimelineVariant] = field(default_factory=dict)
     active_variant_name: str | None = None
+    failed_files: list[tuple[Path, str]] = field(default_factory=list)
 

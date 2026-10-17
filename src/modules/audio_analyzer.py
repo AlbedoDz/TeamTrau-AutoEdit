@@ -1,6 +1,10 @@
 """Audio rhythm, downbeat, onset tracking, and structural energy-sync module using Librosa."""
 
+import hashlib
 import logging
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -9,6 +13,7 @@ import numpy as np
 import soundfile as sf
 
 from src.core.config import PipelineConfig
+from src.core.ffmpeg_utils import run_tool
 from src.core.types import BeatMarker, SongSection, SongSectionType
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,7 @@ class AudioAnalyzer:
         """Safely load audio waveform via librosa or soundfile fallback."""
         if not audio_path.is_file():
             raise FileNotFoundError(f"Soundtrack file not found: {audio_path}")
+        audio_path = self._decode_to_analysis_wav(audio_path)
         try:
             y, sr = librosa.load(str(audio_path), sr=self.config.audio_sample_rate, mono=True)
         except Exception:
@@ -50,6 +56,77 @@ class AudioAnalyzer:
                 y = data
                 sr = sr_sf
         return y, sr
+
+    def _decode_to_analysis_wav(self, audio_path: Path) -> Path:
+        """Decode compressed audio (mp3/m4a/aac...) once with ffmpeg into a cached analysis WAV.
+
+        Avoids librosa's slow, deprecated audioread fallback for formats libsndfile can't read.
+        """
+        if audio_path.suffix.lower() in (".wav", ".flac", ".ogg", ".aiff", ".aif"):
+            return audio_path
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return audio_path
+        st = audio_path.stat()
+        key = f"{audio_path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{self.config.audio_sample_rate}"
+        h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        out = Path(self.config.cache_dir) / "analysis_audio" / f"{audio_path.stem}_{h}.wav"
+        if out.is_file() and out.stat().st_size > 0:
+            return out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.stem + ".part.wav")
+        cmd = [
+            ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", str(audio_path), "-vn", "-ac", "1", "-ar", str(self.config.audio_sample_rate),
+            "-c:a", "pcm_s16le", str(tmp),
+        ]
+        try:
+            res = run_tool(cmd, timeout=600)
+            if res.returncode == 0 and tmp.is_file():
+                os.replace(tmp, out)
+                return out
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.debug("ffmpeg analysis decode failed for %s: %s", audio_path, exc)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return audio_path
+
+    @staticmethod
+    def _cut_native_section(
+        src: Path, dst: Path, start: float, duration: float, fade_in: float, fade_out: float
+    ) -> bool:
+        """Cut [start, start+duration) from the source at native rate/channels with fades."""
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            return False
+        filters = []
+        if fade_in > 0:
+            filters.append(f"afade=t=in:st=0:d={fade_in:.3f}:curve=hsin")
+        if fade_out > 0:
+            filters.append(
+                f"afade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}:curve=hsin"
+            )
+        tmp = dst.with_name(dst.stem + ".part.wav")
+        cmd = [
+            ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(src),
+            "-vn", "-map_metadata", "-1",
+        ]
+        if filters:
+            cmd += ["-af", ",".join(filters)]
+        cmd += ["-c:a", "pcm_s24le", str(tmp)]
+        try:
+            res = run_tool(cmd, timeout=600)
+            if res.returncode != 0 or not tmp.is_file():
+                logger.warning("Native soundtrack cut failed: %s", (res.stderr or "")[-300:])
+                return False
+            os.replace(tmp, dst)
+            return True
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.warning("Native soundtrack cut failed: %s", exc)
+            return False
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def compute_energy_profile(
         self, y: np.ndarray, sr: int, hop_length: int = 512
@@ -393,13 +470,18 @@ class AudioAnalyzer:
                 fade_in_curve = 0.5 * (1.0 - np.cos(np.linspace(0, np.pi, fade_in_samples)))
                 y_slice[:fade_in_samples] *= fade_in_curve.astype(y_slice.dtype)
 
-        # Save to disk
+        # Save to disk. Cut the ORIGINAL file with ffmpeg so the deliverable keeps the
+        # source sample rate and stereo image (y_slice is the mono 22 kHz analysis buffer).
         output_file = (
             self.config.cache_dir
-            / f"soundtrack_{audio_path.stem}_decoupled_{int(target_duration)}s.wav"
+            / f"soundtrack_{audio_path.stem}_{int(best_start * 1000)}_{int(target_duration * 1000)}ms.wav"
         )
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(output_file), y_slice, sr)
+        fade_in = min(0.3, target_duration * 0.05) if best_start > 0.2 else 0.0
+        if not self._cut_native_section(
+            audio_path, output_file, best_start, target_duration, fade_in, fade_sec
+        ):
+            sf.write(str(output_file), y_slice, sr)
         logger.info("Exported decoupled & faded soundtrack to: %s", output_file.name)
 
         # Re-zero adjusted sections

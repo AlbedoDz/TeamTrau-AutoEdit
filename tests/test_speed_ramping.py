@@ -1,7 +1,6 @@
 """Unit tests for Dynamic Speed Ramping (1x - 8x) across visual scorer and timeline."""
 
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import opentimelineio as otio
 
@@ -87,58 +86,16 @@ def test_timeline_builder_linear_time_warp():
 
 
 def test_nvenc_renderer_pts_scaling(tmp_path: Path):
-    """Verify NvencRenderer writes setpts=(PTS-STARTPTS)/speed into filter complex."""
+    """Verify the segment filter scales video PTS by the speed multiplier."""
     cfg = PipelineConfig(fps=30.0, enable_teaser=False)
     renderer = NvencRenderer(cfg)
-
-    fake_video = tmp_path / "scene.mp4"
-    fake_video.write_bytes(b"\x00" * 100)
-    fake_audio = tmp_path / "track.wav"
-    fake_audio.write_bytes(b"\x00" * 100)
-
     scene = ScoredScene(
-        scene=SceneCut(
-            clip_path=fake_video,
-            start_time=1.0,
-            end_time=10.0,
-            start_frame=30,
-            end_frame=300,
-            duration=9.0,
-        ),
+        scene=SceneCut(tmp_path / "scene.mp4", 1.0, 10.0, 30, 300, 9.0),
         sharpness_score=0.3,
         aesthetic_score=0.3,
         composite_score=0.3,
         speed=3.0,
     )
-
-    out_mp4 = tmp_path / "rendered.mp4"
-
-    # Mock subprocess to capture filter complex script
-    captured_filter: list[str] = []
-
-    def mock_popen(cmd, *args, **kwargs):
-        script_idx = cmd.index("-filter_complex_script") + 1
-        script_path = Path(cmd[script_idx])
-        if script_path.exists():
-            captured_filter.append(script_path.read_text(encoding="utf-8"))
-        proc = MagicMock()
-        proc.poll.return_value = 0
-        proc.returncode = 0
-        proc.stderr.readline.return_value = ""
-        out_mp4.write_bytes(b"MP4_DATA")
-        return proc
-
-    from unittest.mock import patch
-    with patch("subprocess.Popen", side_effect=mock_popen):
-        renderer.render_sequence(
-            scored_scenes=[scene],
-            cut_timestamps=[0.0, 2.0],
-            soundtrack_path=fake_audio,
-            output_file=out_mp4,
-            include_teaser=False,
-            force_cpu=True,
-        )
-
-    assert len(captured_filter) == 1
-    content = captured_filter[0]
+    seg = renderer.build_segments([scene], [0.0, 2.0])[0]
+    content = renderer.build_segment_filter(seg, (1920, 1080), with_audio=False, source_has_audio=False)
     assert "setpts=(PTS-STARTPTS)/3.0000" in content

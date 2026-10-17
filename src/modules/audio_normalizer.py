@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from src.core.ffmpeg_utils import run_tool
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ class AudioNormalizer:
         ]
 
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+            res = run_tool(cmd, check=True, timeout=60)
             data = json.loads(res.stdout or "{}")
         except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
             logger.warning("ffprobe inspection failed on %s: %s", audio_path, exc)
@@ -170,7 +172,7 @@ class AudioNormalizer:
         ]
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            run_tool(cmd, check=True, timeout=1800)
             logger.info("Successfully cleaned audio: %s", clean_path)
             return clean_path
         except (subprocess.SubprocessError, OSError) as exc:
@@ -219,7 +221,7 @@ class AudioNormalizer:
                     "null",
                     "-",
                 ]
-                res = subprocess.run(cmd_probe, capture_output=True, text=True, timeout=10)
+                res = run_tool(cmd_probe, timeout=60)
                 for line in (res.stderr + res.stdout).splitlines():
                     if "RMS level dB" in line or "Peak level dB" in line:
                         try:
@@ -261,7 +263,7 @@ class AudioNormalizer:
         ])
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            run_tool(cmd, check=True, timeout=1800)
             return out_path, has_rumble
         except (subprocess.SubprocessError, OSError) as exc:
             if out_path.exists():

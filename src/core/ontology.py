@@ -56,3 +56,11 @@ def get_role_display_name(role: CameraRole | str) -> str:
         CameraRole.EXTERNAL_AUDIO.value: "External Audio (Stem)",
     }
     return mapping.get(val, "Cam A (Master/Host)")
+
+
+def natural_sort_key(path: Path | str) -> list[object]:
+    """Human ordering for file paths: 'clip2' sorts before 'clip10' (case-insensitive)."""
+    import re
+
+    parts = re.split(r"(\d+)", str(path).lower())
+    return [int(p) if p.isdigit() else p for p in parts]

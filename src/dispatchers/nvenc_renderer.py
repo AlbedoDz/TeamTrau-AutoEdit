@@ -1,27 +1,489 @@
-"""Standalone headless video rendering engine utilizing FFmpeg NVENC acceleration."""
+"""Standalone headless video rendering engine utilizing FFmpeg NVENC acceleration.
+
+Rendering is two-stage:
+
+1. Every timeline clip is rendered to its own normalized segment (canvas, fps,
+   exact frame count, 48 kHz stereo PCM camera audio). Each segment input is
+   fast-seeked with ``-ss/-t`` so ffmpeg never decodes footage before the in-point,
+   and segments can be encoded in parallel.
+2. Segments are joined with the concat demuxer (video stream-copied) and the
+   soundtrack / camera audio mix is encoded once into the final container.
+
+The master is written to ``<name>.part`` and only renamed on success, so a failed
+or cancelled render never leaves a corrupt deliverable behind.
+"""
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from src.core.config import PipelineConfig, check_nvenc_available
-from src.core.types import CropWindow, RenderJobResult, SceneCut, ScoredScene, SongSection
+from src.core.ffmpeg_utils import atempo_chain, has_audio_stream, is_hw_encoder_error, popen_tool
+from src.core.types import CropWindow, RenderJobResult, ScoredScene, SongSection
 from src.dispatchers.watermark_helper import build_watermark_filter_lines
 from src.modules.timeline_builder import select_scenes_for_cuts
 
 logger = logging.getLogger(__name__)
 
+AUDIO_RATE = 48000
+PREVIEW_HEIGHT = 540
+
+
+@dataclass
+class RenderSegment:
+    """One clip on the output timeline, expressed in source and output terms."""
+
+    source: Path
+    source_in: float
+    frames: int
+    available: float
+    speed: float = 1.0
+    crop_window: CropWindow | None = None
+    ken_burns: str | None = None
+
+
+class RenderError(RuntimeError):
+    """FFmpeg render failure carrying the tail of ffmpeg's stderr."""
+
+    def __init__(self, message: str, stderr: str = "") -> None:
+        super().__init__(f"{message}\n{stderr[-1500:]}" if stderr else message)
+        self.stderr = stderr
+
+
+def _even(v: float) -> int:
+    return max(2, int(round(v / 2.0)) * 2)
+
 
 class NvencRenderer:
-    """Builds dynamic filter graphs and renders headless video via FFmpeg NVENC."""
+    """Builds per-segment filter graphs and renders headless video via FFmpeg NVENC."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.nvenc_available = check_nvenc_available()
+
+    # ------------------------------------------------------------------
+    # Timeline -> segments
+    # ------------------------------------------------------------------
+    def build_segments(
+        self,
+        scored_scenes: list[ScoredScene],
+        cut_timestamps: list[float],
+        include_teaser: bool | None = None,
+        sections: list[SongSection] | None = None,
+    ) -> list[RenderSegment]:
+        """Turn analysed scenes + beat cuts into frame-exact output segments."""
+        if not scored_scenes:
+            raise ValueError("No scenes provided for rendering.")
+        if len(cut_timestamps) < 2:
+            raise ValueError("cut_timestamps must have at least 2 boundary timestamps.")
+
+        fps = self.config.fps
+        total_duration = cut_timestamps[-1] - cut_timestamps[0]
+        should_teaser = include_teaser if include_teaser is not None else self.config.enable_teaser
+        has_teaser = should_teaser and (total_duration >= self.config.teaser_duration + 4.0)
+
+        def frame_at(t: float) -> int:
+            return int(round((t - cut_timestamps[0]) * fps))
+
+        def make(sc: ScoredScene, frames: int) -> RenderSegment:
+            return RenderSegment(
+                source=sc.scene.clip_path,
+                source_in=sc.scene.start_time,
+                frames=max(1, frames),
+                available=max(0.04, sc.scene.duration),
+                speed=max(0.1, float(sc.speed or 1.0)),
+                crop_window=sc.crop_window,
+                ken_burns=sc.metadata.get("ken_burns") if sc.metadata else None,
+            )
+
+        segments: list[RenderSegment] = []
+        if has_teaser:
+            teaser_frames = frame_at(cut_timestamps[0] + self.config.teaser_duration)
+            num_teaser = min(5, max(3, len(scored_scenes)))
+            bounds = [round(teaser_frames * j / num_teaser) for j in range(num_teaser + 1)]
+            for j in range(num_teaser):
+                candidate = scored_scenes[j % len(scored_scenes)]
+                segments.append(make(candidate, bounds[j + 1] - bounds[j]))
+            teaser_end = cut_timestamps[0] + self.config.teaser_duration
+            main_cuts = [teaser_end] + [t for t in cut_timestamps if t > teaser_end]
+        else:
+            main_cuts = list(cut_timestamps)
+
+        main_scenes = select_scenes_for_cuts(
+            scored_scenes=scored_scenes,
+            cut_timestamps=main_cuts,
+            sections=sections,
+            action_drop_threshold=self.config.action_drop_threshold,
+        )
+        for i in range(len(main_cuts) - 1):
+            frames = frame_at(main_cuts[i + 1]) - frame_at(main_cuts[i])
+            if frames > 0:
+                segments.append(make(main_scenes[i], frames))
+        return segments
+
+    # ------------------------------------------------------------------
+    # Command builders (pure, unit-testable)
+    # ------------------------------------------------------------------
+    def canvas_size(self, preview: bool = False) -> tuple[int, int]:
+        w, h = self.config.canvas_width, self.config.canvas_height
+        if preview and h > PREVIEW_HEIGHT:
+            return _even(w * PREVIEW_HEIGHT / h), PREVIEW_HEIGHT
+        return w, h
+
+    def encoder_args(self, use_nvenc: bool, preview: bool = False) -> tuple[str, list[str]]:
+        cfg = self.config
+        pix = ["-pix_fmt", cfg.nvenc_pix_fmt]
+        if preview:
+            if use_nvenc:
+                return "h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", *pix]
+            return "libx264", ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", *pix]
+        if use_nvenc:
+            return "hevc_nvenc", [
+                "-c:v", "hevc_nvenc",
+                "-preset", cfg.nvenc_preset,
+                "-cq", str(cfg.nvenc_cq),
+                "-b:v", cfg.nvenc_bitrate,
+                "-maxrate", cfg.nvenc_maxrate,
+                "-bufsize", cfg.nvenc_bufsize,
+                *pix,
+            ]
+        return "libx265", [
+            "-c:v", "libx265",
+            "-preset", cfg.cpu_encoder_preset,
+            "-crf", str(cfg.nvenc_cq),
+            "-x265-params", "log-level=error:repeat-headers=1",
+            *pix,
+        ]
+
+    def _geometry_filters(self, seg: RenderSegment, w: int, h: int, src: str, out: str) -> list[str]:
+        """Scale / crop / backdrop the source label ``src`` onto a WxH canvas as ``out``."""
+        cw = seg.crop_window
+        is_vertical = w < h
+        is_blur_backdrop = is_vertical and (
+            (cw is not None and cw.tracking_subject == "blur_backdrop")
+            or getattr(self.config, "reframing_mode", "auto_hybrid") == "blur_backdrop"
+        )
+        if is_blur_backdrop:
+            return [
+                f"[{src}]split=2[bg][fg]",
+                f"[bg]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                f"boxblur=20:5,eq=brightness=-0.15[bgb]",
+                f"[fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fgs]",
+                f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2[{out}]",
+            ]
+        if cw is not None and is_vertical:
+            return [
+                f"[{src}]crop={cw.width}:{cw.height}:{cw.x}:{cw.y},scale={w}:{h}[{out}]"
+            ]
+        return [
+            f"[{src}]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black[{out}]"
+        ]
+
+    def build_segment_filter(
+        self,
+        seg: RenderSegment,
+        canvas: tuple[int, int],
+        with_audio: bool,
+        source_has_audio: bool,
+        watermark_input: int | None = None,
+    ) -> str:
+        """Filter graph for one segment: input 0 is the seeked source clip."""
+        w, h = canvas
+        fps = self.config.fps
+        out_dur = seg.frames / fps
+        lines: list[str] = [f"[0:v]setpts=(PTS-STARTPTS)/{seg.speed:.4f}[vsp]"]
+        lines += self._geometry_filters(seg, w, h, "vsp", "vgeo")
+
+        tail = "vgeo"
+        if seg.ken_burns in ("zoom_in", "zoom_out"):
+            n = max(1, seg.frames)
+            k = max(1.0, float(self.config.ken_burns_scale_factor)) - 1.0
+            z = f"1+{k:.4f}*on/{n}" if seg.ken_burns == "zoom_in" else f"{1 + k:.4f}-{k:.4f}*on/{n}"
+            lines.append(
+                f"[vgeo]zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                f"d=1:s={w}x{h}:fps={fps}[vkb]"
+            )
+            tail = "vkb"
+
+        base_label = "vbase" if watermark_input is not None else "vseg"
+        lines.append(
+            f"[{tail}]setsar=1,fps={fps},"
+            f"tpad=stop_mode=clone:stop_duration={out_dur + 1:.3f},"
+            f"trim=end_frame={seg.frames},setpts=PTS-STARTPTS,"
+            f"format={self.config.nvenc_pix_fmt}[{base_label}]"
+        )
+        if watermark_input is not None:
+            lines.extend(
+                line.rstrip(";")
+                for line in build_watermark_filter_lines(
+                    wm_input_idx=watermark_input,
+                    base_v_label="vbase",
+                    out_v_label="vseg",
+                    position=self.config.watermark_position,
+                    opacity=self.config.watermark_opacity,
+                    margin=self.config.watermark_margin,
+                )
+            )
+
+        if with_audio:
+            n_samples = int(round(seg.frames * AUDIO_RATE / fps))
+            norm = f"aresample={AUDIO_RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
+            if source_has_audio:
+                tempo = atempo_chain(seg.speed)
+                tempo = f"{tempo}," if tempo else ""
+                lines.append(
+                    f"[0:a]asetpts=PTS-STARTPTS,{tempo}{norm},apad,"
+                    f"atrim=end_sample={n_samples},asetpts=PTS-STARTPTS[aseg]"
+                )
+            else:
+                lines.append(
+                    f"anullsrc=r={AUDIO_RATE}:cl=stereo,atrim=end_sample={n_samples},"
+                    f"aformat=sample_fmts=s16:channel_layouts=stereo[aseg]"
+                )
+        return ";".join(lines)
+
+    def build_segment_command(
+        self,
+        ffmpeg_bin: str,
+        seg: RenderSegment,
+        out_path: Path,
+        use_nvenc: bool,
+        with_audio: bool,
+        preview: bool = False,
+    ) -> list[str]:
+        canvas = self.canvas_size(preview)
+        src_dur = min(seg.available, seg.frames / self.config.fps * seg.speed)
+        src_has_audio = with_audio and has_audio_stream(seg.source)
+        wm = self._watermark_path()
+
+        cmd = [ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
+        cmd += ["-ss", f"{max(0.0, seg.source_in):.3f}", "-t", f"{src_dur + 0.25:.3f}"]
+        cmd += ["-i", str(Path(seg.source).resolve())]
+        wm_idx = None
+        if wm is not None:
+            cmd += ["-loop", "1", "-i", str(wm)]
+            wm_idx = 1
+
+        graph = self.build_segment_filter(seg, canvas, with_audio, src_has_audio, wm_idx)
+        cmd += ["-filter_complex", graph, "-map", "[vseg]"]
+        _enc, enc_args = self.encoder_args(use_nvenc, preview)
+        cmd += enc_args
+        if with_audio:
+            cmd += ["-map", "[aseg]", "-c:a", "pcm_s16le"]
+        cmd += ["-f", "matroska", str(out_path)]
+        return cmd
+
+    def build_concat_command(
+        self,
+        ffmpeg_bin: str,
+        list_file: Path,
+        out_path: Path,
+        total_duration: float,
+        segments_have_audio: bool,
+        soundtrack_path: Path | None,
+        soundtrack_in: float = 0.0,
+        encoder: str = "hevc_nvenc",
+    ) -> list[str]:
+        """Join stream-copied video segments and encode the final audio mix once."""
+        cmd = [ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
+        cmd += ["-f", "concat", "-safe", "0", "-i", str(list_file)]
+        norm = f"aresample={AUDIO_RATE},aformat=channel_layouts=stereo"
+        dur = f"{total_duration:.3f}"
+        graph: str | None = None
+        if soundtrack_path is not None:
+            cmd += ["-ss", f"{max(0.0, soundtrack_in):.3f}", "-i", str(Path(soundtrack_path).resolve())]
+            music = f"[1:a]{norm},apad,atrim=duration={dur},asetpts=PTS-STARTPTS"
+            if segments_have_audio:
+                if self.config.workflow_mode == "unboxing_narration":
+                    graph = (
+                        f"{music}[mus];[0:a]{norm},asplit=2[cam][sc];"
+                        f"[mus][sc]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=300[duck];"
+                        f"[duck][cam]amix=inputs=2:duration=first:normalize=0[aout]"
+                    )
+                else:
+                    graph = (
+                        f"{music}[mus];[0:a]{norm},volume={self.config.camera_audio_mix_db}dB[cam];"
+                        f"[mus][cam]amix=inputs=2:duration=first:normalize=0[aout]"
+                    )
+            else:
+                graph = f"{music}[aout]"
+        elif segments_have_audio:
+            graph = f"[0:a]{norm}[aout]"
+
+        cmd += ["-map", "0:v"]
+        if graph is not None:
+            cmd += ["-filter_complex", graph, "-map", "[aout]", "-c:a", "aac", "-b:a", "320k"]
+        cmd += ["-c:v", "copy"]
+        if "hevc" in encoder or encoder == "libx265":
+            cmd += ["-tag:v", "hvc1"]
+        cmd += ["-t", dur, "-movflags", "+faststart", "-f", "mp4", str(out_path)]
+        return cmd
+
+    def _watermark_path(self) -> Path | None:
+        cfg = self.config
+        if cfg.watermark_enabled and cfg.watermark_path and Path(cfg.watermark_path).exists():
+            return Path(cfg.watermark_path).resolve()
+        return None
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+    def _run(
+        self,
+        cmd: list[str],
+        cancel_event: threading.Event | None,
+        job_handle: Any | None,
+    ) -> tuple[int, str]:
+        proc = popen_tool(cmd)
+        if job_handle is not None and hasattr(job_handle, "_child_process"):
+            job_handle._child_process = proc
+        stderr = ""
+        while True:
+            try:
+                _out, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.communicate(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate()
+                    raise InterruptedError("Rendering cancelled by user.") from None
+        return proc.returncode, stderr or ""
+
+    def render_segments(
+        self,
+        segments: list[RenderSegment],
+        soundtrack_path: Path | None,
+        output_file: Path,
+        force_cpu: bool = False,
+        preview: bool = False,
+        soundtrack_in: float = 0.0,
+        progress_callback: Callable[[float, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        job_handle: Any | None = None,
+    ) -> RenderJobResult:
+        """Render an explicit, ordered list of segments to ``output_file``."""
+        if not segments:
+            raise ValueError("No segments provided for rendering.")
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if not ffmpeg_bin:
+            raise FileNotFoundError("FFmpeg executable not found on system PATH.")
+
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        part_file = output_file.with_name(output_file.name + ".part")
+        fps = self.config.fps
+        total_frames = sum(s.frames for s in segments)
+        total_duration = total_frames / fps
+
+        has_soundtrack = soundtrack_path is not None and Path(soundtrack_path).exists()
+        with_audio = (not has_soundtrack) or bool(self.config.keep_video_audio)
+        use_nvenc = self.nvenc_available and not force_cpu
+
+        work_root = Path(self.config.cache_dir).resolve() / "render"
+        work_root.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="seg_", dir=work_root))
+
+        def notify(pct: float, msg: str) -> None:
+            if progress_callback is not None:
+                progress_callback(pct, msg)
+
+        try:
+            while True:
+                seg_paths = [work_dir / f"seg_{i:05d}.mkv" for i in range(len(segments))]
+                done = 0
+                lock = threading.Lock()
+
+                def render_one(i: int, nvenc: bool = use_nvenc) -> None:
+                    nonlocal done
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("Rendering cancelled by user.")
+                    cmd = self.build_segment_command(
+                        ffmpeg_bin, segments[i], seg_paths[i], nvenc, with_audio, preview
+                    )
+                    rc, err = self._run(cmd, cancel_event, job_handle)
+                    if rc != 0:
+                        raise RenderError(f"Segment {i + 1}/{len(segments)} failed (code {rc}).", err)
+                    with lock:
+                        done += 1
+                        notify(95.0 * done / len(segments), f"Rendered segment {done}/{len(segments)}")
+
+                try:
+                    # First segment alone: validates encoder/driver before fanning out.
+                    render_one(0)
+                    workers = 1 if preview else self.config.render_workers
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        futures = [pool.submit(render_one, i) for i in range(1, len(segments))]
+                        try:
+                            for f in futures:
+                                f.result()
+                        except BaseException:
+                            pool.shutdown(wait=True, cancel_futures=True)
+                            raise
+                except RenderError as exc:
+                    if use_nvenc and is_hw_encoder_error(exc.stderr):
+                        logger.warning("NVENC failed (%s). Re-rendering on CPU encoder.", exc.stderr[-200:])
+                        use_nvenc = False
+                        for p in work_dir.glob("seg_*.mkv"):
+                            p.unlink(missing_ok=True)
+                        continue
+                    raise
+                break
+
+            encoder, _ = self.encoder_args(use_nvenc, preview)
+            list_file = work_dir / "concat.txt"
+            list_file.write_text(
+                "".join(
+                    "file '{}'\n".format(p.as_posix().replace("'", "'\\''")) for p in seg_paths
+                ),
+                encoding="utf-8",
+            )
+            notify(96.0, "Muxing master and mixing audio...")
+            cmd = self.build_concat_command(
+                ffmpeg_bin,
+                list_file,
+                part_file,
+                total_duration,
+                with_audio,
+                Path(soundtrack_path) if has_soundtrack and soundtrack_path else None,
+                soundtrack_in,
+                encoder,
+            )
+            rc, err = self._run(cmd, cancel_event, job_handle)
+            if rc != 0:
+                raise RenderError(f"FFmpeg concat/mux failed with exit code {rc}.", err)
+            os.replace(part_file, output_file)
+            notify(100.0, "Render complete.")
+
+            file_size = output_file.stat().st_size
+            logger.info(
+                "Render complete: %s (%.2f MB, encoder=%s, %d segments)",
+                output_file.name, file_size / (1024 * 1024), encoder, len(segments),
+            )
+            return RenderJobResult(
+                output_path=output_file,
+                encoder_used=encoder,
+                duration=total_duration,
+                file_size_bytes=file_size,
+                return_code=0,
+            )
+        finally:
+            if job_handle is not None and hasattr(job_handle, "_child_process"):
+                job_handle._child_process = None
+            part_file.unlink(missing_ok=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     def render_sequence(
         self,
@@ -35,371 +497,17 @@ class NvencRenderer:
         progress_callback: Callable[[float, str], None] | None = None,
         cancel_event: threading.Event | None = None,
         job_handle: Any | None = None,
+        preview: bool = False,
     ) -> RenderJobResult:
-        """Render multi-clip sequence with background music to master video file."""
-        if not scored_scenes:
-            raise ValueError("No scenes provided for rendering.")
-        if len(cut_timestamps) < 2:
-            raise ValueError("cut_timestamps must have at least 2 boundary timestamps.")
-
-        ffmpeg_bin = shutil.which("ffmpeg")
-        if not ffmpeg_bin:
-            raise FileNotFoundError("FFmpeg executable not found on system PATH.")
-
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        total_duration = cut_timestamps[-1] - cut_timestamps[0]
-
-        # Determine unique source video files to optimize input handles
-        unique_sources: list[Path] = []
-        source_to_idx: dict[Path, int] = {}
-        for s in scored_scenes:
-            resolved_p = s.scene.clip_path.resolve()
-            if resolved_p not in source_to_idx:
-                source_to_idx[resolved_p] = len(unique_sources)
-                unique_sources.append(resolved_p)
-
-        audio_input_idx = len(unique_sources)
-
-        # Build dynamic filter_complex graph
-        filter_lines: list[str] = []
-        concat_v_labels: list[str] = []
-
-        target_w = self.config.canvas_width
-        target_h = self.config.canvas_height
-        target_fps = self.config.fps
-
-        should_teaser = (
-            include_teaser if include_teaser is not None else self.config.enable_teaser
+        """Render analysed scenes on beat cuts with background music to a master file."""
+        segments = self.build_segments(scored_scenes, cut_timestamps, include_teaser, sections)
+        return self.render_segments(
+            segments,
+            soundtrack_path,
+            output_file,
+            force_cpu=force_cpu,
+            preview=preview,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            job_handle=job_handle,
         )
-        has_teaser = should_teaser and (total_duration >= self.config.teaser_duration + 4.0)
-
-        clip_specs: list[tuple[SceneCut, float, CropWindow | None, float, str | None]] = []
-        if has_teaser:
-            teaser_dur = self.config.teaser_duration
-            num_teaser = min(5, max(3, len(scored_scenes)))
-            sub_dur = teaser_dur / num_teaser
-            for j in range(num_teaser):
-                candidate = scored_scenes[j % len(scored_scenes)]
-                clip_dur = min(sub_dur, max(0.1, candidate.scene.duration))
-                clip_specs.append(
-                    (candidate.scene, clip_dur, candidate.crop_window, candidate.speed, candidate.metadata.get("ken_burns"))
-                )
-            main_cuts = [teaser_dur] + [t for t in cut_timestamps if t > teaser_dur]
-        else:
-            main_cuts = cut_timestamps
-
-        main_scenes = select_scenes_for_cuts(
-            scored_scenes=scored_scenes,
-            cut_timestamps=main_cuts,
-            sections=sections,
-            action_drop_threshold=self.config.action_drop_threshold,
-        )
-        for i in range(len(main_cuts) - 1):
-            slot_start = main_cuts[i]
-            slot_end = main_cuts[i + 1]
-            slot_dur = max(0.1, slot_end - slot_start)
-
-            candidate = main_scenes[i]
-            sc = candidate.scene
-            clip_dur = min(slot_dur, max(0.1, sc.duration))
-            clip_specs.append((sc, clip_dur, candidate.crop_window, candidate.speed, candidate.metadata.get("ken_burns")))
-
-        for i, (sc, clip_dur, crop_win, speed, kb_motion) in enumerate(clip_specs):
-            in_idx = source_to_idx[sc.clip_path.resolve()]
-            v_label = f"v{i}"
-            concat_v_labels.append(f"[{v_label}]")
-
-            # Determine source footage duration and pts scaling
-            eff_speed = max(0.1, float(speed))
-            if eff_speed != 1.0:
-                src_duration = min(sc.duration, clip_dur * eff_speed)
-                pts_filter = f"setpts=(PTS-STARTPTS)/{eff_speed:.4f}"
-            else:
-                src_duration = clip_dur
-                pts_filter = "setpts=PTS-STARTPTS"
-
-            is_vertical = target_w < target_h
-            is_blur_backdrop = is_vertical and (
-                (crop_win is not None and crop_win.tracking_subject == "blur_backdrop")
-                or getattr(self.config, "reframing_mode", "auto_hybrid") == "blur_backdrop"
-            )
-
-            if is_blur_backdrop:
-                # Dynamic dual-layer blurred backdrop
-                t_raw = f"t_{i}"
-                trim_filter = (
-                    f"[{in_idx}:v]trim=start={sc.start_time:.3f}:duration={src_duration:.3f},"
-                    f"{pts_filter},setsar=1,fps={target_fps}[{t_raw}];"
-                    f"[{t_raw}]split=2[bg_{i}][fg_{i}];"
-                    f"[bg_{i}]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                    f"crop={target_w}:{target_h},boxblur=20:5,eq=brightness=-0.15[bg_b_{i}];"
-                    f"[fg_{i}]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease[fg_s_{i}];"
-                    f"[bg_b_{i}][fg_s_{i}]overlay=(W-w)/2:(H-h)/2[{v_label}];"
-                )
-            elif crop_win is not None and is_vertical:
-                trim_filter = (
-                    f"[{in_idx}:v]trim=start={sc.start_time:.3f}:duration={src_duration:.3f},"
-                    f"{pts_filter},"
-                    f"crop={crop_win.width}:{crop_win.height}:{crop_win.x}:{crop_win.y},"
-                    f"scale={target_w}:{target_h},"
-                    f"setsar=1,fps={target_fps}[{v_label}];"
-                )
-            else:
-                # Standard scale and pad to canvas preset maintaining aspect ratio
-                trim_filter = (
-                    f"[{in_idx}:v]trim=start={sc.start_time:.3f}:duration={src_duration:.3f},"
-                    f"{pts_filter},"
-                    f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                    f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
-                    f"setsar=1,fps={target_fps}[{v_label}];"
-                )
-            filter_lines.append(trim_filter)
-
-        has_watermark = bool(
-            self.config.watermark_enabled
-            and self.config.watermark_path
-            and Path(self.config.watermark_path).exists()
-        )
-
-        # Concat video segments with optional watermark overlay
-        has_soundtrack = soundtrack_path is not None and Path(soundtrack_path).exists()
-        audio_input_idx = len(unique_sources) if has_soundtrack else -1
-
-        if has_watermark:
-            concat_str = (
-                f"{''.join(concat_v_labels)}concat=n={len(concat_v_labels)}:v=1:a=0[vconcat];"
-            )
-            filter_lines.append(concat_str)
-            wm_input_idx = len(unique_sources) + (1 if has_soundtrack else 0)
-            wm_lines = build_watermark_filter_lines(
-                wm_input_idx=wm_input_idx,
-                base_v_label="vconcat",
-                out_v_label="vout",
-                position=self.config.watermark_position,
-                opacity=self.config.watermark_opacity,
-                margin=self.config.watermark_margin,
-            )
-            filter_lines.extend(wm_lines)
-        else:
-            concat_str = (
-                f"{''.join(concat_v_labels)}concat=n={len(concat_v_labels)}:v=1:a=0[vout];"
-            )
-            filter_lines.append(concat_str)
-
-        # Audio track processing
-        if has_soundtrack:
-            audio_trim = (
-                f"[{audio_input_idx}:a]atrim=start=0:duration={total_duration:.3f},"
-                f"asetpts=PTS-STARTPTS[aout]"
-            )
-            filter_lines.append(audio_trim)
-        else:
-            # Concatenate synchronous camera audio from clips
-            concat_a_labels: list[str] = []
-            for i, (sc, clip_dur, _cw, speed, _kb) in enumerate(clip_specs):
-                in_idx = source_to_idx[sc.clip_path.resolve()]
-                a_label = f"a{i}"
-                concat_a_labels.append(f"[{a_label}]")
-                eff_speed = max(0.1, float(speed))
-                src_duration = min(sc.duration, clip_dur * eff_speed) if eff_speed != 1.0 else clip_dur
-                filter_lines.append(
-                    f"[{in_idx}:a]atrim=start={sc.start_time:.3f}:duration={src_duration:.3f},"
-                    f"asetpts=PTS-STARTPTS[{a_label}];"
-                )
-            filter_lines.append(
-                f"{''.join(concat_a_labels)}concat=n={len(concat_a_labels)}:v=0:a=1[aout]"
-            )
-
-        filter_complex_content = "\n".join(filter_lines)
-
-        # Use temporary file for filter_complex_script to bypass Windows CLI length limits
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".filter", delete=False, encoding="utf-8"
-        ) as f_script:
-            f_script.write(filter_complex_content)
-            script_path = Path(f_script.name)
-
-        use_nvenc = self.nvenc_available and not force_cpu
-        encoder = "hevc_nvenc" if use_nvenc else "libx265"
-
-        cmd: list[str] = [ffmpeg_bin, "-y", "-hide_banner"]
-
-        # Add video inputs
-        for src in unique_sources:
-            cmd.extend(["-i", str(src)])
-
-        # Add audio input if soundtrack present
-        if has_soundtrack and soundtrack_path is not None:
-            cmd.extend(["-i", str(soundtrack_path.resolve())])
-
-        # Add watermark input if active
-        if has_watermark and self.config.watermark_path is not None:
-            cmd.extend(["-i", str(Path(self.config.watermark_path).resolve())])
-
-        # Filter script and mapping
-        cmd.extend(["-filter_complex_script", str(script_path)])
-        cmd.extend(["-map", "[vout]", "-map", "[aout]"])
-
-        # Encoder options
-        if use_nvenc:
-            cmd.extend(
-                [
-                    "-c:v",
-                    "hevc_nvenc",
-                    "-preset",
-                    self.config.nvenc_preset,
-                    "-cq",
-                    str(self.config.nvenc_cq),
-                    "-b:v",
-                    self.config.nvenc_bitrate,
-                    "-maxrate",
-                    self.config.nvenc_maxrate,
-                    "-bufsize",
-                    self.config.nvenc_bufsize,
-                    "-pix_fmt",
-                    self.config.nvenc_pix_fmt,
-                ]
-            )
-        else:
-            cmd.extend(
-                [
-                    "-c:v",
-                    "libx265",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    str(self.config.nvenc_cq),
-                    "-pix_fmt",
-                    self.config.nvenc_pix_fmt,
-                ]
-            )
-
-        cmd.extend(
-            [
-                "-c:a",
-                "aac",
-                "-b:a",
-                "320k",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                str(output_file.resolve()),
-            ]
-        )
-
-        logger.info(
-            "Executing FFmpeg render (%s, canvas: %dx%d @ %.1ffps)...",
-            encoder,
-            target_w,
-            target_h,
-            target_fps,
-        )
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-            if job_handle is not None and hasattr(job_handle, "_child_process"):
-                job_handle._child_process = proc
-
-            stderr_lines: list[str] = []
-
-            def _drain_stderr() -> None:
-                if proc.stderr:
-                    try:
-                        for err_line in proc.stderr:
-                            stderr_lines.append(err_line)
-                    except Exception:
-                        pass
-
-            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-            stderr_thread.start()
-
-            total_frames = int(total_duration * target_fps)
-            if proc.stdout:
-                try:
-                    for raw_line in proc.stdout:
-                        if cancel_event is not None and cancel_event.is_set():
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                            raise InterruptedError("Rendering cancelled by user.")
-
-                        line = str(raw_line).strip()
-                        if line.startswith("frame="):
-                            val = line.split("=", 1)[1].strip()
-                            if val.isdigit():
-                                curr_frame = int(val)
-                                if total_frames > 0 and progress_callback is not None:
-                                    pct = min(99.0, (curr_frame / total_frames) * 100.0)
-                                    progress_callback(
-                                        pct,
-                                        f"Rendering frame {curr_frame}/{total_frames} ({pct:.1f}%)",
-                                    )
-                        elif line == "progress=end":
-                            if progress_callback is not None:
-                                progress_callback(100.0, "Finalizing output container...")
-                except Exception as exc:
-                    if not isinstance(exc, InterruptedError):
-                        logger.debug("Stdout streaming ended or encountered error: %s", exc)
-                    else:
-                        raise
-
-            proc.wait()
-            stderr_thread.join(timeout=3.0)
-
-            if cancel_event is not None and cancel_event.is_set():
-                raise InterruptedError("Rendering cancelled by user.")
-
-            # If NVENC failed at runtime, try fallback to CPU libx265
-            if proc.returncode != 0 and use_nvenc:
-                logger.warning(
-                    "NVENC render failed (code %d). Retrying with libx265 CPU fallback...",
-                    proc.returncode,
-                )
-                return self.render_sequence(
-                    scored_scenes=scored_scenes,
-                    cut_timestamps=cut_timestamps,
-                    soundtrack_path=soundtrack_path,
-                    output_file=output_file,
-                    force_cpu=True,
-                    include_teaser=include_teaser,
-                    sections=sections,
-                    progress_callback=progress_callback,
-                    cancel_event=cancel_event,
-                    job_handle=job_handle,
-                )
-
-            if proc.returncode != 0:
-                stderr_text = "".join(stderr_lines)
-                raise RuntimeError(
-                    f"FFmpeg render failed with exit code {proc.returncode}:\n{stderr_text[-1000:]}"
-                )
-
-            file_size = output_file.stat().st_size if output_file.is_file() else 0
-            logger.info(
-                "Render complete: %s (%.2f MB, encoder=%s)",
-                output_file.name,
-                file_size / (1024 * 1024),
-                encoder,
-            )
-
-            return RenderJobResult(
-                output_path=output_file,
-                encoder_used=encoder,
-                duration=total_duration,
-                file_size_bytes=file_size,
-                return_code=proc.returncode,
-            )
-        finally:
-            if job_handle is not None and hasattr(job_handle, "_child_process"):
-                job_handle._child_process = None
-            if script_path.exists():
-                script_path.unlink(missing_ok=True)

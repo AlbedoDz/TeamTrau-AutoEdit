@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from src.core.config import PipelineConfig
+from src.core.ontology import natural_sort_key
 from src.core.types import CleanedSegment, DefectSpan, DefectType, SceneCut
 from src.modules.audio_normalizer import AudioNormalizer
 
@@ -487,7 +488,7 @@ class RoughCutCleaner:
             all_cleaned.extend(cleaned)
 
         # Enforce strict chronological ordering based on clip_path and start_time
-        all_cleaned.sort(key=lambda s: (str(s.clip_path), s.start_time))
+        all_cleaned.sort(key=lambda s: (natural_sort_key(s.clip_path), s.start_time))
 
         logger.info(
             "Rough cut defect pruning complete: %d raw scenes -> %d chronological golden takes.",

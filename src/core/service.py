@@ -384,6 +384,9 @@ class StudioBackendAdapter:
             progress_callback=_ingest_prog,
             cancel_event=cancel_event,
         )
+        for bad_path, reason in detector.failed_files:
+            if callbacks and callbacks.on_log:
+                callbacks.on_log("WARNING", f"Skipped unreadable clip {bad_path.name}: {reason}")
         if not all_scenes:
             raise ValueError("No usable scene intervals detected from input footage.")
 
@@ -419,7 +422,7 @@ class StudioBackendAdapter:
                 try:
                     from src.modules.audio_normalizer import AudioNormalizer
 
-                    audio_norm = AudioNormalizer(cache_dir=output_dir / ".cache" / "audio_clean")
+                    audio_norm = AudioNormalizer(cache_dir=Path(config.cache_dir) / "audio_clean")
                     active_input_soundtrack = audio_norm.clean_audio(soundtrack)
                 except Exception as norm_err:
                     logger.warning("Audio normalization skipped: %s", norm_err)
@@ -749,4 +752,5 @@ class StudioBackendAdapter:
             scored_scenes=ranked_scenes,
             timeline_variants=variants,
             active_variant_name="beat_driven" if "beat_driven" in variants else None,
+            failed_files=list(detector.failed_files),
         )
