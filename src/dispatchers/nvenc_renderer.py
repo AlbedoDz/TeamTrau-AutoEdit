@@ -212,6 +212,7 @@ class NvencRenderer:
         use_nvenc: bool,
         with_audio: bool,
         preview: bool = False,
+        hwdecode: bool = False,
     ) -> list[str]:
         canvas = self.canvas_size(preview)
         src_dur = min(seg.available, seg.frames / self.config.fps * seg.speed)
@@ -219,6 +220,10 @@ class NvencRenderer:
         wm = self._watermark_path()
 
         cmd = [ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
+        if hwdecode and use_nvenc:
+            # NVDEC decode; no -hwaccel_output_format, so frames are downloaded to system
+            # memory and every CPU filter (scale/crop/zoompan/overlay/...) keeps working.
+            cmd += ["-hwaccel", "cuda"]
         cmd += ["-ss", f"{max(0.0, seg.source_in):.3f}", "-t", f"{src_dur + 0.25:.3f}"]
         cmd += ["-i", str(Path(seg.source_path).resolve())]
         wm_idx = None
@@ -356,6 +361,7 @@ class NvencRenderer:
         try:
             while True:
                 seg_paths = [work_dir / f"seg_{i:05d}.mkv" for i in range(len(segments))]
+                hwdec = {"on": bool(self.config.nvenc_hwdecode) and use_nvenc}
                 done = 0
                 lock = threading.Lock()
 
@@ -364,9 +370,19 @@ class NvencRenderer:
                     if cancel_event is not None and cancel_event.is_set():
                         raise InterruptedError("Rendering cancelled by user.")
                     cmd = self.build_segment_command(
-                        ffmpeg_bin, segments[i], seg_paths[i], nvenc, with_audio, preview
+                        ffmpeg_bin, segments[i], seg_paths[i], nvenc, with_audio, preview,
+                        hwdecode=hwdec["on"],
                     )
                     rc, err = self._run(cmd, cancel_event, job_handle)
+                    if rc != 0 and hwdec["on"]:
+                        # Unsupported codec/profile for NVDEC: software-decode this and the
+                        # remaining segments but keep the NVENC encoder.
+                        logger.warning("NVDEC decode failed (%s). Retrying with software decode.", err[-160:])
+                        hwdec["on"] = False
+                        cmd = self.build_segment_command(
+                            ffmpeg_bin, segments[i], seg_paths[i], nvenc, with_audio, preview
+                        )
+                        rc, err = self._run(cmd, cancel_event, job_handle)
                     if rc != 0:
                         raise RenderError(f"Segment {i + 1}/{len(segments)} failed (code {rc}).", err)
                     with lock:
