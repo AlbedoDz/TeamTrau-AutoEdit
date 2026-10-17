@@ -1,6 +1,7 @@
 # TeamTrau-AutoEdit: Production-Grade Automated Video Editing Orchestrator
 
-![Uploading image.png…]()
+<img width="1919" height="1033" alt="image" src="https://github.com/user-attachments/assets/dacd2867-770f-46b1-8b0e-72996cc7870b" />
+
 
 
 Production-grade automated video editing engine on Windows 11 with NVIDIA GPU hardware acceleration (CUDA, NVENC).
