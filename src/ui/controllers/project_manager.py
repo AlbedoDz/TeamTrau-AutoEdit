@@ -15,6 +15,8 @@ from typing import Any
 
 from src.core.config import PRESETS, PipelineConfig
 from src.core.project_io import (
+    audio_state_from_dict,
+    audio_state_to_dict,
     deliver_settings_from_dict,
     edit_timeline_from_dict,
     edit_timeline_to_dict,
@@ -39,7 +41,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECENT_PROJECTS_PATH = Path.home() / ".teamtrau" / "recent_projects.json"
 PROJECT_FILE_EXTENSION = ".tteproj"
 PROJECT_FILE_FILTER = "TeamTrau Project (*.tteproj);;All Files (*.*)"
-PROJECT_SCHEMA_VERSION = "2.2.0"
+PROJECT_SCHEMA_VERSION = "2.3.0"
+# Workflow position of a project (v2.3): where the user left off.
+PIPELINE_STAGES = ("ingest", "rough_cut", "sequence", "deliver")
 
 
 @dataclass
@@ -76,6 +80,10 @@ class ProjectData:
     active_timeline_key: str = "master"
     # v2.2: Deliver settings (canvas/fps/colour/audio/master...); empty = derive from timeline.
     deliver_settings: dict[str, Any] = field(default_factory=dict)
+    # v2.3: staged workflow. ``pipeline_stage`` is one of PIPELINE_STAGES; ``audio_state`` is the REAL
+    # soundtrack analysis (beats + downbeats, bar grid, sections, cut points, cadence cuts, tempo).
+    pipeline_stage: str = "ingest"
+    audio_state: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert project data to JSON-serializable dictionary."""
@@ -109,7 +117,19 @@ class ProjectData:
             edit_timelines=data.get("edit_timelines", {}),
             active_timeline_key=data.get("active_timeline_key", "master"),
             deliver_settings=data.get("deliver_settings") or {},
+            pipeline_stage=_valid_stage(data.get("pipeline_stage")),
+            audio_state=data.get("audio_state") or {},
         )
+
+    def get_audio_state(self) -> AudioAnalysisResult | None:
+        """Rebuild the stored soundtrack analysis (beats, bar grid, ...); None when absent or invalid."""
+        if not self.audio_state:
+            return None
+        try:
+            return audio_state_from_dict(self.audio_state)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Ignoring invalid stored audio_state: %s", exc)
+            return None
 
     def get_deliver_settings(self) -> DeliverSettings | None:
         """Decode stored Deliver settings; None when absent (v2.0/2.1) or invalid."""
@@ -127,6 +147,10 @@ class ProjectData:
         if out:
             return out
         return upgrade_variants_to_edit_timelines(self)
+
+
+def _valid_stage(value: Any) -> str:
+    return value if value in PIPELINE_STAGES else "ingest"
 
 
 class ProjectManager:
@@ -501,6 +525,9 @@ def project_from_result(
 ) -> ProjectData:
     """Build a saveable project (Edit state) from a finished analysis run."""
     pm = ProjectManager
+    audio = getattr(result, "audio_analysis", None)
+    stage = getattr(result, "stage", "all")
+    timelines = {k: edit_timeline_to_dict(v) for k, v in result.edit_timelines.items()}
     data = ProjectData(
         project_name=project_name,
         input_dir=str(input_dirs[0]) if input_dirs else None,
@@ -509,12 +536,25 @@ def project_from_result(
         output_dir=str(output_dir),
         preset_name=config.preset_name,
         config=ProjectManager().serialize_pipeline_config(config),
-        scored_scenes=[pm.serialize_scored_scene(s) for s in result.scored_scenes],
-        included_scene_indices=list(range(len(result.scored_scenes))),
+        scored_scenes=[
+            pm.serialize_scored_scene(s, is_included=s.metadata.get("included", True) is not False)
+            for s in result.scored_scenes
+        ],
+        included_scene_indices=[
+            i for i, s in enumerate(result.scored_scenes) if s.metadata.get("included", True) is not False
+        ],
         timeline_variants={k: pm.serialize_timeline_variant(v) for k, v in result.timeline_variants.items()},
         active_variant_name=result.active_variant_name,
-        edit_timelines={k: edit_timeline_to_dict(v) for k, v in result.edit_timelines.items()},
-        active_timeline_key="master",
+        edit_timelines=timelines,
+        active_timeline_key="master" if "master" in timelines else next(iter(timelines), "master"),
+        audio_analysis=pm.serialize_audio_analysis(audio) if audio is not None else {},
+        audio_state=audio_state_to_dict(audio),
+        pipeline_stage=(
+            "rough_cut"
+            if stage == "rough_cut"
+            or (result.edit_timelines and all(t.kind == "rough_cut" for t in result.edit_timelines.values()))
+            else "sequence"
+        ),
     )
     return data
 

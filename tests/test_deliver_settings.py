@@ -291,10 +291,10 @@ def test_deliver_settings_from_dict_tolerates_missing_and_unknown_keys():
         deliver_settings_from_dict({"canvas_width": 1281})
 
 
-def test_project_schema_is_2_2_and_stores_deliver_settings(tmp_path: Path):
-    assert PROJECT_SCHEMA_VERSION == "2.2.0"
+def test_project_schema_is_2_3_and_stores_deliver_settings(tmp_path: Path):
+    assert PROJECT_SCHEMA_VERSION == "2.3.0"
     data = ProjectData(project_name="P")
-    assert data.version == "2.2.0" and data.deliver_settings == {}
+    assert data.version == "2.3.0" and data.deliver_settings == {}
     assert data.get_deliver_settings() is None
     s = _settings(fps=29.97, master="dnxhr_hqx")
     data.deliver_settings = deliver_settings_to_dict(s)
@@ -302,7 +302,7 @@ def test_project_schema_is_2_2_and_stores_deliver_settings(tmp_path: Path):
     path = tmp_path / "p.tteproj"
     assert mgr.save_project(path, data)
     loaded = mgr.load_project(path)
-    assert loaded is not None and loaded.version == "2.2.0"
+    assert loaded is not None and loaded.version == "2.3.0"
     assert loaded.get_deliver_settings() == s
 
 

@@ -970,7 +970,7 @@ def validate_timeline_qa(
 @mcp_server.tool()
 def execute_pipeline_job(
     input_dir: str,
-    soundtrack: str,
+    soundtrack: str | None = None,
     output_dir: str = "./output",
     preset: str = "1080p30",
     duration_mode: str = "fixed",
@@ -983,15 +983,24 @@ def execute_pipeline_job(
     subtitle_style: str = "kinetic_ass",
     no_render: bool = True,
     run_async: bool = False,
+    stage: str = "all",
+    genre: str | None = None,
+    cadence: str | None = None,
+    rough_cut: bool | None = None,
 ) -> dict[str, Any]:
     """Analyze footage and auto-edit a timeline, saved as a .tteproj project.
 
-    Stops at "Timeline ready" - nothing is exported. Use render_master / export_timeline
-    with the returned project_path ONLY when the user asks to export.
+    Analysis only: stops at "Timeline ready" - nothing is exported. Use render_master /
+    export_timeline with the returned project_path ONLY when the user asks to export.
 
     Args:
         input_dir: Path to directory of raw video footage.
-        soundtrack: Background soundtrack audio file.
+        soundtrack: Background soundtrack audio file (optional only when stage is 'rough_cut').
+        stage: 'rough_cut' (defect pruning only, saved as the 'rough_cut' timeline, no soundtrack),
+            'sequence' (music edit) or 'all' (default, classic one-pass analysis).
+        genre: Genre preset key (e.g. 'travel_cinematic', 'sports_extreme'); drives pacing.
+        cadence: Cadence profile: 'fast_syncopated', 'balanced_narrative', 'lingering_cinematic', 'viral_burst'.
+        rough_cut: With stage 'all', run the defect-pruning rough cut first (default off).
         output_dir: Project / deliverables directory.
         preset: Target preset (e.g. '1080p30', 'social_vertical', '4k30').
         duration_mode: Decoupling mode ('fixed', 'footage_driven', 'full_track').
@@ -1008,10 +1017,14 @@ def execute_pipeline_job(
     Returns:
         Job handle status, timeline summary and the saved project path.
     """
+    from src.core.stage_options import STAGES, apply_staged_options
     from src.ui.controllers.project_manager import save_result_as_project
 
+    stage = (stage or "all").lower()
+    if stage not in STAGES:
+        raise ValueError(f"Unknown stage '{stage}'. Use one of: {', '.join(STAGES)}")
     in_p = Path(input_dir)
-    audio_p = Path(soundtrack)
+    audio_p = Path(soundtrack) if soundtrack else None
     out_p = Path(output_dir)
     project_p = out_p / f"{in_p.resolve().name or 'project'}.tteproj"
 
@@ -1019,6 +1032,9 @@ def execute_pipeline_job(
         preset, duration_mode, target_duration, enable_teaser, speed_ramping,
         watermark_path, layout_mode, subtitle_style, enable_transcription,
     )
+    apply_staged_options(cfg, genre=genre, cadence=cadence, rough_cut=rough_cut)
+    if audio_p is None and stage != "rough_cut" and cfg.workflow_mode != "rough_cut":
+        raise ValueError("soundtrack is required unless stage is 'rough_cut'.")
 
     def _persist(handle) -> None:
         res = handle.result
@@ -1032,6 +1048,7 @@ def execute_pipeline_job(
         config=cfg,
         run_async=run_async,
         no_render=no_render,
+        stage=stage,  # type: ignore[arg-type]
     )
 
     if run_async:
@@ -1054,6 +1071,7 @@ def execute_pipeline_job(
         "job_id": handle.job_id,
         "success": ok,
         "status": "timeline_ready" if ok else "failed",
+        "stage": res.stage if res else stage,
         "project_path": str(project_p) if ok else None,
         "timelines": sorted(res.edit_timelines) if ok else [],
         "duration": round(res.total_duration, 2) if res else 0.0,

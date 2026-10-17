@@ -607,4 +607,17 @@ class PipelineExecutionResult:
     sections: list[SongSection] = field(default_factory=list)
     source_files: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Staged workflow (Phase 23 B1): which stage produced this result, the golden takes (rough cut)
+    # and the REAL soundtrack analysis (an ``AudioAnalysisResult``; typed Any to avoid an import cycle).
+    stage: Literal["rough_cut", "sequence", "all"] = "all"
+    cleaned_segments: list[CleanedSegment] = field(default_factory=list)
+    audio_analysis: Any = None
+
+    @property
+    def bar_grid(self) -> "MusicalBarGrid | None":
+        return getattr(self.audio_analysis, "bar_grid", None)
+
+    @property
+    def beats(self) -> list[BeatMarker]:
+        return list(getattr(self.audio_analysis, "beats", None) or [])
 

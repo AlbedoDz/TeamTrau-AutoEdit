@@ -14,6 +14,7 @@ from src.core.config import (
     check_nvenc_available,
 )
 from src.core.service import StudioBackendAdapter
+from src.core.stage_options import CADENCE_NAMES, apply_staged_options
 from src.modules.ingest_detector import IngestDetector
 
 logging.basicConfig(
@@ -216,8 +217,33 @@ def gui_cmd(dry_run: bool) -> None:
 @click.option(
     "--soundtrack",
     type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-    required=True,
-    help="Soundtrack audio file (.wav, .mp3, .flac).",
+    default=None,
+    help="Soundtrack audio file (.wav, .mp3, .flac). Optional only for --stage rough_cut.",
+)
+@click.option(
+    "--stage",
+    type=click.Choice(["rough_cut", "sequence", "all"], case_sensitive=False),
+    default="all",
+    show_default=True,
+    help="rough_cut: ingest + defect pruning (no soundtrack); sequence: ingest + music edit from the "
+    "footage; all: the classic one-pass analysis.",
+)
+@click.option(
+    "--rough-cut/--no-rough-cut",
+    "rough_cut",
+    default=None,
+    help="With --stage all: run the defect-pruning rough cut first (default: off, classic flow).",
+)
+@click.option(
+    "--cadence",
+    type=click.Choice(list(CADENCE_NAMES), case_sensitive=False),
+    default=None,
+    help="Cadence profile (how fast shots turn over relative to the musical bar).",
+)
+@click.option(
+    "--genre",
+    default=None,
+    help="Genre preset key (see the genre presets, e.g. travel_cinematic, sports_extreme); drives pacing.",
 )
 @click.option(
     "--output-dir",
@@ -373,7 +399,7 @@ def gui_cmd(dry_run: bool) -> None:
 )
 def run_pipeline(
     input_dir: Path,
-    soundtrack: Path,
+    soundtrack: Path | None,
     output_dir: Path,
     preset: str,
     fps: float | None,
@@ -407,12 +433,18 @@ def run_pipeline(
     watermark_opacity: float = 0.85,
     watermark_margin: int = 40,
     no_audio_fix: bool = False,
+    stage: str = "all",
+    rough_cut: bool | None = None,
+    cadence: str | None = None,
+    genre: str | None = None,
 ) -> None:
     """Analyze footage and auto-edit a timeline (saved as a .tteproj project).
 
     Nothing is exported until you ask for it: run `deliver` on the saved project, or pass
-    --render / --export-nle to do it in one go.
+    --render / --export-nle to do it in one go. `--stage rough_cut` only prunes defects
+    (no soundtrack needed) and saves the rough cut timeline.
     """
+    stage = stage.lower()
     if no_render:
         click.echo("Note: --no-render is deprecated; rendering is now opt-in via --render.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -460,6 +492,13 @@ def run_pipeline(
         cfg.watermark_margin = watermark_margin
     if no_audio_fix:
         cfg.enable_audio_fix = False
+    try:
+        apply_staged_options(cfg, genre=genre, cadence=cadence, rough_cut=rough_cut)
+    except ValueError as exc:
+        param = "--cadence" if cadence is not None and "cadence" in str(exc).lower() else "--genre"
+        raise click.BadParameter(str(exc), param_hint=param) from exc
+    if soundtrack is None and stage != "rough_cut" and cfg.workflow_mode != "rough_cut":
+        raise click.UsageError("--soundtrack is required unless --stage rough_cut (or the rough cut workflow) is used.")
 
     if clear_cache:
         detector = IngestDetector(cfg)
@@ -479,6 +518,7 @@ def run_pipeline(
         force_cpu=no_nvenc,
         resolve=resolve,
         dry_run_resolve=dry_run_resolve,
+        stage=stage,  # type: ignore[arg-type]
     )
     result = handle.result
     if not result or not result.success:
@@ -500,6 +540,9 @@ def run_pipeline(
         )
     if cfg.enable_vlm_tagging:
         click.echo(f"VLM Understanding: ACTIVE ({cfg.vlm_provider} / {cfg.vlm_model})")
+    click.echo(f"Stage            : {result.stage}")
+    if result.cleaned_segments:
+        click.echo(f"Golden Takes     : {len(result.cleaned_segments)} kept by the rough cut")
     click.echo(f"Song Sections    : {result.sections_detected} classified")
     click.echo(f"Music Tempo      : {result.audio_bpm:.1f} BPM")
     click.echo(f"Assembled Cuts   : {result.clip_count}")

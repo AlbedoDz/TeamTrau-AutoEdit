@@ -705,8 +705,13 @@ def build_rough_cut_edit_timeline(
     config: PipelineConfig,
     cleaned_segments: list[CleanedSegment],
     name: str = "RoughCut_Assembly",
+    variant_key: str = "master",
 ) -> EditTimeline:
-    """Chronological string-out of golden takes, keeping camera audio (no soundtrack)."""
+    """Chronological string-out of golden takes, keeping camera audio (no soundtrack).
+
+    The staged workflow stores it under ``variant_key="rough_cut"``; the standalone
+    ``workflow_mode="rough_cut"`` keeps the historical ``master`` key.
+    """
     if not cleaned_segments:
         raise ValueError("Cannot build rough cut timeline with empty cleaned_segments list.")
     fps = config.fps
@@ -732,6 +737,8 @@ def build_rough_cut_edit_timeline(
                 label=f"{seg.clip_path.stem}_take_{i + 1:03d}",
                 markers=markers,
                 original_path=seg.scene.original_path,
+                scene_start=seg.source_start_time,
+                scene_end=seg.source_end_time,
             )
         )
     return EditTimeline(
@@ -741,7 +748,7 @@ def build_rough_cut_edit_timeline(
         canvas_height=config.canvas_height,
         clips=clips,
         soundtrack_path=None,
-        variant_key="master",
+        variant_key=variant_key,
         kind="rough_cut",
     )
 
@@ -767,11 +774,20 @@ def apply_scene_curation(
     Cut points (the beat grid) and every manual edit on other clips are preserved: each
     affected clip keeps its length and is re-filled with the next included scene that is
     long enough (round-robin). Returns (new timeline, number of clips replaced).
+
+    A ``rough_cut`` timeline is a chronological string-out of golden takes: clips of excluded
+    scenes are simply dropped (nothing is refilled, the rest closes up). ``replaced`` then counts
+    the dropped clips.
     """
     excluded_keys = {scene_key(s.scene.clip_path, s.scene.start_time) for s in excluded}
     hit = [c for c in edit_tl.clips if clip_scene_key(c) in excluded_keys]
     if not hit:
         return edit_tl, 0
+    if edit_tl.kind == "rough_cut":
+        kept = [c for c in edit_tl.clips if clip_scene_key(c) not in excluded_keys]
+        if not kept:
+            raise ValueError("Every scene is excluded - include at least one scene to keep the rough cut.")
+        return dataclasses.replace(edit_tl, clips=kept), len(hit)
     pool = [
         s for s in included if scene_key(s.scene.clip_path, s.scene.start_time) not in excluded_keys
     ]

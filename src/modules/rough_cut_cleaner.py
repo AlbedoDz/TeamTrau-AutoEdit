@@ -14,18 +14,37 @@ Assembles surviving golden segments in strict chronological order.
 """
 
 import logging
+import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 
+from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig
 from src.core.ontology import natural_sort_key
 from src.core.types import CleanedSegment, DefectSpan, DefectType, SceneCut
 from src.modules.audio_normalizer import AudioNormalizer
 
 logger = logging.getLogger(__name__)
+
+
+# Bump when the detection algorithm changes so stale cache entries are ignored.
+_ALGO_VERSION = 1
+# Frame series are stored downsampled so the cache stays small; the long-shot window planner
+# (``shot_windows``) can reuse flow/sharpness without decoding the clip again.
+SERIES_HZ = 4.0
+
+_CACHE_PARAM_NAMES = (
+    "enable_head_tail_trim", "head_prune_sec", "tail_prune_sec", "head_tail_motion_ratio",
+    "enable_shake_pruning", "max_shake_threshold", "max_shake_min_duration",
+    "enable_ground_carrying_pruning", "enable_focus_guard", "focus_drop_ratio",
+    "focus_drop_min_duration", "enable_occlusion_guard", "occlusion_area_ratio",
+    "occlusion_luma_threshold", "occlusion_min_duration", "enable_exposure_clipping_guard",
+    "exposure_clip_ratio", "enable_flicker_repair", "min_take_duration_sec",
+)
 
 
 class RoughCutCleaner:
@@ -35,24 +54,52 @@ class RoughCutCleaner:
         """Initialize RoughCutCleaner with pipeline configuration."""
         self.config = config or PipelineConfig()
         self.audio_normalizer = AudioNormalizer(cache_dir=self.config.cache_dir / "audio_clean")
+        self._cache = AnalysisCache(self.config)
 
-    def inspect_scene(self, scene: SceneCut) -> list[CleanedSegment]:
+    def _cache_params(self) -> dict[str, Any]:
+        params = {n: getattr(self.config, n, None) for n in _CACHE_PARAM_NAMES}
+        params["algo"] = _ALGO_VERSION
+        return params
+
+    def inspect_scene(
+        self, scene: SceneCut, cancel_event: threading.Event | None = None
+    ) -> list[CleanedSegment]:
         """Inspect a single SceneCut for all defects and return pruned golden segments.
 
         Non-destructively bisects and trims defective portions while preserving
         chronological coordinates. Surviving segments shorter than min_take_duration_sec
-        are discarded.
+        are discarded. The per-frame analysis (the expensive part) is cached per file + scene
+        range + detection parameters under the ``rough_cut`` namespace; ``cancel_event`` is
+        checked every few frames and raises ``InterruptedError``.
         """
         clip_path = Path(scene.clip_path).resolve()
         if not clip_path.exists():
             logger.warning("Clip path does not exist: %s", clip_path)
             return []
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Rough cut cleaning cancelled by user.")
 
+        ckey = self._cache.make_key(clip_path, **self._cache_params())
+        skey = scene_key(scene.start_time, scene.end_time)
+        entry: dict[str, Any] = self._cache.load("rough_cut", clip_path, ckey) or {}
+        analysis = entry.get(skey)
+        if not isinstance(analysis, dict):
+            analysis = self._scan_scene(scene, clip_path, cancel_event)
+            if analysis is None:  # unreadable: not cached
+                return []
+            entry[skey] = analysis
+            self._cache.save("rough_cut", clip_path, ckey, entry)
+        return self._segments_from_analysis(scene, clip_path, analysis)
+
+    def _scan_scene(
+        self, scene: SceneCut, clip_path: Path, cancel_event: threading.Event | None
+    ) -> dict[str, Any] | None:
+        """Decode the scene frame by frame and detect defects (the heavy, cacheable pass)."""
         # Open video capture
         cap = cv2.VideoCapture(str(clip_path))
         if not cap.isOpened():
             logger.warning("Failed to open video capture for: %s", clip_path)
-            return []
+            return None
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 0 or np.isnan(fps):
@@ -63,7 +110,7 @@ class RoughCutCleaner:
         scene_end_frame = min(total_frames, int(round(scene.end_time * fps)))
         if scene_end_frame <= scene_start_frame:
             cap.release()
-            return []
+            return None
 
         # Frame-accurate sampling (step=1 for continuous sequential optical flow)
         step = 1
@@ -82,6 +129,9 @@ class RoughCutCleaner:
 
         frame_idx = scene_start_frame
         while frame_idx < scene_end_frame:
+            if cancel_event is not None and (frame_idx & 7) == 0 and cancel_event.is_set():
+                cap.release()
+                raise InterruptedError("Rough cut cleaning cancelled by user.")
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
@@ -164,8 +214,75 @@ class RoughCutCleaner:
 
         scene_dur = scene.end_time - scene.start_time
         if len(timestamps) < 2 or scene_dur < 0.2:
-            return []
+            return {"valid": False}
 
+        defect_spans, requires_deflicker = self._detect_defects(
+            scene_dur, timestamps, flow_mags, flow_dy, sharpnesses, occlusions, clippings, luma_means
+        )
+        return {
+            "valid": True,
+            "scene_dur": scene_dur,
+            "spans": [
+                {
+                    "start": d.start_time,
+                    "end": d.end_time,
+                    "type": d.defect_type.value,
+                    "severity": d.severity,
+                    "description": d.description,
+                }
+                for d in defect_spans
+            ],
+            "requires_deflicker": bool(requires_deflicker),
+            "mean_sharpness": float(np.mean(sharpnesses)) if sharpnesses else 1.0,
+            "series": self._downsample_series(timestamps, flow_mags, sharpnesses, occlusions, clippings),
+        }
+
+    @staticmethod
+    def _downsample_series(
+        timestamps: list[float],
+        flow_mags: list[float],
+        sharpnesses: list[float],
+        occlusions: list[float],
+        clippings: list[float],
+    ) -> dict[str, Any]:
+        """Per-frame series reduced to ``SERIES_HZ``: mean flow / sharpness, worst exposure flags."""
+        n_bins = int(timestamps[-1] * SERIES_HZ) + 1
+        flow = [0.0] * n_bins
+        sharp = [0.0] * n_bins
+        dark = [0.0] * n_bins
+        clip = [0.0] * n_bins
+        count = [0] * n_bins
+        for t, f, s, o, c in zip(timestamps, flow_mags, sharpnesses, occlusions, clippings, strict=False):
+            b = min(n_bins - 1, int(t * SERIES_HZ))
+            flow[b] += f
+            sharp[b] += s
+            dark[b] = max(dark[b], o)
+            clip[b] = max(clip[b], c)
+            count[b] += 1
+        for b in range(n_bins):
+            if count[b]:
+                flow[b] /= count[b]
+                sharp[b] /= count[b]
+        return {
+            "hz": SERIES_HZ,
+            "flow": [round(v, 3) for v in flow],
+            "sharpness": [round(v, 3) for v in sharp],
+            "dark_ratio": [round(v, 3) for v in dark],
+            "clip_ratio": [round(v, 3) for v in clip],
+        }
+
+    def _detect_defects(
+        self,
+        scene_dur: float,
+        timestamps: list[float],
+        flow_mags: list[float],
+        flow_dy: list[float],
+        sharpnesses: list[float],
+        occlusions: list[float],
+        clippings: list[float],
+        luma_means: list[float],
+    ) -> tuple[list[DefectSpan], bool]:
+        """Defect spans (scene-relative seconds) and the flicker flag from the per-frame series."""
         defect_spans: list[DefectSpan] = []
 
         # -----------------------------------------------------------------
@@ -388,6 +505,27 @@ class RoughCutCleaner:
             if zero_crossings > len(luma_diff) * 0.4 and np.std(luma_arr) > 4.0:
                 requires_deflicker = True
 
+        return defect_spans, requires_deflicker
+
+    def _segments_from_analysis(
+        self, scene: SceneCut, clip_path: Path, analysis: dict[str, Any]
+    ) -> list[CleanedSegment]:
+        """Golden takes of a scene from its (possibly cached) analysis."""
+        if not analysis.get("valid"):
+            return []
+        scene_dur = float(analysis["scene_dur"])
+        requires_deflicker = bool(analysis.get("requires_deflicker", False))
+        mean_sharpness = float(analysis.get("mean_sharpness", 1.0))
+        defect_spans = [
+            DefectSpan(
+                start_time=float(s["start"]),
+                end_time=float(s["end"]),
+                defect_type=DefectType(s["type"]),
+                severity=float(s.get("severity", 1.0)),
+                description=str(s.get("description", "")),
+            )
+            for s in analysis.get("spans", [])
+        ]
         # -----------------------------------------------------------------
         # C. Non-Destructive Interval Bisecting & Micro-Take Clamping
         # -----------------------------------------------------------------
@@ -423,7 +561,7 @@ class RoughCutCleaner:
                 source_end_time=abs_end,
                 defects_removed=take_defects,
                 requires_deflicker=requires_deflicker,
-                sharpness_score=float(np.mean(sharpnesses)) if sharpnesses else 1.0,
+                sharpness_score=mean_sharpness,
                 metadata={
                     "defects_count": len(take_defects),
                     "original_scene_duration": scene_dur,
@@ -472,6 +610,7 @@ class RoughCutCleaner:
         self,
         scenes: list[SceneCut],
         progress_callback: Callable[[float, float, str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[CleanedSegment]:
         """Process batch of SceneCuts across all footage, strictly ordered chronologically."""
         if not scenes:
@@ -484,7 +623,9 @@ class RoughCutCleaner:
             if progress_callback:
                 progress_callback(i / total, 1.0, f"Defect pruning {i+1}/{total}: {sc.clip_path.name}")
 
-            cleaned = self.inspect_scene(sc)
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Rough cut cleaning cancelled by user.")
+            cleaned = self.inspect_scene(sc, cancel_event=cancel_event)
             all_cleaned.extend(cleaned)
 
         # Enforce strict chronological ordering based on clip_path and start_time

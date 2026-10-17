@@ -288,6 +288,9 @@ class PipelineConfig(BaseModel):
     cadence_multiples: list[float] | None = Field(default=None)  # None = take from the profile
     cadence_seed: int = Field(default=7)
     enable_rough_cut_pruning: bool = Field(default=True)
+    # Staged workflow: ``submit_job(stage="all")`` runs the rough-cut cleaner first only when True
+    # (the GUI / agents set it from the "Rough cut pruning" checkbox); False = classic one-pass flow.
+    run_rough_cut_in_all: bool = Field(default=False)
     extended_shot_threshold_sec: float = Field(default=12.0)
     max_scene_len_sec: float = Field(default=16.0)
     allow_multi_segment_for_long_shots: bool = Field(default=True)

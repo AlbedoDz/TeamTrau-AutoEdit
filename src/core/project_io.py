@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from src.core.types import (
+    BeatMarker,
     CropWindow,
     DeliverSettings,
     EditClip,
@@ -215,4 +216,65 @@ def deliver_settings_from_dict(d: dict[str, Any]) -> DeliverSettings:
         relink_original=bool(d.get("relink_original", defaults.relink_original)),
         variants=list(d.get("variants") or defaults.variants),
         fcpxml_version=str(d.get("fcpxml_version", defaults.fcpxml_version)),
+    )
+
+
+def audio_state_to_dict(audio: Any | None) -> dict[str, Any]:
+    """REAL soundtrack analysis for a project (v2.3): beats with downbeats, bar grid, sections,
+    cut points, cadence cuts and tempo. ``audio`` is an ``AudioAnalysisResult`` (duck-typed);
+    ``None`` -> ``{}``."""
+    if audio is None:
+        return {}
+    ext = getattr(audio, "extracted_audio_path", None)
+    cadence = getattr(audio, "cadence_cuts", None)
+    return {
+        "tempo_bpm": float(getattr(audio, "tempo_bpm", 0.0)),
+        "duration": float(getattr(audio, "duration", 0.0)),
+        "sample_rate": int(getattr(audio, "sample_rate", 0)),
+        "beats": [
+            {
+                "timestamp": float(b.timestamp),
+                "frame_idx": int(b.frame_idx),
+                "strength": float(b.strength),
+                "is_downbeat": bool(b.is_downbeat),
+            }
+            for b in (getattr(audio, "beats", None) or [])
+        ],
+        "bar_grid": bar_grid_to_dict(getattr(audio, "bar_grid", None)),
+        "sections": [section_to_dict(s) for s in (getattr(audio, "sections", None) or [])],
+        "cut_timestamps": [float(t) for t in (getattr(audio, "cut_timestamps", None) or [])],
+        "cadence_cuts": None if cadence is None else [float(t) for t in cadence],
+        "extracted_audio_path": str(ext) if ext else None,
+    }
+
+
+def audio_state_from_dict(d: dict[str, Any] | None) -> Any | None:
+    """Inverse of :func:`audio_state_to_dict` -> ``AudioAnalysisResult`` (None for an empty dict).
+
+    Every key is optional so older / partial states still load.
+    """
+    if not d:
+        return None
+    from src.modules.audio_analyzer import AudioAnalysisResult
+
+    beats = [
+        BeatMarker(
+            timestamp=float(b["timestamp"]),
+            frame_idx=int(b.get("frame_idx", 0)),
+            strength=float(b.get("strength", 0.0)),
+            is_downbeat=bool(b.get("is_downbeat", False)),
+        )
+        for b in d.get("beats", [])
+    ]
+    cadence = d.get("cadence_cuts")
+    return AudioAnalysisResult(
+        tempo_bpm=float(d.get("tempo_bpm", 0.0)),
+        duration=float(d.get("duration", 0.0)),
+        beats=beats,
+        cut_timestamps=[float(t) for t in d.get("cut_timestamps", [])],
+        sample_rate=int(d.get("sample_rate", 22050)),
+        sections=[section_from_dict(s) for s in d.get("sections", [])],
+        extracted_audio_path=Path(d["extracted_audio_path"]) if d.get("extracted_audio_path") else None,
+        bar_grid=bar_grid_from_dict(d.get("bar_grid")),
+        cadence_cuts=None if cadence is None else [float(t) for t in cadence],
     )

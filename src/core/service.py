@@ -4,6 +4,7 @@ Decouples UI and API consumers from internal algorithmic modules, providing
 thread-safe job management, incremental progress callbacks, and cancellation.
 """
 
+import copy
 import dataclasses
 import json
 import logging
@@ -12,9 +13,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
+from src.core.analysis_cache import scene_key as span_key
 from src.core.config import PipelineConfig
+from src.core.ontology import infer_camera_role
 from src.core.types import (
     ALL_DELIVER_FORMATS,
     UNSUPPORTED_RAW_EXTENSIONS,
@@ -177,6 +180,71 @@ def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[
     return collected, skipped
 
 
+def _camera_role(scene: SceneCut) -> str:
+    """Camera role of the source clip (folder / file name heuristics, same as ingest)."""
+    try:
+        return infer_camera_role(scene.original_path or scene.clip_path).value
+    except Exception:  # pragma: no cover - defensive: roles are cosmetic
+        return "cam_a"
+
+
+def _is_scored(scene: ScoredScene) -> bool:
+    """True when the scene already carries normalised VisualScorer metrics (not raw rough-cut sharpness)."""
+    meta = scene.metadata or {}
+    return meta.get("scored_by") == "visual_scorer" or "dhash" in meta
+
+
+def _golden_scenes(
+    config: PipelineConfig, cleaned: list[CleanedSegment]
+) -> tuple[list[SceneCut], dict[tuple[Path, str], dict[str, Any]]]:
+    """Golden takes as ``SceneCut``s plus their JSON-safe ``metadata`` (``golden`` block, long-shot flag).
+
+    ``golden.defects`` are in source seconds (clip timeline); ``trimmed_sec`` is the footage the
+    cleaner removed from the originating scene (original duration minus all its takes).
+    """
+    kept: dict[tuple[str, str], float] = {}
+    for seg in cleaned:
+        k = (str(seg.clip_path), span_key(seg.scene.start_time, seg.scene.end_time))
+        kept[k] = kept.get(k, 0.0) + seg.duration
+    cuts: list[SceneCut] = []
+    meta: dict[tuple[Path, str], dict[str, Any]] = {}
+    for seg in cleaned:
+        cut = SceneCut(
+            clip_path=seg.clip_path,
+            start_time=seg.start_time,
+            end_time=seg.end_time,
+            start_frame=int(round(seg.start_time * config.fps)),
+            end_frame=int(round(seg.end_time * config.fps)),
+            duration=seg.duration,
+            original_path=seg.scene.original_path,
+        )
+        cuts.append(cut)
+        orig = float(seg.scene.end_time - seg.scene.start_time)
+        k = (str(seg.clip_path), span_key(seg.scene.start_time, seg.scene.end_time))
+        meta[(cut.clip_path, span_key(cut.start_time, cut.end_time))] = {
+            "golden": {
+                "source_in": round(float(seg.source_start_time), 4),
+                "source_out": round(float(seg.source_end_time), 4),
+                "defects": [
+                    {
+                        "type": d.defect_type.value,
+                        "start": round(float(seg.scene.start_time + d.start_time), 4),
+                        "end": round(float(seg.scene.start_time + d.end_time), 4),
+                        "description": d.description,
+                    }
+                    for d in seg.defects_removed
+                ],
+                "requires_deflicker": bool(seg.requires_deflicker),
+                "original_scene_duration": round(orig, 4),
+                "trimmed_sec": round(max(0.0, orig - kept[k]), 4),
+            },
+            "is_long_shot": bool(seg.duration >= config.extended_shot_threshold_sec),
+            "defects_count": len(seg.defects_removed),
+            "original_scene_duration": round(orig, 4),
+        }
+    return cuts, meta
+
+
 class StudioBackendAdapter:
     """Primary facade coordinating media analysis, timeline synthesis, and export."""
 
@@ -294,13 +362,34 @@ class StudioBackendAdapter:
         resolve: bool = False,
         dry_run_resolve: bool = False,
         export_nle: bool = False,
+        *,
+        stage: Literal["rough_cut", "sequence", "all"] = "all",
+        scenes: list[ScoredScene] | None = None,
+        existing_timelines: dict[str, EditTimeline] | None = None,
     ) -> JobHandle:
         """Submit an analysis + auto-edit job. It stops at "Timeline ready".
 
         Like DaVinci Resolve / Premiere / CapCut, nothing is exported or rendered unless
         explicitly requested: pass ``no_render=False`` / ``export_nle=True`` for a one-shot
         CLI run, otherwise call :meth:`submit_deliver_job` when the user clicks Export.
+
+        ``stage`` selects the staged workflow:
+
+        * ``"all"`` (default): the classic one-pass analysis. With ``config.run_rough_cut_in_all``
+          the defect-pruning rough cut runs first and the sequence is built from the golden takes.
+        * ``"rough_cut"``: ingest + defect pruning only; the result holds the golden takes
+          (``scored_scenes``) and ``edit_timelines["rough_cut"]``. No soundtrack is needed.
+        * ``"sequence"``: audio + scoring + reframing + cadence engine (master + variants). With
+          ``scenes`` (golden / curated scenes, e.g. from a saved project) footage is NOT ingested
+          again; scenes with ``metadata["included"] == False`` are left out of the edit.
+          ``existing_timelines`` are merged into the result (a ``rough_cut`` timeline survives; an
+          old master / variants are replaced). Needs a soundtrack.
+
+        ``config.workflow_mode == "rough_cut"`` stays the standalone alternative mode and ignores
+        ``stage``.
         """
+        if stage not in ("rough_cut", "sequence", "all"):
+            raise ValueError(f"Unknown stage '{stage}'. Use rough_cut, sequence or all.")
         handle = self._new_handle()
         cancel_event = handle.cancel_event
         job_id = handle.job_id
@@ -320,6 +409,9 @@ class StudioBackendAdapter:
                     dry_run_resolve=dry_run_resolve,
                     job_handle=handle,
                     export_nle=export_nle,
+                    stage=stage,
+                    scenes=scenes,
+                    existing_timelines=existing_timelines,
                 )
                 handle._result = res
             except Exception as exc:
@@ -345,6 +437,7 @@ class StudioBackendAdapter:
                     dialogue_sentences=0,
                     error_message="Cancelled by user." if cancelled else str(exc),
                     cancelled=cancelled,
+                    stage=stage,
                 )
             finally:
                 handle._completed.set()
@@ -816,9 +909,54 @@ class StudioBackendAdapter:
         dry_run_resolve: bool,
         job_handle: JobHandle | None,
         export_nle: bool = False,
+        stage: Literal["rough_cut", "sequence", "all"] = "all",
+        scenes: list[ScoredScene] | None = None,
+        existing_timelines: dict[str, EditTimeline] | None = None,
     ) -> PipelineExecutionResult:
-        """Synchronously execute analysis + auto-edit, ending at "Timeline ready"."""
-        total_stages = 7 if not no_render else 6
+        """Synchronously execute analysis + auto-edit, ending at "Timeline ready".
+
+        See :meth:`submit_job` for ``stage`` / ``scenes`` / ``existing_timelines``.
+        """
+        legacy_rough = config.workflow_mode == "rough_cut"  # standalone alternative mode
+        if legacy_rough:
+            stage = "all"
+        golden = not legacy_rough and (
+            stage == "rough_cut" or (stage == "all" and bool(getattr(config, "run_rough_cut_in_all", False)))
+        )
+        supplied: list[ScoredScene] = list(scenes or [])
+        if stage == "sequence" and scenes is not None and not supplied:
+            raise ValueError("No scenes supplied for the sequence stage - run the rough cut first.")
+        reuse_scenes = stage == "sequence" and bool(supplied)  # no ingest: golden / curated pool
+        needs_audio = stage != "rough_cut"
+        if stage == "sequence" and soundtrack is None:
+            raise ValueError("The sequence stage needs a soundtrack.")
+        pool_path = golden or reuse_scenes  # scored through the staged helpers below
+
+        # Stage plan: indices / total follow the stages that really run.
+        plan: list[str] = []
+        if not reuse_scenes:
+            plan.append("ingest")
+        if needs_audio:
+            plan.append("audio")
+        if golden or legacy_rough:
+            plan.append("clean")
+        if not legacy_rough:
+            plan.append("score")
+        if stage != "rough_cut":
+            plan += ["reframe", "enrich"]
+        plan.append("synth")
+        stage_idx = {k: i + 1 for i, k in enumerate(plan)}
+
+        deliver_formats: set[DeliverFormat] = set()
+        if export_nle:
+            deliver_formats |= {"fcpxml", "premiere", "otio"}
+            if config.enable_capcut_export:
+                deliver_formats.add("capcut")
+        if not no_render:
+            deliver_formats.add("mp4")
+        deliver_wanted = bool(deliver_formats) or resolve or dry_run_resolve
+        total_stages = len(plan) + (1 if deliver_wanted else 0)
+
         output_dir.mkdir(parents=True, exist_ok=True)
         # Analysis side-products live next to the project, never among deliverables.
         analysis_dir = output_dir / ".analysis"
@@ -834,52 +972,60 @@ class StudioBackendAdapter:
                 callbacks.on_stage_changed(name, idx, total_stages)
             logger.info("[Stage %d/%d] %s", idx, total_stages, name)
 
-        def _notify_progress(stage_pct: float, stage_idx: int, message: str) -> None:
+        def _notify_progress(stage_pct: float, stage_idx_: int, message: str) -> None:
             _check_cancel()
             if callbacks and callbacks.on_progress:
-                base_pct = ((stage_idx - 1) / total_stages) * 100.0
+                base_pct = ((stage_idx_ - 1) / total_stages) * 100.0
                 total_pct = base_pct + (stage_pct / total_stages)
                 callbacks.on_progress(stage_pct, total_pct, message)
 
         # -------------------------------------------------------------
         # Stage 1: Ingestion & Shot Detection (Multi-Source Capable)
         # -------------------------------------------------------------
-        _notify_stage("Ingesting & Detecting Scenes", 1)
-        collected_files, skipped_raw = collect_video_files(input_dir)
-        for raw in skipped_raw:
-            logger.warning("Skipping %s: camera RAW format is not supported (transcode it first).", raw.name)
-
-        # Deduplicate while preserving order
-        seen_paths = set()
-        raw_files: list[Path] = []
-        for f in collected_files:
-            rf = f.resolve()
-            if rf not in seen_paths:
-                seen_paths.add(rf)
-                raw_files.append(f)
-
-        if not raw_files:
-            raise FileNotFoundError(f"No video files found in {input_dir}")
-
         detector = IngestDetector(config)
-
-        # Pre-ingest VFR detection and normalization pass
+        raw_files: list[Path] = []
         probed_meta: dict[Path, VideoMetadata] = {}
-        if getattr(config, "auto_normalize_vfr", True):
-            normalized_raw = []
-            for rf in raw_files:
-                _check_cancel()
-                try:
-                    meta = detector.probe_video(rf)
-                    if meta.is_vfr:
-                        _notify_progress(5.0, 1, f"Normalizing VFR footage ({rf.name})...")
-                        rf = detector.normalize_to_cfr(rf, target_fps=config.fps)
-                    else:
-                        probed_meta[rf] = meta  # reused by ingest: no second ffprobe
-                except Exception as vfr_err:
-                    logger.warning("VFR check/normalization warning for %s: %s", rf.name, vfr_err)
-                normalized_raw.append(rf)
-            raw_files = normalized_raw
+        all_scenes: list[SceneCut] = []
+        if reuse_scenes:
+            # Golden / curated scenes come from the caller (saved project): nothing is re-ingested.
+            _check_cancel()
+            all_scenes = [s.scene for s in supplied]
+            for sc_in in all_scenes:
+                if sc_in.clip_path not in raw_files:
+                    raw_files.append(sc_in.clip_path)
+        else:
+            _notify_stage("Ingesting & Detecting Scenes", stage_idx["ingest"])
+            collected_files, skipped_raw = collect_video_files(input_dir)
+            for raw in skipped_raw:
+                logger.warning("Skipping %s: camera RAW format is not supported (transcode it first).", raw.name)
+
+            # Deduplicate while preserving order
+            seen_paths = set()
+            for f in collected_files:
+                rf = f.resolve()
+                if rf not in seen_paths:
+                    seen_paths.add(rf)
+                    raw_files.append(f)
+
+            if not raw_files:
+                raise FileNotFoundError(f"No video files found in {input_dir}")
+
+            # Pre-ingest VFR detection and normalization pass
+            if getattr(config, "auto_normalize_vfr", True):
+                normalized_raw = []
+                for rf in raw_files:
+                    _check_cancel()
+                    try:
+                        meta = detector.probe_video(rf)
+                        if meta.is_vfr:
+                            _notify_progress(5.0, 1, f"Normalizing VFR footage ({rf.name})...")
+                            rf = detector.normalize_to_cfr(rf, target_fps=config.fps)
+                        else:
+                            probed_meta[rf] = meta  # reused by ingest: no second ffprobe
+                    except Exception as vfr_err:
+                        logger.warning("VFR check/normalization warning for %s: %s", rf.name, vfr_err)
+                    normalized_raw.append(rf)
+                raw_files = normalized_raw
 
         def _ingest_prog(pct: float, msg: str) -> None:
             _notify_progress(pct, 1, msg)
@@ -891,7 +1037,7 @@ class StudioBackendAdapter:
         skip_audio = config.workflow_mode == "rough_cut" and (
             soundtrack is None or not Path(soundtrack).exists()
         )
-        if not skip_audio:
+        if needs_audio and not skip_audio:
 
             def _audio_job() -> tuple[Path | None, AudioAnalysisResult | None]:
                 active_in: Path | None = soundtrack
@@ -920,29 +1066,31 @@ class StudioBackendAdapter:
 
             audio_bg = _Background(_audio_job, "AutoEditAudio")
 
-        all_scenes = detector.batch_process_videos(
-            raw_files,
-            progress_callback=_ingest_prog,
-            cancel_event=cancel_event,
-            **({"metadata_map": probed_meta} if probed_meta else {}),
-        )
-        for bad_path, reason in detector.failed_files:
-            if callbacks and callbacks.on_log:
-                callbacks.on_log("WARNING", f"Skipped unreadable clip {bad_path.name}: {reason}")
-        if not all_scenes:
-            raise ValueError("No usable scene intervals detected from input footage.")
+        if not reuse_scenes:
+            all_scenes = detector.batch_process_videos(
+                raw_files,
+                progress_callback=_ingest_prog,
+                cancel_event=cancel_event,
+                **({"metadata_map": probed_meta} if probed_meta else {}),
+            )
+            for bad_path, reason in detector.failed_files:
+                if callbacks and callbacks.on_log:
+                    callbacks.on_log("WARNING", f"Skipped unreadable clip {bad_path.name}: {reason}")
+            if not all_scenes:
+                raise ValueError("No usable scene intervals detected from input footage.")
 
-        detector.export_metadata_csv(all_scenes, analysis_dir / "scenes_metadata.csv")
-        detector.export_metadata_edl(
-            all_scenes, analysis_dir / "scenes_metadata.edl", config.fps
-        )
+            detector.export_metadata_csv(all_scenes, analysis_dir / "scenes_metadata.csv")
+            detector.export_metadata_edl(
+                all_scenes, analysis_dir / "scenes_metadata.edl", config.fps
+            )
         total_footage_duration = sum(s.duration for s in all_scenes)
-        _notify_progress(100.0, 1, f"Discovered {len(all_scenes)} scenes across footage")
+        if not reuse_scenes:
+            _notify_progress(100.0, 1, f"Discovered {len(all_scenes)} scenes across footage")
 
         # Speech-to-text only needs the source files: start it now so it overlaps with
         # soundtrack analysis, scoring and reframing; it is joined in stage 5.
         whisper_bg: _Background | None = None
-        if config.enable_transcription:
+        if config.enable_transcription and stage != "rough_cut":
 
             def _transcribe_job() -> list[Any]:
                 transcriber = TranscriptionEngine(config)
@@ -962,9 +1110,21 @@ class StudioBackendAdapter:
         # -------------------------------------------------------------
         # Stage 2: Audio Rhythm & Structure Analysis
         # -------------------------------------------------------------
-        if audio_bg is None:
-            _notify_stage("Audio Rhythm & Structure (Bypassed for Rough Cut)", 2)
-            _notify_progress(100.0, 2, "Camera audio will be preserved on Track A1 (No soundtrack)")
+        analysed_audio: AudioAnalysisResult | None = None
+        if not needs_audio:
+            audio_res = AudioAnalysisResult(
+                tempo_bpm=0.0,
+                duration=total_footage_duration,
+                beats=[],
+                cut_timestamps=[0.0, total_footage_duration],
+                sample_rate=config.audio_sample_rate,
+                sections=[],
+                extracted_audio_path=None,
+            )
+            active_soundtrack = None
+        elif audio_bg is None:
+            _notify_stage("Audio Rhythm & Structure (Bypassed for Rough Cut)", stage_idx["audio"])
+            _notify_progress(100.0, stage_idx["audio"], "Camera audio will be preserved on Track A1 (No soundtrack)")
             audio_res = AudioAnalysisResult(
                 tempo_bpm=0.0,
                 duration=total_footage_duration,
@@ -976,8 +1136,9 @@ class StudioBackendAdapter:
             )
             active_soundtrack = None
         else:
-            _notify_stage("Analyzing Soundtrack & Musical Structure", 2)
-            _notify_progress(10.0, 2, "Computing continuous RMS and spectral novelty...")
+            a_idx = stage_idx["audio"]
+            _notify_stage("Analyzing Soundtrack & Musical Structure", a_idx)
+            _notify_progress(10.0, a_idx, "Computing continuous RMS and spectral novelty...")
             active_input_soundtrack, audio_res_opt = audio_bg.result()
             if audio_res_opt is None:  # footage_driven: needs the total footage duration
                 audio_res_opt = AudioAnalyzer(config).analyze(
@@ -987,29 +1148,39 @@ class StudioBackendAdapter:
                     duration_mode=config.duration_mode,
                 )
             audio_res = audio_res_opt
+            analysed_audio = audio_res
             active_soundtrack = audio_res.extracted_audio_path or active_input_soundtrack
             _notify_progress(
                 100.0,
-                2,
+                a_idx,
                 f"BPM: {audio_res.tempo_bpm:.1f}, Sections: {len(audio_res.sections)}",
             )
 
         # -------------------------------------------------------------
-        # Stage 3: Visual Quality Scoring & Deduplication / Defect Pruning
+        # Stage 3: Rough-cut defect pruning and/or visual quality scoring & deduplication
         # -------------------------------------------------------------
         cleaned_segments: list[CleanedSegment] = []
+        golden_meta: dict[tuple[Path, str], dict[str, Any]] = {}
         keyframe_store: KeyframeStore | None = None
-        if config.workflow_mode == "rough_cut":
-            _notify_stage("Rough Cut Defect Pruning (Wobble, Shake, Focus)", 3)
+        scored_all: list[ScoredScene] = []  # pool path: every golden / supplied scene
+        if golden or legacy_rough:
+            c_idx = stage_idx["clean"]
+            _notify_stage("Rough Cut Defect Pruning (Wobble, Shake, Focus)", c_idx)
             from src.modules.rough_cut_cleaner import RoughCutCleaner
 
             cleaner = RoughCutCleaner(config)
 
             def _clean_prog(sp: float, tp: float, msg: str) -> None:
-                _notify_progress(sp * 100.0, 3, msg)
+                _notify_progress(sp * 100.0, c_idx, msg)
 
-            cleaned_segments = cleaner.clean_batch(all_scenes, progress_callback=_clean_prog)
+            cleaned_segments = cleaner.clean_batch(
+                all_scenes, progress_callback=_clean_prog, cancel_event=cancel_event
+            )
+            if golden and not cleaned_segments:
+                raise ValueError("Rough cut kept no usable takes - every scene was pruned as defective.")
 
+        ranked_scenes: list[ScoredScene]
+        if legacy_rough:
             ranked_scenes = []
             for seg in cleaned_segments:
                 sc_cut = SceneCut(
@@ -1036,21 +1207,105 @@ class StudioBackendAdapter:
 
             _notify_progress(
                 100.0,
-                3,
+                c_idx,
                 f"Cleaned {len(cleaned_segments)} golden takes in chronological order",
             )
+        elif pool_path:
+            s_idx = stage_idx["score"]
+            if golden:
+                golden_cuts, golden_meta = _golden_scenes(config, cleaned_segments)
+                _notify_progress(100.0, c_idx, f"Cleaned {len(cleaned_segments)} golden takes in chronological order")
+                prescored: list[ScoredScene] = []
+                todo_cuts = golden_cuts
+            else:
+                prescored = [s for s in supplied if _is_scored(s)]
+                todo_cuts = [s.scene for s in supplied if not _is_scored(s)]
+            _notify_stage("Evaluating Visual Quality & Deduplication", s_idx)
+            # Golden takes are scored on the normalised VisualScorer scale (never raw Tenengrad);
+            # de-duplication happens on the edit pool only, so the take list stays complete.
+            scorer = VisualScorer(config.model_copy(update={"enable_deduplication": False}))
+
+            def _pool_score_prog(pct: float, msg: str) -> None:
+                _notify_progress(pct, s_idx, msg)
+
+            reframe_active = config.enable_smart_reframing and (
+                config.canvas_width < config.canvas_height
+            )
+            _notify_progress(0.0, s_idx, "Reading keyframes (one pass per clip)...")
+            skip_keys = scorer.cached_scene_keys(todo_cuts, from_store=True) if todo_cuts else set()
+            skip_keys |= {
+                (s.scene.clip_path, span_key(s.scene.start_time, s.scene.end_time)) for s in prescored
+            }
+            keyframe_store = extract_keyframes(
+                build_requests(
+                    [s.scene for s in prescored] + todo_cuts,
+                    config,
+                    scorer=bool(todo_cuts),
+                    reframer=reframe_active and stage != "rough_cut",
+                    vlm=config.enable_vlm_tagging and stage != "rough_cut",
+                    boundaries=config.enable_exposure_guard and stage != "rough_cut",
+                    skip_scorer_for=skip_keys,
+                ),
+                config,
+                cancel_event=cancel_event,
+            )
+            _check_cancel()
+            scored_new = (
+                scorer.score_and_rank_scenes(
+                    todo_cuts,
+                    progress_callback=_pool_score_prog,
+                    cancel_event=cancel_event,
+                    keyframes=keyframe_store,
+                )
+                if todo_cuts
+                else []
+            )
+            _check_cancel()
+            by_key = {(s.scene.clip_path, span_key(s.scene.start_time, s.scene.end_time)): s for s in supplied}
+            for sc in scored_new:
+                key = (sc.scene.clip_path, span_key(sc.scene.start_time, sc.scene.end_time))
+                old = by_key.get(key)
+                if old is not None:  # keep curation / golden info, take the fresh scores
+                    merged = dict(old.metadata)
+                    merged.update(sc.metadata)
+                    sc.metadata = merged
+                    sc.camera_role = old.camera_role
+                    sc.metadata["scored_by"] = "visual_scorer"
+                else:
+                    sc.metadata.update(copy.deepcopy(golden_meta.get(key, {})))
+                    sc.camera_role = _camera_role(sc.scene)
+                    sc.metadata["scored_by"] = "visual_scorer"
+            scored_all = sorted(prescored + scored_new, key=lambda s: s.composite_score, reverse=True)
+            if callbacks and callbacks.on_scene_discovered:
+                for sc in scored_all:
+                    callbacks.on_scene_discovered(sc)
+
+            if stage == "rough_cut":
+                ranked_scenes = list(scored_all)
+            else:
+                ranked_scenes = [s for s in scored_all if s.metadata.get("included", True) is not False]
+                if not ranked_scenes:
+                    raise ValueError("Every scene is excluded - include at least one scene to build the sequence.")
+                if config.enable_deduplication:
+                    ranked_scenes = scorer.deduplicate_scenes(ranked_scenes)
+                if config.enable_exposure_guard:
+                    attach_boundary_frames(ranked_scenes, keyframe_store)
+            _notify_progress(100.0, s_idx, f"Ranked {len(ranked_scenes)} scene candidates")
+            if hasattr(scorer, "unload_model"):
+                scorer.unload_model()
         else:
-            _notify_stage("Evaluating Visual Quality & Deduplication", 3)
+            s_idx = stage_idx["score"]
+            _notify_stage("Evaluating Visual Quality & Deduplication", s_idx)
             scorer = VisualScorer(config)
 
             def _score_prog(pct: float, msg: str) -> None:
-                _notify_progress(pct, 3, msg)
+                _notify_progress(pct, s_idx, msg)
 
             # One sweep per clip feeds scorer, reframer, VLM and cut-continuity checks.
             reframe_active = config.enable_smart_reframing and (
                 config.canvas_width < config.canvas_height
             )
-            _notify_progress(0.0, 3, "Reading keyframes (one pass per clip)...")
+            _notify_progress(0.0, s_idx, "Reading keyframes (one pass per clip)...")
             keyframe_store = extract_keyframes(
                 build_requests(
                     all_scenes,
@@ -1079,92 +1334,104 @@ class StudioBackendAdapter:
                 for sc in ranked_scenes:
                     callbacks.on_scene_discovered(sc)
 
-            _notify_progress(100.0, 3, f"Ranked {len(ranked_scenes)} unique scene candidates")
+            _notify_progress(100.0, s_idx, f"Ranked {len(ranked_scenes)} unique scene candidates")
             if hasattr(scorer, "unload_model"):
                 scorer.unload_model()
 
-        # -------------------------------------------------------------
-        # Stage 4: AI Smart 9:16 Reframing (if vertical)
-        # -------------------------------------------------------------
-        _notify_stage("AI Smart 9:16 Re-framing (YOLO & EMA)", 4)
-        if config.enable_smart_reframing and (
-            config.canvas_width < config.canvas_height
-        ):
+        transcribed_sentences: list[Any] = []
+        if stage != "rough_cut":
+            # -------------------------------------------------------------
+            # Stage 4: AI Smart 9:16 Reframing (if vertical)
+            # -------------------------------------------------------------
+            r_idx = stage_idx["reframe"]
+            _notify_stage("AI Smart 9:16 Re-framing (YOLO & EMA)", r_idx)
+            if config.enable_smart_reframing and (
+                config.canvas_width < config.canvas_height
+            ):
 
-            def _reframe_prog(pct: float, msg: str) -> None:
-                _notify_progress(pct, 4, msg)
+                def _reframe_prog(pct: float, msg: str) -> None:
+                    _notify_progress(pct, r_idx, msg)
 
-            reframer = SmartReframer(config)
-            ranked_scenes = reframer.reframe_all_scenes(
-                ranked_scenes,
-                progress_callback=_reframe_prog,
-                cancel_event=cancel_event,
-                **({"keyframes": keyframe_store} if keyframe_store is not None else {}),
-            )
-            _notify_progress(100.0, 4, "9:16 pan-and-scan crop windows calculated")
-            if hasattr(reframer, "unload_model"):
-                reframer.unload_model()
-        else:
-            _notify_progress(100.0, 4, "Skipped (Canvas is horizontal or reframing disabled)")
+                reframer = SmartReframer(config)
+                ranked_scenes = reframer.reframe_all_scenes(
+                    ranked_scenes,
+                    progress_callback=_reframe_prog,
+                    cancel_event=cancel_event,
+                    **({"keyframes": keyframe_store} if keyframe_store is not None else {}),
+                )
+                _notify_progress(100.0, r_idx, "9:16 pan-and-scan crop windows calculated")
+                if hasattr(reframer, "unload_model"):
+                    reframer.unload_model()
+            else:
+                _notify_progress(100.0, r_idx, "Skipped (Canvas is horizontal or reframing disabled)")
 
-        # -------------------------------------------------------------
-        # Stage 5: Speech-to-Text & VLM Semantic Tagging
-        # -------------------------------------------------------------
-        _notify_stage("Speech Transcription & Semantic Understanding", 5)
-        transcribed_sentences = []
-        if whisper_bg is not None:
-            _notify_progress(20.0, 5, "Extracting speech dialogue via faster-whisper...")
-            transcribed_sentences.extend(whisper_bg.result())
-            _check_cancel()
+            # -------------------------------------------------------------
+            # Stage 5: Speech-to-Text & VLM Semantic Tagging
+            # -------------------------------------------------------------
+            e_idx = stage_idx["enrich"]
+            _notify_stage("Speech Transcription & Semantic Understanding", e_idx)
+            if whisper_bg is not None:
+                _notify_progress(20.0, e_idx, "Extracting speech dialogue via faster-whisper...")
+                transcribed_sentences.extend(whisper_bg.result())
+                _check_cancel()
 
-            if transcribed_sentences:
-                is_vert = config.canvas_width < config.canvas_height
-                if getattr(config, "subtitle_style", "kinetic_ass") == "kinetic_ass":
-                    try:
-                        from src.modules.kinetic_subtitle import export_kinetic_ass
+                if transcribed_sentences:
+                    is_vert = config.canvas_width < config.canvas_height
+                    if getattr(config, "subtitle_style", "kinetic_ass") == "kinetic_ass":
+                        try:
+                            from src.modules.kinetic_subtitle import export_kinetic_ass
 
-                        ass_path = analysis_dir / "subtitles_kinetic.ass"
-                        export_kinetic_ass(
-                            transcribed_sentences,
-                            ass_path,
-                            is_vertical=is_vert,
-                            margin_v=config.subtitle_margin_v_vertical if is_vert else config.subtitle_margin_v_horizontal,
+                            ass_path = analysis_dir / "subtitles_kinetic.ass"
+                            export_kinetic_ass(
+                                transcribed_sentences,
+                                ass_path,
+                                is_vertical=is_vert,
+                                margin_v=config.subtitle_margin_v_vertical if is_vert else config.subtitle_margin_v_horizontal,
+                            )
+                            logger.info("Exported kinetic subtitles: %s", ass_path.name)
+                        except Exception as sub_err:
+                            logger.warning("Failed to export kinetic subtitles: %s", sub_err)
+
+                    if config.target_duration:
+                        packer = DurationPacker(config)
+                        packed_res = packer.pack_timeline(
+                            sentences=transcribed_sentences,
+                            scored_scenes=ranked_scenes,
+                            target_duration=config.target_duration,
                         )
-                        logger.info("Exported kinetic subtitles: %s", ass_path.name)
-                    except Exception as sub_err:
-                        logger.warning("Failed to export kinetic subtitles: %s", sub_err)
+                        ranked_scenes = packed_res.selected_scenes
 
-                if config.target_duration:
-                    packer = DurationPacker(config)
-                    packed_res = packer.pack_timeline(
-                        sentences=transcribed_sentences,
-                        scored_scenes=ranked_scenes,
-                        target_duration=config.target_duration,
-                    )
-                    ranked_scenes = packed_res.selected_scenes
+            if config.enable_vlm_tagging:
+                _notify_progress(60.0, e_idx, f"Tagging scenes with VLM ({config.vlm_provider})...")
+                vlm_engine = VLMAssistant(config)
+                ranked_scenes = vlm_engine.tag_scored_scenes(
+                    ranked_scenes,
+                    keyframes=vlm_keyframes(ranked_scenes, keyframe_store) if keyframe_store is not None else None,
+                )
+                if callbacks and callbacks.on_scenes_tagged:
+                    callbacks.on_scenes_tagged(ranked_scenes)
 
-
-        if config.enable_vlm_tagging:
-            _notify_progress(60.0, 5, f"Tagging scenes with VLM ({config.vlm_provider})...")
-            vlm_engine = VLMAssistant(config)
-            ranked_scenes = vlm_engine.tag_scored_scenes(
-                ranked_scenes,
-                keyframes=vlm_keyframes(ranked_scenes, keyframe_store) if keyframe_store is not None else None,
-            )
-            if callbacks and callbacks.on_scenes_tagged:
-                callbacks.on_scenes_tagged(ranked_scenes)
-
-        _notify_progress(100.0, 5, "Speech dialogue and semantic analysis completed")
+            _notify_progress(100.0, e_idx, "Speech dialogue and semantic analysis completed")
 
         # -------------------------------------------------------------
         # Stage 6: Edit Timeline Synthesis (no files are exported here)
         # -------------------------------------------------------------
-        _notify_stage("Edit Timeline Synthesis & Variants", 6)
-        _notify_progress(25.0, 6, "Assembling edit timeline...")
-        if config.workflow_mode == "rough_cut" and cleaned_segments:
-            master_tl = build_rough_cut_edit_timeline(
-                config, cleaned_segments, name=f"RoughCut_{config.preset_name}"
+        y_idx = stage_idx["synth"]
+        _notify_stage("Edit Timeline Synthesis & Variants", y_idx)
+        _notify_progress(25.0, y_idx, "Assembling edit timeline...")
+        rough_tl: EditTimeline | None = None
+        if cleaned_segments and (golden or legacy_rough):
+            rough_tl = build_rough_cut_edit_timeline(
+                config,
+                cleaned_segments,
+                name=f"RoughCut_{config.preset_name}",
+                variant_key="master" if legacy_rough else "rough_cut",
             )
+        if legacy_rough and rough_tl is not None:
+            master_tl = rough_tl
+        elif stage == "rough_cut":
+            assert rough_tl is not None
+            master_tl = rough_tl
         else:
             master_tl = build_edit_timeline(
                 config,
@@ -1178,12 +1445,16 @@ class StudioBackendAdapter:
                 profile=config.cadence_profile,
                 cadence_seed=config.cadence_seed,
             )
-        edit_timelines: dict[str, EditTimeline] = {"master": master_tl}
+        edit_timelines: dict[str, EditTimeline] = {}
+        if stage == "rough_cut":
+            edit_timelines["rough_cut"] = master_tl
+        else:
+            edit_timelines["master"] = master_tl
 
         variants = {}
         stage_warnings: list[str] = []
-        if config.workflow_mode != "rough_cut" and active_soundtrack is not None:
-            _notify_progress(60.0, 6, "Synthesizing creative variants...")
+        if not legacy_rough and stage != "rough_cut" and active_soundtrack is not None:
+            _notify_progress(60.0, y_idx, "Synthesizing creative variants...")
             try:
                 from src.modules.variant_synthesizer import MultiVariantTimelineSynthesizer
 
@@ -1206,34 +1477,48 @@ class StudioBackendAdapter:
                 logger.warning("Multi-variant timeline synthesis warning: %s", var_err, exc_info=True)
                 stage_warnings.append(f"Variant synthesis failed: {var_err}")
 
+        if stage != "rough_cut" and not legacy_rough:
+            # The rough cut survives a re-sequence; an old master / variants are replaced.
+            if rough_tl is not None:
+                edit_timelines["rough_cut"] = rough_tl
+            elif existing_timelines:
+                for key, tl in existing_timelines.items():
+                    if tl.kind == "rough_cut" and key not in edit_timelines:
+                        edit_timelines[key] = tl
+
         # Boundary frames were only needed for cut-continuity checks; free the memory.
-        for sc in ranked_scenes:
+        for sc in ranked_scenes + scored_all:
             sc.metadata.pop("_boundary_frame_start", None)
             sc.metadata.pop("_boundary_frame_end", None)
         keyframe_store = None
 
-        _notify_progress(100.0, 6, f"Timeline ready ({len(master_tl.clips)} clips, {len(variants)} variants)")
+        # Pool path: the project keeps every golden / supplied scene (curation list), the edit
+        # pool first.
+        result_scenes = ranked_scenes
+        if pool_path and stage != "rough_cut":
+            in_pool = {(s.scene.clip_path, span_key(s.scene.start_time, s.scene.end_time)) for s in ranked_scenes}
+            result_scenes = ranked_scenes + [
+                s
+                for s in scored_all
+                if (s.scene.clip_path, span_key(s.scene.start_time, s.scene.end_time)) not in in_pool
+            ]
+
+        _notify_progress(100.0, y_idx, f"Timeline ready ({len(master_tl.clips)} clips, {len(variants)} variants)")
 
         # -------------------------------------------------------------
         # Optional one-shot Deliver (CLI --render / --export-nle only)
         # -------------------------------------------------------------
         deliver_res: DeliverResult | None = None
-        formats: set[DeliverFormat] = set()
-        if export_nle:
-            formats |= {"fcpxml", "premiere", "otio"}
-            if config.enable_capcut_export:
-                formats.add("capcut")
-        if not no_render:
-            formats.add("mp4")
-        if formats or resolve or dry_run_resolve:
-            _notify_stage("Deliver: Export & Render", 7)
+        if deliver_wanted:
+            d_idx = len(plan) + 1
+            _notify_stage("Deliver: Export & Render", d_idx)
             deliver_res = self._execute_deliver(
                 master_tl,
                 output_dir,
                 config,
-                formats=formats,
+                formats=deliver_formats,
                 callbacks=JobCallbacks(
-                    on_progress=lambda sp, _tp, msg: _notify_progress(sp, 7, msg)
+                    on_progress=lambda sp, _tp, msg: _notify_progress(sp, d_idx, msg)
                 ),
                 cancel_event=cancel_event,
                 force_cpu=force_cpu,
@@ -1249,6 +1534,7 @@ class StudioBackendAdapter:
         # Write pipeline summary JSON
         summary = {
             "status": "SUCCESS",
+            "stage": stage,
             "preset": config.preset_name,
             "canvas": f"{config.canvas_width}x{config.canvas_height}@{config.fps}fps",
             "width": config.canvas_width,
@@ -1262,6 +1548,7 @@ class StudioBackendAdapter:
             "total_footage_duration": total_footage_duration,
             "scenes_detected": len(all_scenes),
             "scenes_selected": len(ranked_scenes),
+            "golden_takes": len(cleaned_segments),
             "transcription_enabled": config.enable_transcription,
             "dialogue_sentences": len(transcribed_sentences),
             "sections_detected": len(audio_res.sections),
@@ -1305,7 +1592,7 @@ class StudioBackendAdapter:
             resolve_status=resolve_info,
             dialogue_sentences=len(transcribed_sentences),
             error_message=None,
-            scored_scenes=ranked_scenes,
+            scored_scenes=result_scenes,
             timeline_variants=variants,
             active_variant_name="beat_driven" if "beat_driven" in variants else None,
             failed_files=list(detector.failed_files),
@@ -1315,4 +1602,7 @@ class StudioBackendAdapter:
             sections=list(audio_res.sections),
             source_files=list(raw_files),
             warnings=stage_warnings,
+            stage=stage,
+            cleaned_segments=cleaned_segments,
+            audio_analysis=analysed_audio,
         )
