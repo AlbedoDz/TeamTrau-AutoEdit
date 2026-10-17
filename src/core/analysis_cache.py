@@ -20,7 +20,7 @@ from src.core.config import PipelineConfig
 logger = logging.getLogger(__name__)
 
 # Bump when the stored schema or the algorithm of any cached analysis changes.
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # 2: audio results carry bar_grid + cadence_cuts
 
 _write_lock = threading.Lock()
 

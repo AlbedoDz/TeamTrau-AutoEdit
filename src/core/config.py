@@ -281,6 +281,17 @@ class PipelineConfig(BaseModel):
     audio_fade_out_sec: float = Field(default=2.5)
     action_drop_threshold: float = Field(default=0.70)
 
+    # Rhythmic cadence engine (Phase 23): cuts on bar/half-bar points with a per-section curve.
+    # ``use_cadence_engine=False`` keeps the legacy beat filter (0.8 s / 0.4 s) as the pipeline.
+    use_cadence_engine: bool = Field(default=True)
+    cadence_profile: str = Field(default="balanced_narrative")
+    cadence_multiples: list[float] | None = Field(default=None)  # None = take from the profile
+    cadence_seed: int = Field(default=7)
+    enable_rough_cut_pruning: bool = Field(default=True)
+    extended_shot_threshold_sec: float = Field(default=12.0)
+    max_scene_len_sec: float = Field(default=16.0)
+    allow_multi_segment_for_long_shots: bool = Field(default=True)
+
     # Visual Scoring Constants
     sharpness_weight: float = Field(default=0.5)
     aesthetic_weight: float = Field(default=0.5)

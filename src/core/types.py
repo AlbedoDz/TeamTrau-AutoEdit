@@ -77,6 +77,34 @@ class BeatMarker:
     is_downbeat: bool
 
 
+class CadenceProfile(str, Enum):
+    """How quickly shots turn over relative to the musical bar (see ``src/core/cadence.py``)."""
+
+    FAST_SYNCOPATED = "fast_syncopated"
+    BALANCED_NARRATIVE = "balanced_narrative"
+    LINGERING_CINEMATIC = "lingering_cinematic"
+    VIRAL_BURST = "viral_burst"
+
+
+@dataclass
+class MusicalBarGrid:
+    """Bar/phrase lattice of a soundtrack (seconds on the soundtrack/timeline clock).
+
+    ``phrase_N`` lists the bar times that START an N-bar phrase. Phrases restart at every
+    SongSection boundary, so a phrase never spans two sections. ``confidence`` is in [0, 1];
+    below ~0.4 callers should fall back to the legacy beat filter.
+    """
+
+    tempo_bpm: float
+    beats_per_bar: int = 4
+    bar_times: list[float] = field(default_factory=list)
+    phrase_2: list[float] = field(default_factory=list)
+    phrase_4: list[float] = field(default_factory=list)
+    phrase_8: list[float] = field(default_factory=list)
+    confidence: float = 0.0
+    bar_confidence: list[float] = field(default_factory=list)
+
+
 class DurationMode(str, Enum):
     """Operational mode for soundtrack and video duration decoupling."""
 
@@ -297,6 +325,10 @@ class EditClip:
     # Set by retarget_timeline when the canvas aspect changed: ``crop_window`` was computed for
     # the previous canvas and exporters/renderers should recompute (or ignore) it.
     crop_needs_recompute: bool = False
+    # Identity of the originating scene (source seconds). Set when a clip is built from a scene so
+    # curation/variants do not depend on ``source_in`` once clips use arbitrary sub-windows.
+    scene_start: float | None = None
+    scene_end: float | None = None
 
     def media_path(self, relink_original: bool = True) -> Path:
         """Path an NLE file should reference: the original media when known, else the source."""
@@ -328,6 +360,10 @@ class EditTimeline:
     sections: list[SongSection] = field(default_factory=list)
     variant_key: str = "master"
     kind: Literal["music", "rough_cut"] = "music"
+    # Musical lattice used to place cuts (for the ruler) and the largest distance, in seconds,
+    # between an ideal cadence cut and the frame it was snapped to.
+    bar_grid: MusicalBarGrid | None = None
+    cut_snap_error_max_sec: float | None = None
 
     @property
     def total_frames(self) -> int:

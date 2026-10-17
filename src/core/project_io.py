@@ -8,6 +8,7 @@ from src.core.types import (
     DeliverSettings,
     EditClip,
     EditTimeline,
+    MusicalBarGrid,
     SongSection,
     SongSectionType,
 )
@@ -67,6 +68,40 @@ def section_from_dict(d: dict[str, Any]) -> SongSection:
     )
 
 
+def bar_grid_to_dict(g: MusicalBarGrid | None) -> dict[str, Any] | None:
+    if g is None:
+        return None
+    return {
+        "tempo_bpm": g.tempo_bpm,
+        "beats_per_bar": g.beats_per_bar,
+        "bar_times": list(g.bar_times),
+        "phrase_2": list(g.phrase_2),
+        "phrase_4": list(g.phrase_4),
+        "phrase_8": list(g.phrase_8),
+        "confidence": g.confidence,
+        "bar_confidence": list(g.bar_confidence),
+    }
+
+
+def bar_grid_from_dict(d: dict[str, Any] | None) -> MusicalBarGrid | None:
+    if not d:
+        return None
+    return MusicalBarGrid(
+        tempo_bpm=float(d.get("tempo_bpm", 0.0)),
+        beats_per_bar=int(d.get("beats_per_bar", 4)),
+        bar_times=[float(t) for t in d.get("bar_times", [])],
+        phrase_2=[float(t) for t in d.get("phrase_2", [])],
+        phrase_4=[float(t) for t in d.get("phrase_4", [])],
+        phrase_8=[float(t) for t in d.get("phrase_8", [])],
+        confidence=float(d.get("confidence", 0.0)),
+        bar_confidence=[float(t) for t in d.get("bar_confidence", [])],
+    )
+
+
+def _opt_float(v: Any) -> float | None:
+    return None if v is None else float(v)
+
+
 def edit_clip_to_dict(c: EditClip) -> dict[str, Any]:
     return {
         "source_path": str(c.source_path),
@@ -82,6 +117,8 @@ def edit_clip_to_dict(c: EditClip) -> dict[str, Any]:
         "markers": list(c.markers),
         "original_path": str(c.original_path) if c.original_path else None,
         "crop_needs_recompute": c.crop_needs_recompute,
+        "scene_start": c.scene_start,
+        "scene_end": c.scene_end,
     }
 
 
@@ -100,6 +137,8 @@ def edit_clip_from_dict(d: dict[str, Any]) -> EditClip:
         markers=list(d.get("markers", [])),
         original_path=Path(d["original_path"]) if d.get("original_path") else None,
         crop_needs_recompute=bool(d.get("crop_needs_recompute", False)),
+        scene_start=_opt_float(d.get("scene_start")),
+        scene_end=_opt_float(d.get("scene_end")),
     )
 
 
@@ -115,6 +154,8 @@ def edit_timeline_to_dict(tl: EditTimeline) -> dict[str, Any]:
         "kind": tl.kind,
         "sections": [section_to_dict(s) for s in tl.sections],
         "clips": [edit_clip_to_dict(c) for c in tl.clips],
+        "bar_grid": bar_grid_to_dict(tl.bar_grid),
+        "cut_snap_error_max_sec": tl.cut_snap_error_max_sec,
     }
 
 
@@ -130,6 +171,8 @@ def edit_timeline_from_dict(d: dict[str, Any]) -> EditTimeline:
         sections=[section_from_dict(s) for s in d.get("sections", [])],
         variant_key=str(d.get("variant_key", "master")),
         kind="rough_cut" if d.get("kind") == "rough_cut" else "music",
+        bar_grid=bar_grid_from_dict(d.get("bar_grid")),
+        cut_snap_error_max_sec=_opt_float(d.get("cut_snap_error_max_sec")),
     )
 
 

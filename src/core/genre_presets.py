@@ -3,11 +3,13 @@
 Controls pacing, cut frequency, speed-ramping, beat snapping, transitions, and camera-role priorities.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Final
 
+from src.core.cadence import PROFILE_MULTIPLES
 from src.core.config import PRESETS, PipelineConfig
+from src.core.types import CadenceProfile
 
 
 class MajorGenre(str, Enum):
@@ -44,6 +46,10 @@ class SubGenrePreset:
     reframing_mode: str
     action_drop_threshold: float
     preferred_camera_roles: list[str] = field(default_factory=list)
+    # Rhythmic cadence (Phase 23): see _CADENCE_BY_GROUP below for how presets map to profiles.
+    cadence_profile: str = CadenceProfile.BALANCED_NARRATIVE.value
+    target_bar_multiples: tuple[float, ...] = PROFILE_MULTIPLES[CadenceProfile.BALANCED_NARRATIVE]
+    allow_extended_shots: bool = True
 
     def apply(self, config: PipelineConfig) -> PipelineConfig:
         """Mutate a PipelineConfig with this preset's operational parameters."""
@@ -62,6 +68,8 @@ class SubGenrePreset:
         config.ken_burns_scale_factor = self.ken_burns_scale_factor
         config.reframing_mode = self.reframing_mode
         config.action_drop_threshold = self.action_drop_threshold
+        config.cadence_profile = self.cadence_profile
+        config.cadence_multiples = list(self.target_bar_multiples)
 
         # Update resolution preset if valid
         if self.preferred_render_preset in PRESETS:
@@ -77,7 +85,77 @@ class SubGenrePreset:
         return config
 
 
-GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = {
+# Cadence mapping (slot lengths in bars, see src/core/cadence.py):
+#
+#   profile              multiples   sub-genres
+#   -------------------  ----------  ---------------------------------------------------------
+#   lingering_cinematic  2, 4, 8     travel_cinematic, travel_luxury, travel_nature,
+#                                    commercial_realestate, doc_interview, narrative_shortfilm,
+#                                    wedding_highlight
+#   balanced_narrative   1, 2, 4     travel_roadtrip, travel_daily_vlog, travel_food,
+#                                    commercial_product, commercial_brand_promo,
+#                                    commercial_tech_review, doc_bts, rough_cut_assembly
+#   fast_syncopated      0.5, 1, 2   sports_extreme, sports_racing, sports_combat,
+#                                    sports_outdoor, sports_fpv_drone, sports_gaming
+#   viral_burst          0.5, 1      social_tiktok_fast, social_reels_aesthetic,
+#                                    commercial_fashion
+_CADENCE_BY_KEY: Final[dict[str, CadenceProfile]] = {
+    **dict.fromkeys(
+        (
+            "travel_cinematic",
+            "travel_luxury",
+            "travel_nature",
+            "commercial_realestate",
+            "doc_interview",
+            "narrative_shortfilm",
+            "wedding_highlight",
+        ),
+        CadenceProfile.LINGERING_CINEMATIC,
+    ),
+    **dict.fromkeys(
+        (
+            "travel_roadtrip",
+            "travel_daily_vlog",
+            "travel_food",
+            "commercial_product",
+            "commercial_brand_promo",
+            "commercial_tech_review",
+            "doc_bts",
+            "rough_cut_assembly",
+        ),
+        CadenceProfile.BALANCED_NARRATIVE,
+    ),
+    **dict.fromkeys(
+        (
+            "sports_extreme",
+            "sports_racing",
+            "sports_combat",
+            "sports_outdoor",
+            "sports_fpv_drone",
+            "sports_gaming",
+        ),
+        CadenceProfile.FAST_SYNCOPATED,
+    ),
+    **dict.fromkeys(
+        ("social_tiktok_fast", "social_reels_aesthetic", "commercial_fashion"),
+        CadenceProfile.VIRAL_BURST,
+    ),
+}
+
+
+def _with_cadence(presets: dict[str, SubGenrePreset]) -> dict[str, SubGenrePreset]:
+    """Fill cadence_profile / target_bar_multiples from _CADENCE_BY_KEY (KeyError = unmapped)."""
+    return {
+        key: replace(
+            p,
+            cadence_profile=_CADENCE_BY_KEY[key].value,
+            target_bar_multiples=PROFILE_MULTIPLES[_CADENCE_BY_KEY[key]],
+        )
+        for key, p in presets.items()
+    }
+
+
+GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = _with_cadence({
     # -------------------------------------------------------------
     # 1. Action & Sports (6 Sub-genres)
     # -------------------------------------------------------------
@@ -622,9 +700,10 @@ GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = {
         action_drop_threshold=0.80,
         preferred_camera_roles=["b_roll", "cam_a", "drone"],
     ),
-}
+})
 
-ROUGH_CUT_PRESET: Final[SubGenrePreset] = SubGenrePreset(
+ROUGH_CUT_PRESET: Final[SubGenrePreset] = _with_cadence(
+    {"rough_cut_assembly": SubGenrePreset(
     key="rough_cut_assembly",
     major_genre=MajorGenre.DOCUMENTARY_NARRATIVE,
     display_name="Rough Cut Stringout & Defect Pruning",
@@ -646,7 +725,8 @@ ROUGH_CUT_PRESET: Final[SubGenrePreset] = SubGenrePreset(
     reframing_mode="auto_hybrid",
     action_drop_threshold=0.70,
     preferred_camera_roles=["cam_a", "cam_b", "drone", "action_cam", "b_roll"],
-)
+)}
+)["rough_cut_assembly"]
 
 
 def get_preset_by_key(key: str) -> SubGenrePreset:

@@ -15,11 +15,22 @@ import numpy as np
 import soundfile as sf
 
 from src.core.analysis_cache import AnalysisCache
+from src.core.cadence import (
+    assign_downbeats,
+    cadence_cuts_with_stats,
+    estimate_beats_per_bar,
+    extract_musical_bar_grid,
+    profile_multiples,
+)
 from src.core.config import PipelineConfig
 from src.core.ffmpeg_utils import run_tool
-from src.core.types import BeatMarker, SongSection, SongSectionType
+from src.core.project_io import bar_grid_from_dict
+from src.core.types import BeatMarker, MusicalBarGrid, SongSection, SongSectionType
 
 logger = logging.getLogger(__name__)
+
+# Hop (samples) of the onset envelope / beat tracker; BeatMarker.frame_idx counts these hops.
+ANALYSIS_HOP_LENGTH = 512
 
 
 @dataclass
@@ -33,6 +44,11 @@ class AudioAnalysisResult:
     sample_rate: int
     sections: list[SongSection] = field(default_factory=list)
     extracted_audio_path: Path | None = None
+    # Bar/phrase lattice (None when disabled, too few beats, or analysis cache predates it).
+    bar_grid: MusicalBarGrid | None = None
+    # Bar-locked cuts for the configured profile with default multiples; None = use the legacy
+    # ``cut_timestamps`` (bar grid missing or low confidence). Consumers switch to it in A3.
+    cadence_cuts: list[float] | None = None
 
 
 class AudioAnalyzer:
@@ -620,6 +636,13 @@ class AudioAnalyzer:
             std_beat=cfg.standard_min_beat_interval,
             climax_beat=cfg.climax_min_beat_interval,
             fade=cfg.audio_fade_out_sec,
+            cadence=(
+                cfg.use_cadence_engine,
+                cfg.cadence_profile,
+                tuple(cfg.cadence_multiples) if cfg.cadence_multiples else None,
+                cfg.cadence_seed,
+                cfg.fps,
+            ),
         )
 
     @staticmethod
@@ -646,6 +669,10 @@ class AudioAnalyzer:
                 for sec in d["sections"]
             ],
             extracted_audio_path=extracted,
+            bar_grid=bar_grid_from_dict(d.get("bar_grid")),
+            cadence_cuts=(
+                [float(c) for c in d["cadence_cuts"]] if d.get("cadence_cuts") else None
+            ),
         )
 
     def analyze(
@@ -780,6 +807,8 @@ class AudioAnalyzer:
             target_dur = target_duration if target_duration is not None else self.config.target_duration
 
         extracted_audio_path = None
+        start_t = 0.0
+        end_t = duration
         if target_dur is not None and target_dur < (duration - 1.0):
             (
                 extracted_audio_path,
@@ -799,7 +828,7 @@ class AudioAnalyzer:
             filtered_markers = [
                 BeatMarker(
                     timestamp=float(m.timestamp - start_t),
-                    frame_idx=int(round((m.timestamp - start_t) * sr)),
+                    frame_idx=int(round((m.timestamp - start_t) * sr / ANALYSIS_HOP_LENGTH)),
                     strength=m.strength,
                     is_downbeat=m.is_downbeat,
                 )
@@ -817,6 +846,21 @@ class AudioAnalyzer:
             "YES" if extracted_audio_path else "NO",
         )
 
+        bar_grid: MusicalBarGrid | None = None
+        cadence_cuts: list[float] | None = None
+        if self.config.use_cadence_engine:
+            window = [
+                BeatMarker(
+                    timestamp=m.timestamp - start_t,
+                    frame_idx=m.frame_idx,
+                    strength=m.strength,
+                    is_downbeat=m.is_downbeat,
+                )
+                for m in raw_markers
+                if start_t <= m.timestamp <= end_t
+            ]
+            bar_grid, cadence_cuts = self._cadence_outputs(window, sections, tempo_bpm, duration, sr)
+
         return AudioAnalysisResult(
             tempo_bpm=tempo_bpm,
             duration=duration,
@@ -825,7 +869,44 @@ class AudioAnalyzer:
             sample_rate=sr,
             sections=sections,
             extracted_audio_path=extracted_audio_path,
+            bar_grid=bar_grid,
+            cadence_cuts=cadence_cuts,
         )
+
+    def _cadence_outputs(
+        self,
+        beats: list[BeatMarker],
+        sections: list[SongSection],
+        tempo_bpm: float,
+        duration: float,
+        sr: int,
+    ) -> tuple[MusicalBarGrid | None, list[float] | None]:
+        """Bar grid for the (possibly extracted) soundtrack window + default-multiples cuts."""
+        if len(beats) < 4:
+            return None, None
+        meter = estimate_beats_per_bar([b.strength for b in beats])
+        if meter != 4:
+            beats = assign_downbeats(beats, meter)
+        grid = extract_musical_bar_grid(
+            beats, sections, tempo_bpm, duration, ANALYSIS_HOP_LENGTH / sr, beats_per_bar=meter
+        )
+        stats = cadence_cuts_with_stats(
+            grid,
+            sections,
+            self.config.cadence_profile,
+            profile_multiples(self.config.cadence_profile, self.config),
+            duration,
+            self.config.fps,
+            self.config.cadence_seed,
+        )
+        logger.info(
+            "Bar grid: %d bars, %d/bar, confidence=%.2f, cadence cuts=%s",
+            len(grid.bar_times),
+            meter,
+            grid.confidence,
+            "n/a (legacy fallback)" if stats is None else len(stats[0]),
+        )
+        return grid, (None if stats is None else stats[0])
 
     def _filter_micro_cuts(
         self, markers: list[BeatMarker], min_interval: float
