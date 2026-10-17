@@ -1,6 +1,6 @@
 # TECHNICAL HANDOFF DOSSIER: TEAMTRAU-AUTOEDIT ORCHESTRATOR
 **Confidential & Proprietary — Engineering Handoff Blueprint**  
-**Document Revision:** 2.1.0 (Post-Phase 15 Engine Audit & Clearance)  
+**Document Revision:** 2.2.0 (Post-Phase 20: real FCPXML 1.8, Resolve-verified; GUI config/cancel/curation fixes)  
 **System Target:** Windows 11 Enterprise (x64), NVIDIA CUDA 12+, NVENC Gen 8 (RTX 3070+), DaVinci Resolve Studio 19/21, PySide6  
 **Audience:** Incoming Principal AI Software Architect & Autonomous Coding Agents
 
@@ -101,6 +101,10 @@ flowchart TD
   * `infer_camera_role(path: Path) -> CameraRole`: Lexical pattern matcher identifying camera tags from folder or file naming conventions (`drone`, `dji`, `gopro`, `pov`, `hero`, `cam_a`, `wide`, `broll`).
   * `get_role_display_name(role: CameraRole | str) -> str`: Human-readable label generator for UI dropdowns.
 - **Dependencies:** `src.core.types`. Downstream: `MediaBrowserWidget`, `IngestDetector`, `ProjectManager`.
+
+#### `src/core/analysis_cache.py`, `src/core/project_io.py`, `src/core/ffmpeg_utils.py`
+- **Role:** Disk cache for per-clip analysis results (repeat runs skip recomputation: analysis 33.6s -> 1.8s cached); `.tteproj` read/write helpers used by Edit/Deliver; shared FFmpeg subprocess and probe helpers.
+- **Dependencies:** `src.core.types`. Downstream: `StudioBackendAdapter`, `ProjectManager`, `NvencRenderer`.
 
 #### `src/core/genre_presets.py`
 - **Role:** Multi-genre editorial ontology matrix covering 4 Major Genres and 23 Sub-genres.
@@ -241,10 +245,24 @@ flowchart TD
 - **Core Signatures:**
   * `class TimelineBuilder`:
     - `build_timeline(scored_scenes, cut_timestamps, soundtrack_path, ...) -> otio.schema.Timeline`: Builds multi-track sequence (Track V2 Teaser Hook, Track V1 Master Sequence, Track A1 Soundtrack).
-    - `export_fcpxml(...) -> Path`: Exports DaVinci Resolve FCPXML (FCP 7 XML / FCPXML v1.8+).
+    - `export_fcpxml(...) -> Path`: Exports DaVinci Resolve FCPXML 1.8 via `fcpxml_exporter` (the old FCP 7 XML written into a `.fcpxml` file is gone).
     - `export_premiere_xml(...) -> Path`: Exports Adobe Premiere Pro XML.
     - `export_all(...) -> TimelineExportResult`: Exports FCPXML, Premiere XML, OTIO, and triggers CapCut draft export.
 - **Dependencies:** `opentimelineio`, `xml.etree.ElementTree`. Downstream: `StudioBackendAdapter`, `VariantSynthesizer`.
+
+#### `src/modules/edit_timeline.py`
+- **Role:** Edit-stage timeline operations on the analysed OTIO timeline: scene curation (`apply_scene_curation` replaces clips from excluded scenes, keeps beat grid and manual edits), clip move/delete used by the GUI undo stack.
+- **Dependencies:** `opentimelineio`, `src.core.types`. Downstream: `main_window.py`, `project_manager.py`, `StudioBackendAdapter`.
+
+#### `src/modules/keyframe_cache.py`
+- **Role:** Shared keyframe sweep: one decode pass feeds sharpness, aesthetic, dedup and reframing stages instead of each stage re-decoding the video.
+- **Dependencies:** `cv2`, `numpy`. Downstream: `VisualScorer`, `SmartReframer`, `StudioBackendAdapter`.
+
+#### `src/modules/fcpxml_exporter.py`
+- **Role:** Native FCPXML 1.8 writer for DaVinci Resolve, built straight from the OTIO timeline (`fa8589c`).
+- **Hardware Vector:** CPU-bound XML serialization.
+- **Core Behavior:** Exact rational times; asset-clip spine; `timeMap` speed ramps (linear segments through origin, `start = in-point/speed`); gaps; cross-dissolve; music as connected lane -1 with camera audio ducked/muted; rough-cut markers; percent-encoded unicode URLs. Audio clips carry an `AutoEdit` role (`music` / `camera_audio`) instead of name matching.
+- **Dependencies:** `xml.etree.ElementTree`, `opentimelineio`. Downstream: `TimelineBuilder.export_fcpxml`, `ResolveDispatcher`.
 
 #### `src/modules/capcut_exporter.py`
 - **Role:** Native CapCut Desktop project draft generator (`draft_content.json` & `draft_meta_info.json`).
@@ -305,12 +323,13 @@ flowchart TD
       * Handles cooperative cancellation via `cancel_event.is_set()` with graceful `proc.terminate()` and timeout `kill()`.
 - **Dependencies:** `subprocess`, `threading`, `shutil`. Downstream: `StudioBackendAdapter`.
 
-#### `src/dispatchers/resolve_dispatcher.py`
+#### `src/dispatchers/resolve_dispatcher.py` & `resolve_worker.py`
 - **Role:** DaVinci Resolve Studio automation client via Windows Scripting API (`fusionscript.dll`).
 - **Hardware Vector:** External process IPC via Blackmagic Design DaVinciResolveScript.
 - **Core Signatures:**
   * `class ResolveDispatcher`:
-    - `dispatch_project(fcpxml_path, source_media_paths, project_name, ...) -> dict[str, Any]`: Launches or binds to running Resolve Studio instance, creates project, configures timeline canvas dimensions, imports FCPXML, populates media pool, and queues deliverables.
+    - `dispatch_project(fcpxml_path, source_media_paths, project_name, ...) -> dict[str, Any]`: Binds to running Resolve Studio, creates a **new** project (never reconfigures the user's open one), keeps NTSC rates (29.97 / 23.976), imports FCPXML, populates media pool, queues deliverables.
+    - Falls back to `resolve_worker.py` in a subprocess under a Python that fusionscript supports (3.13 on the reference machine; the 3.11 venv cannot load it).
 - **Dependencies:** `DaVinciResolveScript`. Downstream: `StudioBackendAdapter`.
 
 #### `src/dispatchers/watermark_helper.py`
@@ -393,9 +412,11 @@ sequenceDiagram
 
 ## 3. TEST BASELINE & QUALITY INVARIANTS
 
-### 3.1 Verified Test Suite Mapping (219 Passing Tests)
+### 3.1 Verified Test Suite Mapping (315 collected; 314 passing on last full run)
 
-The repository maintains 100% test pass rate across 42 test modules (`pytest -v`):
+Last full run (`pytest tests -q`): 314 passed, 1 failed. The failure is `tests/test_service_adapter.py::test_adapter_submit_job_async_and_cancel`, which passes when run alone. It is flaky under full-suite load and not yet root-caused. Treat as open, not as a regression that was fixed.
+
+Per-module mapping below. Rows added in 2.2.0 are the new GUI, FCPXML, Resolve, cache and concurrency suites:
 
 | Test Suite File | Covered Module | Test Count | Key Verification Objectives |
 |:---|:---|:---:|:---|
@@ -407,7 +428,13 @@ The repository maintains 100% test pass rate across 42 test modules (`pytest -v`
 | `test_capcut_exporter.py` | `src/modules/capcut_exporter.py` | 3 | CapCut `draft_content.json`, microsecond timecodes, track layout |
 | `test_config.py` | `src/core/config.py` | 4 | Preset definitions, Pydantic validation, resolution overrides |
 | `test_duration_packer.py` | `src/modules/duration_packer.py` | 3 | Knapsack duration solver, dialogue-to-B-roll ratio allocation |
+| `test_edit_deliver_gui.py` | `src/ui/main_window.py`, `timeline_view.py` | 10 | Edit/Deliver split in Desktop Studio, Timeline ready state, export gating |
 | `test_export_panel.py` | `src/ui/widgets/export_panel.py` | 10 | Multi-NLE export checkboxes, NVENC bitrate/CQ overrides, render monitor |
+| `test_fcpxml_exporter.py` | `src/modules/fcpxml_exporter.py` | 9 | FCPXML 1.8 structure, exact rational times, timeMap ramps, unicode URLs, audio roles |
+| `test_gui_config_precedence.py` | `src/ui/main_window.py` | 7 | Single `_build_config()`: Rough Cut, Apply Preset, Export honour UI state |
+| `test_keyframe_cache.py` | `src/modules/keyframe_cache.py` | 7 | Shared keyframe sweep correctness and reuse across stages |
+| `test_pipeline_concurrency.py` | `src/core/service.py` | 4 | Audio/whisper overlap, cancellation during concurrent stages |
+| `test_scene_curation_and_cancel.py` | `edit_timeline.py`, `service.py` | 7 | Scene curation applied to timeline, "Cancelled" vs "Failed" result |
 | `test_genre_presets.py` | `src/core/genre_presets.py` | 3 | 23-genre matrix integrity, dynamic `apply()` mutations |
 | `test_genre_recommender.py` | `src/modules/genre_recommender.py` | 4 | DSP audio feature matching, 1-click UI recommendation banner |
 | `test_gui_shell.py` | `src/ui/main_window.py` | 6 | PySide6 window shell, dark theme loading, status bar updates |
@@ -422,7 +449,7 @@ The repository maintains 100% test pass rate across 42 test modules (`pytest -v`
 | `test_nvenc_renderer.py` | `src/dispatchers/nvenc_renderer.py` | 5 | Dynamic filtergraph generation, NVENC flags, CPU fallback |
 | `test_pipeline_e2e.py` | End-to-End Orchestrator | 5 | Complete synthetic pipeline run: FCPXML, Premiere, NVENC render |
 | `test_project_manager.py` | `src/ui/controllers/project_manager.py` | 5 | `.tteproj` v2.0.0 serialization, deserialization, dirty state |
-| `test_resolve_dispatcher.py` | `src/dispatchers/resolve_dispatcher.py` | 3 | DaVinci Resolve Studio API client, dry-run simulation |
+| `test_resolve_dispatcher.py` | `src/dispatchers/resolve_dispatcher.py`, `resolve_worker.py` | 6 | DaVinci Resolve Studio API client, new-project creation, NTSC rates, worker fallback |
 | `test_scene_grid.py` | `src/ui/widgets/scene_grid.py` | 12 | Thumbnail grid, sharpness/aesthetic badges, include toggles |
 | `test_service_adapter.py` | `src/core/service.py` | 7 | Sync/async submission, callback streaming, job cancellation |
 | `test_settings_dialog.py` | `src/ui/widgets/settings_dialog.py` | 6 | 5-tab preferences persistence, async test ping, JSON config |
@@ -453,6 +480,14 @@ The repository maintains 100% test pass rate across 42 test modules (`pytest -v`
 ---
 
 ## 4. CRITICAL GAP ANALYSIS, TECHNICAL DEBT & LIMITATIONS
+
+### 4.0 Cleared Debt (Resolved in Phase 17-20)
+- **Resolve reconfigured the user's open project:** Resolved. `ResolveDispatcher` creates a new project, keeps NTSC rates, and falls back to `resolve_worker.py` under a compatible Python.
+- **FCP7 XML written as `.fcpxml`:** Resolved. Native FCPXML 1.8 writer `fcpxml_exporter.py`, verified in Resolve Studio 21.
+- **FCPXML retime lost/doubled in-point:** Resolved. `start = in-point/speed` with linear timeMap through origin.
+- **GUI export silently reset Rough Cut and Apply Preset did nothing:** Resolved by single `_build_config()` (`049a216`).
+- **Scene exclusions had no effect on the export:** Resolved. Apply Scene Curation to Timeline (`15cb868`).
+- **User Stop reported as "Export failed":** Resolved. Result status is "Cancelled".
 
 ### 4.1 Cleared Debt (Resolved in Phase 15)
 - **VFR Timecode Drift:** Resolved. `IngestDetector.probe_video` flags `is_vfr: bool` and executes non-destructive CFR normalization before scene segmentation.
@@ -488,8 +523,9 @@ The following architectural limitations, edge cases, and missing features remain
   * Add explicit `aresample=48000:async=1` to every input video audio stream to prevent micro-clicks when concatenating mixed 44.1kHz and 48kHz camera audio.
 
 #### 3. [MODERATE] NLE Interchange Schema Loss
-- **DaVinci Resolve FCPXML (Variable Speed Ramping):**
-  * Speed ramping (1x - 8x variable playback curves) is translated as static linear retimed segments (`<rate>` and `<duration>`). Quadratic/Bezier speed curves cannot be preserved across standard FCP 7 XML / FCPXML schemas.
+- **DaVinci Resolve FCPXML (Variable Speed Ramping) — partly resolved in 2.2.0:**
+  * FCPXML 1.8 is now written natively (`fcpxml_exporter.py`) and imports into Resolve Studio 21 with clips, audio lanes, gaps, dissolves and unicode paths intact. Speed ramps are `timeMap` segments, each linear.
+  * Still open: smooth Quadratic/Bezier speed curves are approximated by linear segments; Resolve does not get the curve shape.
 - **Adobe Premiere Pro XML (9:16 Crop Window & Motion):**
   * 9:16 pan-and-scan crop coordinates (`CropWindow`) cannot be represented in standard FCP 7 XML without proprietary `<effect><name>Basic Motion</name>` injection. Premiere Pro opens footage uncropped at full 16:9 canvas dimensions unless user manually crops in Effects Controls.
 - **CapCut Desktop (`draft_content.json` Version Drift):**
@@ -522,7 +558,7 @@ If you are an incoming AI agent or software engineer taking over `TeamTrau-AutoE
    .venv\Scripts\python.exe -m pytest tests -v --tb=short
    .venv\Scripts\python.exe -m ruff check src tests main.py
    ```
-   All 219 tests must pass with 0 ruff errors.
+   All tests must pass with 0 ruff errors. Baseline is 315 collected; the flaky `test_adapter_submit_job_async_and_cancel` (section 3.1) must be fixed or re-verified before calling a run clean.
 2. **Respect the Unified Service Facade:** Never implement pipeline logic directly inside Qt widgets or Click CLI commands. All business logic must be authored inside `src/modules/` or `src/dispatchers/` and orchestrated via `StudioBackendAdapter` in `src/core/service.py`.
 3. **Strict Thread Safety:** Never call Qt GUI elements (`QProgressBar`, `QTableWidget`) directly from background worker threads. Always emit through `BackendSignalBridge` (`src/ui/adapter_bridge.py`).
 4. **Immediate Next Implementation Tasks (Phase 16 Master Plan):**

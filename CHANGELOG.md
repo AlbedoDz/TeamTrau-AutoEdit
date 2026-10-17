@@ -1,3 +1,18 @@
+## Commits 46978b3..3838675 (Phase 22-23)
+Grouped by feature. Commit hashes in parentheses.
+
+- **Deliver settings** (`46978b3`, `3928cca`, `7c988d1`, `996f749`): `DeliverSettings` covers canvas, exact fps (23.976/29.97/59.94/119.88), fit mode, colour, audio, master codec (hevc/h264/prores/dnxhr), subtitles, relink to originals. 21 presets in GUI, CLI and MCP. `deliver_manifest.json` and per-variant folders. Master render handles HDR→SDR tone-map, cross-dissolves and `.srt`/`.ass` burn-in. `watermark_in_nle` is recorded but not applied yet.
+- **Resolve FCPXML** (`268cb95`, `f4be479`): per-asset formats, colour, timecode and reframe. Retimed clips use `start = snapped_in/speed`, verified on Resolve with 4K 29.97 and 01:00:00:00 timecode.
+- **Premiere / CapCut** (`eb70ec2`, `91b4dcd`): Premiere sequence format from canvas, Time Remap for speed ramps, Basic Motion for 9:16 crop, correct audio channels so Link Media works. CapCut: real speed materials, gaps, crop, camera audio ducked. **Premiere and CapCut changes are not verified in the real apps.**
+- **Audio fix** (`aca58ba`): `apad+atrim` after the mix pins master audio to video length (dropped ~0.17 s under load).
+- **Cadence engine** (`0ed8945`, `9485ce6`, `179b27d`): bar/phrase grid, 23 genre cadence profiles, shot sub-windows, cadence slot allocation on bar points. Teaser ends at the half-bar point nearest `teaser_duration`.
+- **Staged workflow** (`a219edd`, `3838675`): `submit_job(stage=rough_cut | sequence | all)`, cached rough cut, project schema 2.3.0. GUI 4-step stepper with per-stage cancel, scene badges and re-edit from stored scenes without re-ingest. CLI `--stage` / `--rough-cut` / `--cadence` / `--genre`.
+- **Merge** `f4be479` (Resolve FCPXML formats).
+
+Changes not yet in `docs/TECHNICAL_HANDOFF.md` (rev 2.2.0 covers up to `510fb62` only).
+
+---
+
 ## Commits 4b2de02..7ea75d2 (2026-10-17)
 Itemized by commit. Summary for the unlisted range; Phase 17-19 below covers the same work at feature level.
 
@@ -18,6 +33,13 @@ Itemized by commit. Summary for the unlisted range; Phase 17-19 below covers the
 - **Edit/Deliver split**: analysis ends at "Timeline ready"; nothing is rendered or exported until the user asks (GUI Export button, `main.py deliver`, MCP `render_master`/`export_timeline` with `project_path`). Exports match the edited timeline exactly. New 540p preview render.
 - **Fixes**: unicode filenames, speed-ramp audio sync, clips without audio, native-quality music, rotated phone footage, NLE source ranges, beat alignment, failed-clip reporting.
 - **Speed**: ~2.3x faster cold, ~2.5x cached overall (analysis 33.6s -> 1.8s cached): shared keyframes, analysis cache, merged dead-air pass, GPU batching, concurrent stages.
+- **GUI config precedence** (`049a216`): single `_build_config()` in Desktop Studio. Export panel no longer resets Rough Cut to standard. "Apply Preset" now takes effect. Export uses current UI state (watermark, NVENC overrides, keep-audio). All 3 variants always generated so they can be compared in Edit.
+- **Scene curation reaches timeline** (`15cb868`): new Edit > Apply Scene Curation to Timeline replaces clips from excluded scenes while keeping beat grid and manual edits (`apply_scene_curation` in `edit_timeline.py`). Scene hotkeys P/X/F no longer act on scene #1 when no row is selected.
+- **Cancel reported correctly** (`15cb868`): user Stop shows "Cancelled" (`PipelineExecutionResult.cancelled` / `DeliverResult.cancelled`), not "Export failed".
+- **Resolve safety** (`510fb62`): ResolveDispatcher creates a new project instead of reconfiguring the open one, keeps NTSC rates, falls back to `resolve_worker.py` under a Python that fusionscript supports (3.13; venv 3.11 cannot load it).
+- **FCPXML retime fix** (`510fb62`): retimed clips lost/doubled in-point. Resolve reads `start*speed`, so `start = in-point/speed` with linear timeMap through origin. Verified by importing into Resolve Studio 21.0.4.5 and comparing exported stills.
+- New modules: `src/modules/fcpxml_exporter.py` (FCPXML 1.8 writer, `fa8589c`), `src/dispatchers/resolve_worker.py`.
+- New tests: `test_fcpxml_exporter.py`, `test_gui_config_precedence.py`, `test_scene_curation_and_cancel.py`. Suite: 314/315 pass in full run (`test_service_adapter.py::test_adapter_submit_job_async_and_cancel` failed once, passes alone; flaky, not yet investigated).
 
 # CHANGELOG
 
