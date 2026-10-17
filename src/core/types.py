@@ -333,6 +333,7 @@ class DeliverResult:
     resolve_status: dict[str, Any] | None = None
     is_preview: bool = False
     error_message: str | None = None
+    cancelled: bool = False
 
 
 @dataclass
@@ -424,6 +425,7 @@ class PipelineExecutionResult:
     timeline_variants: dict[str, TimelineVariant] = field(default_factory=dict)
     active_variant_name: str | None = None
     failed_files: list[tuple[Path, str]] = field(default_factory=list)
+    cancelled: bool = False
     edit_timelines: dict[str, EditTimeline] = field(default_factory=dict)
     active_soundtrack: Path | None = None
     cut_timestamps: list[float] = field(default_factory=list)

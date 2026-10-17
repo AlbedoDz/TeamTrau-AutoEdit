@@ -5,6 +5,7 @@ EditTimeline is what the GUI shows and edits, what the project file stores, and
 what Deliver renders / exports, so the master video always matches the timeline.
 """
 
+import dataclasses
 import logging
 from pathlib import Path
 
@@ -256,3 +257,54 @@ def build_rough_cut_edit_timeline(
         variant_key="master",
         kind="rough_cut",
     )
+
+
+def scene_key(path: Path | str, start: float) -> tuple[str, float]:
+    """Stable identity of a scene: resolved source path + start time (10 ms precision)."""
+    return (str(Path(path).resolve()), round(float(start), 2))
+
+
+def apply_scene_curation(
+    edit_tl: EditTimeline,
+    included: list[ScoredScene],
+    excluded: list[ScoredScene],
+) -> tuple[EditTimeline, int]:
+    """Replace clips that come from excluded scenes with included ones.
+
+    Cut points (the beat grid) and every manual edit on other clips are preserved: each
+    affected clip keeps its length and is re-filled with the next included scene that is
+    long enough (round-robin). Returns (new timeline, number of clips replaced).
+    """
+    excluded_keys = {scene_key(s.scene.clip_path, s.scene.start_time) for s in excluded}
+    hit = [c for c in edit_tl.clips if scene_key(c.source_path, c.source_in) in excluded_keys]
+    if not hit:
+        return edit_tl, 0
+    pool = [
+        s for s in included if scene_key(s.scene.clip_path, s.scene.start_time) not in excluded_keys
+    ]
+    if not pool:
+        raise ValueError("Every scene is excluded - include at least one scene to rebuild the edit.")
+
+    fps = edit_tl.fps
+    cursor = 0
+    clips: list[EditClip] = []
+    replaced = 0
+    for c in edit_tl.clips:
+        if scene_key(c.source_path, c.source_in) not in excluded_keys:
+            clips.append(c)
+            continue
+        need = c.frames / fps
+        pick = None
+        for k in range(len(pool)):
+            cand = pool[(cursor + k) % len(pool)]
+            if cand.scene.duration / max(0.1, float(cand.speed or 1.0)) + 1e-6 >= need:
+                pick, cursor = cand, cursor + k + 1
+                break
+        if pick is None:  # nothing long enough: take the longest, renderer holds the last frame
+            pick = max(pool, key=lambda s: s.scene.duration / max(0.1, float(s.speed or 1.0)))
+            cursor += 1
+        new = clip_from_scene(pick, c.frames, is_teaser=c.is_teaser, label=c.label)
+        new.transition_in_frames = c.transition_in_frames
+        clips.append(new)
+        replaced += 1
+    return dataclasses.replace(edit_tl, clips=clips), replaced

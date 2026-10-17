@@ -295,7 +295,11 @@ class StudioBackendAdapter:
                 )
                 handle._result = res
             except Exception as exc:
-                logger.error("Job %s failed: %s", job_id, exc, exc_info=True)
+                cancelled = isinstance(exc, InterruptedError)
+                if cancelled:
+                    logger.info("Job %s cancelled by user.", job_id)
+                else:
+                    logger.error("Job %s failed: %s", job_id, exc, exc_info=True)
                 handle._result = PipelineExecutionResult(
                     success=False,
                     total_duration=0.0,
@@ -311,7 +315,8 @@ class StudioBackendAdapter:
                     encoder_used=None,
                     resolve_status=None,
                     dialogue_sentences=0,
-                    error_message=str(exc),
+                    error_message="Cancelled by user." if cancelled else str(exc),
+                    cancelled=cancelled,
                 )
             finally:
                 handle._completed.set()
@@ -379,9 +384,17 @@ class StudioBackendAdapter:
                     job_handle=handle,
                 )
             except Exception as exc:
-                logger.error("Deliver job %s failed: %s", handle.job_id, exc, exc_info=True)
+                cancelled = isinstance(exc, InterruptedError)
+                if cancelled:
+                    logger.info("Deliver job %s cancelled by user.", handle.job_id)
+                else:
+                    logger.error("Deliver job %s failed: %s", handle.job_id, exc, exc_info=True)
                 handle._result = DeliverResult(
-                    success=False, output_dir=output_dir, is_preview=preview, error_message=str(exc)
+                    success=False,
+                    output_dir=output_dir,
+                    is_preview=preview,
+                    error_message="Cancelled by user." if cancelled else str(exc),
+                    cancelled=cancelled,
                 )
             finally:
                 handle._completed.set()

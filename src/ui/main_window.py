@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from src.ui.widgets.agent_console_dialog import AgentConsoleDialog
-
+    from src.modules.edit_timeline import apply_scene_curation
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QFont, QUndoStack
 from PySide6.QtWidgets import (
@@ -39,6 +38,7 @@ from src.core.config import DEFAULT_PRESET_NAME, PRESETS, PipelineConfig, check_
 from src.core.project_io import edit_timeline_to_dict
 from src.core.service import JobHandle, StudioBackendAdapter
 from src.core.types import DeliverResult, EditTimeline, PipelineExecutionResult, ScoredScene
+from src.modules.edit_timeline import apply_scene_curation
 from src.ui.adapter_bridge import BackendSignalBridge
 from src.ui.controllers import (
     ClipDeleteCommand,
@@ -49,6 +49,7 @@ from src.ui.controllers import (
     ShortcutManager,
 )
 from src.ui.controllers.project_manager import PROJECT_FILE_FILTER
+from src.ui.widgets.agent_console_dialog import AgentConsoleDialog
 from src.ui.widgets.export_dialog import ExportDialog
 from src.ui.widgets.export_panel import ExportPanelWidget
 from src.ui.widgets.inspector_panel import InspectorPanelWidget
@@ -289,6 +290,13 @@ class StudioMainWindow(QMainWindow):
         self.action_exclude_deadair = QAction("&Exclude Dead-Air & Freeze Scenes", self)
         self.action_exclude_deadair.triggered.connect(self._on_quick_exclude_dead_air)
         edit_menu.addAction(self.action_exclude_deadair)
+
+        self.action_apply_curation = QAction("Apply Scene &Curation to Timeline", self)
+        self.action_apply_curation.setToolTip(
+            "Replace timeline clips that come from excluded scenes with included ones (keeps the beat grid)"
+        )
+        self.action_apply_curation.triggered.connect(self._on_apply_scene_curation)
+        edit_menu.addAction(self.action_apply_curation)
 
         edit_menu.addSeparator()
 
@@ -915,8 +923,10 @@ class StudioMainWindow(QMainWindow):
     def _on_shortcut_scene_action(self, action: str) -> None:
         """Apply curation hotkey (pin, reject, favorite) to currently selected scene row."""
         row = self.scene_grid.table.currentRow()
-        if row < 0 and self.scene_grid.table.rowCount() > 0:
-            row = 0
+        if row < 0:
+            # Never act on an arbitrary scene when nothing is selected.
+            self.status_bar.showMessage("Select a scene first (P = keep, X = reject, F = favorite)", 2500)
+            return
         if row >= 0:
             target_inc = action in ("pin", "favorite")
             cmd = SceneToggleCommand(self.scene_grid, row, target_inc)
@@ -999,6 +1009,11 @@ class StudioMainWindow(QMainWindow):
             else:
                 self._append_console("[WARN] Analysis produced no edit timeline - nothing to export.")
             self.status_bar.showMessage("Timeline ready - press Export when you're happy", 8000)
+        elif getattr(result, "cancelled", False):
+            self.lbl_stage.setText("Status: Cancelled")
+            self.lbl_message.setText("Analysis cancelled.")
+            self.progress_bar.setValue(0)
+            self._append_console("\n[USER] Analysis cancelled.")
         else:
             self.lbl_stage.setText("Status: Failed")
             self.lbl_message.setText("Pipeline encountered an error.")
@@ -1013,6 +1028,13 @@ class StudioMainWindow(QMainWindow):
             self.inspector_panel.btn_analyze.setEnabled(True)
         self._current_job = None
         self._update_export_enabled()
+
+        if getattr(result, "cancelled", False):
+            self.lbl_stage.setText("Status: Export cancelled")
+            self.lbl_message.setText("Export cancelled.")
+            self.progress_bar.setValue(0)
+            self._append_console("\n[USER] Export cancelled - no partial files were kept.")
+            return
 
         if not result.success:
             self.lbl_stage.setText("Status: Export failed")
@@ -1709,6 +1731,45 @@ class StudioMainWindow(QMainWindow):
     def _on_scene_toggled_by_user(self, scene_idx: int, included: bool) -> None:
         """Slot invoked when user toggles scene inclusion checkbox in SceneGrid."""
         self._set_dirty(True)
+        if self._edit_timelines:
+            self.status_bar.showMessage(
+                "Scene curation changed - use Edit > Apply Scene Curation to Timeline to update the edit", 6000
+            )
+
+    @Slot()
+    def _on_apply_scene_curation(self) -> None:
+        """Re-fill timeline clips that use excluded scenes (all timelines, beat grid preserved)."""
+        if not self._edit_timelines:
+            self.status_bar.showMessage("No timeline yet - run Analyze & Optimize first", 3000)
+            return
+        excluded = self.scene_grid.get_excluded_scenes()
+        if not excluded:
+            self.status_bar.showMessage("No scenes are excluded - nothing to apply", 3000)
+            return
+        included = self.scene_grid.get_included_scenes()
+        active = self.timeline_view.get_active_timeline_key() or self._active_timeline_key
+        try:
+            updated: dict[str, EditTimeline] = {}
+            total = 0
+            for key, tl in self.timeline_view.get_edit_timelines().items():
+                new_tl, n = apply_scene_curation(tl, included, excluded)
+                updated[key] = new_tl
+                total += n
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot Apply Curation", str(exc))
+            return
+        if total == 0:
+            self.status_bar.showMessage("Excluded scenes are not used by the timelines", 3000)
+            return
+        self._edit_timelines = updated
+        self.timeline_view.set_edit_timelines(
+            updated, active_key=active, tempo_bpm=self.timeline_view._tempo_bpm
+        )
+        self.player_widget.load_edit_timeline(updated[active])
+        self.undo_stack.clear()
+        self._set_dirty(True)
+        self._append_console(f"[CURATION] Replaced {total} clip(s) from excluded scenes across {len(updated)} timeline(s).")
+        self.status_bar.showMessage(f"Replaced {total} clip(s) from excluded scenes", 4000)
 
     def _on_clear_cache(self) -> None:
         """Clear scene detection cache on disk and active scene grid."""
