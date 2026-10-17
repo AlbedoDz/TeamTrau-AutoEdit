@@ -31,6 +31,13 @@ from src.modules.audio_analyzer import AudioAnalysisResult, AudioAnalyzer
 from src.modules.duration_packer import DurationPacker
 from src.modules.edit_timeline import build_edit_timeline, build_rough_cut_edit_timeline
 from src.modules.ingest_detector import IngestDetector
+from src.modules.keyframe_cache import (
+    KeyframeStore,
+    attach_boundary_frames,
+    build_requests,
+    extract_keyframes,
+    vlm_keyframes,
+)
 from src.modules.smart_reframer import SmartReframer
 from src.modules.timeline_builder import TimelineBuilder
 from src.modules.transcription_engine import TranscriptionEngine
@@ -88,6 +95,29 @@ class JobHandle:
     def result(self) -> Any:
         """Return final execution result if completed, else None."""
         return self._result
+
+
+class _Background:
+    """Run ``fn`` on a daemon thread; ``result()`` joins and re-raises its exception."""
+
+    def __init__(self, fn: Callable[[], Any], name: str) -> None:
+        self._value: Any = None
+        self._exc: BaseException | None = None
+
+        def _run() -> None:
+            try:
+                self._value = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised in result()
+                self._exc = exc
+
+        self._thread = threading.Thread(target=_run, name=name, daemon=True)
+        self._thread.start()
+
+    def result(self) -> Any:
+        self._thread.join()
+        if self._exc is not None:
+            raise self._exc
+        return self._value
 
 
 def _enforce_vram_headroom(max_allowed_gb: float = 2.0) -> None:
@@ -571,6 +601,42 @@ class StudioBackendAdapter:
         def _ingest_prog(pct: float, msg: str) -> None:
             _notify_progress(pct, 1, msg)
 
+        # Soundtrack analysis does not depend on the footage (except footage_driven duration
+        # solving), so it overlaps with ingest. footage_driven only pre-warms normalisation +
+        # decode; the cheap duration solve then happens after ingest.
+        audio_bg: _Background | None = None
+        skip_audio = config.workflow_mode == "rough_cut" and (
+            soundtrack is None or not Path(soundtrack).exists()
+        )
+        if not skip_audio:
+
+            def _audio_job() -> tuple[Path | None, AudioAnalysisResult | None]:
+                active_in: Path | None = soundtrack
+                if config.enable_audio_fix and soundtrack is not None:
+                    try:
+                        from src.modules.audio_normalizer import AudioNormalizer
+
+                        audio_norm = AudioNormalizer(cache_dir=Path(config.cache_dir) / "audio_clean")
+                        active_in = audio_norm.clean_audio(soundtrack)
+                    except Exception as norm_err:
+                        logger.warning("Audio normalization skipped: %s", norm_err)
+                if active_in is None:
+                    raise ValueError("Soundtrack path required for music-driven editing modes.")
+                engine = AudioAnalyzer(config)
+                if config.duration_mode == "footage_driven":
+                    if Path(active_in).is_file():
+                        engine._decode_to_analysis_wav(Path(active_in))
+                    return active_in, None
+                res = engine.analyze(
+                    active_in,
+                    target_duration=config.target_duration,
+                    available_footage_duration=None,
+                    duration_mode=config.duration_mode,
+                )
+                return active_in, res
+
+            audio_bg = _Background(_audio_job, "AutoEditAudio")
+
         all_scenes = detector.batch_process_videos(
             raw_files,
             progress_callback=_ingest_prog,
@@ -590,18 +656,38 @@ class StudioBackendAdapter:
         total_footage_duration = sum(s.duration for s in all_scenes)
         _notify_progress(100.0, 1, f"Discovered {len(all_scenes)} scenes across footage")
 
+        # Speech-to-text only needs the source files: start it now so it overlaps with
+        # soundtrack analysis, scoring and reframing; it is joined in stage 5.
+        whisper_bg: _Background | None = None
+        if config.enable_transcription:
+
+            def _transcribe_job() -> list[Any]:
+                transcriber = TranscriptionEngine(config)
+                sentences: list[Any] = []
+                try:
+                    for rf in raw_files:
+                        if cancel_event.is_set():
+                            break
+                        sentences.extend(transcriber.transcribe_file(rf))
+                finally:
+                    if hasattr(transcriber, "unload_model"):
+                        transcriber.unload_model()
+                return sentences
+
+            whisper_bg = _Background(_transcribe_job, "AutoEditWhisper")
+
         # -------------------------------------------------------------
         # Stage 2: Audio Rhythm & Structure Analysis
         # -------------------------------------------------------------
-        if config.workflow_mode == "rough_cut" and (soundtrack is None or not Path(soundtrack).exists()):
+        if audio_bg is None:
             _notify_stage("Audio Rhythm & Structure (Bypassed for Rough Cut)", 2)
             _notify_progress(100.0, 2, "Camera audio will be preserved on Track A1 (No soundtrack)")
             audio_res = AudioAnalysisResult(
                 tempo_bpm=0.0,
-                beat_timestamps=[],
+                duration=total_footage_duration,
                 beats=[],
-                downbeat_timestamps=[],
                 cut_timestamps=[0.0, total_footage_duration],
+                sample_rate=config.audio_sample_rate,
                 sections=[],
                 extracted_audio_path=None,
             )
@@ -609,27 +695,15 @@ class StudioBackendAdapter:
         else:
             _notify_stage("Analyzing Soundtrack & Musical Structure", 2)
             _notify_progress(10.0, 2, "Computing continuous RMS and spectral novelty...")
-
-            active_input_soundtrack = soundtrack
-            if config.enable_audio_fix and soundtrack is not None:
-                try:
-                    from src.modules.audio_normalizer import AudioNormalizer
-
-                    audio_norm = AudioNormalizer(cache_dir=Path(config.cache_dir) / "audio_clean")
-                    active_input_soundtrack = audio_norm.clean_audio(soundtrack)
-                except Exception as norm_err:
-                    logger.warning("Audio normalization skipped: %s", norm_err)
-
-            if active_input_soundtrack is None:
-                raise ValueError("Soundtrack path required for music-driven editing modes.")
-
-            audio_engine = AudioAnalyzer(config)
-            audio_res = audio_engine.analyze(
-                active_input_soundtrack,
-                target_duration=config.target_duration,
-                available_footage_duration=total_footage_duration,
-                duration_mode=config.duration_mode,
-            )
+            active_input_soundtrack, audio_res_opt = audio_bg.result()
+            if audio_res_opt is None:  # footage_driven: needs the total footage duration
+                audio_res_opt = AudioAnalyzer(config).analyze(
+                    active_input_soundtrack,
+                    target_duration=config.target_duration,
+                    available_footage_duration=total_footage_duration,
+                    duration_mode=config.duration_mode,
+                )
+            audio_res = audio_res_opt
             active_soundtrack = audio_res.extracted_audio_path or active_input_soundtrack
             _notify_progress(
                 100.0,
@@ -641,6 +715,7 @@ class StudioBackendAdapter:
         # Stage 3: Visual Quality Scoring & Deduplication / Defect Pruning
         # -------------------------------------------------------------
         cleaned_segments: list[CleanedSegment] = []
+        keyframe_store: KeyframeStore | None = None
         if config.workflow_mode == "rough_cut":
             _notify_stage("Rough Cut Defect Pruning (Wobble, Shake, Focus)", 3)
             from src.modules.rough_cut_cleaner import RoughCutCleaner
@@ -687,11 +762,34 @@ class StudioBackendAdapter:
             def _score_prog(pct: float, msg: str) -> None:
                 _notify_progress(pct, 3, msg)
 
+            # One sweep per clip feeds scorer, reframer, VLM and cut-continuity checks.
+            reframe_active = config.enable_smart_reframing and (
+                config.canvas_width < config.canvas_height
+            )
+            _notify_progress(0.0, 3, "Reading keyframes (one pass per clip)...")
+            keyframe_store = extract_keyframes(
+                build_requests(
+                    all_scenes,
+                    config,
+                    scorer=True,
+                    reframer=reframe_active,
+                    vlm=config.enable_vlm_tagging,
+                    boundaries=config.enable_exposure_guard,
+                    skip_scorer_for=scorer.cached_scene_keys(all_scenes, from_store=True),
+                ),
+                config,
+                cancel_event=cancel_event,
+            )
+            _check_cancel()
+
             ranked_scenes = scorer.score_and_rank_scenes(
                 all_scenes,
                 progress_callback=_score_prog,
                 cancel_event=cancel_event,
+                keyframes=keyframe_store,
             )
+            if config.enable_exposure_guard:
+                attach_boundary_frames(ranked_scenes, keyframe_store)
 
             if callbacks and callbacks.on_scene_discovered:
                 for sc in ranked_scenes:
@@ -717,6 +815,7 @@ class StudioBackendAdapter:
                 ranked_scenes,
                 progress_callback=_reframe_prog,
                 cancel_event=cancel_event,
+                **({"keyframes": keyframe_store} if keyframe_store is not None else {}),
             )
             _notify_progress(100.0, 4, "9:16 pan-and-scan crop windows calculated")
             if hasattr(reframer, "unload_model"):
@@ -729,12 +828,10 @@ class StudioBackendAdapter:
         # -------------------------------------------------------------
         _notify_stage("Speech Transcription & Semantic Understanding", 5)
         transcribed_sentences = []
-        if config.enable_transcription:
+        if whisper_bg is not None:
             _notify_progress(20.0, 5, "Extracting speech dialogue via faster-whisper...")
-            transcriber = TranscriptionEngine(config)
-            for rf in raw_files:
-                _check_cancel()
-                transcribed_sentences.extend(transcriber.transcribe_file(rf))
+            transcribed_sentences.extend(whisper_bg.result())
+            _check_cancel()
 
             if transcribed_sentences:
                 is_vert = config.canvas_width < config.canvas_height
@@ -762,13 +859,14 @@ class StudioBackendAdapter:
                     )
                     ranked_scenes = packed_res.selected_scenes
 
-            if hasattr(transcriber, "unload_model"):
-                transcriber.unload_model()
 
         if config.enable_vlm_tagging:
             _notify_progress(60.0, 5, f"Tagging scenes with VLM ({config.vlm_provider})...")
             vlm_engine = VLMAssistant(config)
-            ranked_scenes = vlm_engine.tag_scored_scenes(ranked_scenes)
+            ranked_scenes = vlm_engine.tag_scored_scenes(
+                ranked_scenes,
+                keyframes=vlm_keyframes(ranked_scenes, keyframe_store) if keyframe_store is not None else None,
+            )
             if callbacks and callbacks.on_scenes_tagged:
                 callbacks.on_scenes_tagged(ranked_scenes)
 
@@ -815,6 +913,12 @@ class StudioBackendAdapter:
                 logger.info("Synthesized %d creative timeline variants.", len(variants))
             except Exception as var_err:
                 logger.warning("Multi-variant timeline synthesis warning: %s", var_err)
+
+        # Boundary frames were only needed for cut-continuity checks; free the memory.
+        for sc in ranked_scenes:
+            sc.metadata.pop("_boundary_frame_start", None)
+            sc.metadata.pop("_boundary_frame_end", None)
+        keyframe_store = None
 
         _notify_progress(100.0, 6, f"Timeline ready ({len(master_tl.clips)} clips, {len(variants)} variants)")
 

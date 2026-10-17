@@ -209,3 +209,61 @@ def test_reframe_scene_blur_backdrop_and_auto_hybrid(synthetic_video_clip: Path)
     # 3. SMART_CROP with no subjects: falls back to center crop
     cw_smart = reframer.reframe_scene(scene, layout_mode=LayoutMode.SMART_CROP)
     assert cw_smart.tracking_subject == "center"
+
+
+def _person_model(cx_in_frame: float = 250.0):
+    mock_model = MagicMock()
+    box = MagicMock()
+    box.xyxy = [[cx_in_frame - 50, 10.0, cx_in_frame + 50, 200.0]]
+    box.conf = [0.9]
+    res = MagicMock()
+    res.boxes = [box]
+    mock_model.return_value = [res] * 5
+    return mock_model
+
+
+def test_reframe_scene_batches_frames_in_one_yolo_call(synthetic_video_clip: Path):
+    cfg = PipelineConfig(canvas_width=1080, canvas_height=1920, reframer_sample_frames=5)
+    model = _person_model()
+    reframer = SmartReframer(cfg, model=model)
+    reframer.reframe_scene(SceneCut(synthetic_video_clip, 0.0, 0.9, 0, 27, 0.9))
+    assert model.call_count == 1
+    batch = model.call_args.args[0]
+    assert isinstance(batch, list) and len(batch) == 5
+    assert model.call_args.kwargs["imgsz"] == 640
+
+
+def test_reframe_uses_keyframe_store_and_rescales_to_source(synthetic_video_clip: Path):
+    """Frames come from the store (downscaled); detections are scaled back to source pixels."""
+    from src.modules import keyframe_cache as kc
+
+    cfg = PipelineConfig(canvas_width=1080, canvas_height=1920, reframer_sample_frames=3)
+    scene = SceneCut(synthetic_video_clip, 0.0, 1.0, 0, 30, 1.0)
+    store = kc.extract_keyframes(kc.build_requests([scene], cfg, scorer=False, boundaries=False, reframer=True), cfg)
+    src_w, _src_h = store.source_size(synthetic_video_clip)
+    frame_w = next(iter(store.values())).shape[1]
+    assert frame_w <= kc.MAX_FRAME_WIDTH
+
+    model = _person_model(cx_in_frame=frame_w / 2.0)
+    cw = SmartReframer(cfg, model=model).reframe_scene(scene, keyframes=store)
+    # Subject at the horizontal middle of the frame -> centred crop in source pixels.
+    assert abs((cw.x + cw.width / 2.0) - src_w / 2.0) <= 4
+
+
+def test_reframe_all_scenes_reuses_disk_cache(synthetic_video_clip: Path, tmp_path: Path):
+    cfg = PipelineConfig(
+        canvas_width=1080, canvas_height=1920, reframer_sample_frames=3, cache_dir=tmp_path / "c"
+    )
+    scene = SceneCut(synthetic_video_clip, 0.0, 1.0, 0, 30, 1.0)
+
+    def scored():
+        return [ScoredScene(scene=scene, sharpness_score=1.0, aesthetic_score=1.0, composite_score=1.0)]
+
+    first_model = _person_model()
+    first = SmartReframer(cfg, model=first_model).reframe_all_scenes(scored())
+    assert first_model.call_count == 1
+
+    second_model = _person_model()
+    second = SmartReframer(cfg, model=second_model).reframe_all_scenes(scored())
+    assert second_model.call_count == 0
+    assert second[0].crop_window == first[0].crop_window

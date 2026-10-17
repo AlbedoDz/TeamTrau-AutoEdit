@@ -65,3 +65,40 @@ def test_filter_micro_cuts_strictly_enforces_min_interval():
     for i in range(len(filtered) - 1):
         interval = filtered[i + 1].timestamp - filtered[i].timestamp
         assert interval >= 0.4 - 1e-6
+
+
+def test_onset_strength_computed_once_per_analysis(synthetic_audio_path, tmp_path, monkeypatch):
+    import librosa
+
+    calls = {"n": 0}
+    real = librosa.onset.onset_strength
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(librosa.onset, "onset_strength", counting)
+    cfg = PipelineConfig(cache_dir=tmp_path / "c", enable_cache=False)
+    AudioAnalyzer(cfg).analyze(synthetic_audio_path)
+    assert calls["n"] == 1
+
+
+def test_audio_analysis_result_cached_on_disk(synthetic_audio_path, tmp_path, monkeypatch):
+    cfg = PipelineConfig(cache_dir=tmp_path / "c")
+    first = AudioAnalyzer(cfg).analyze(synthetic_audio_path)
+
+    def boom(*a, **k):
+        raise AssertionError("audio was re-analysed despite a cache hit")
+
+    monkeypatch.setattr(AudioAnalyzer, "_load_audio", boom)
+    second = AudioAnalyzer(cfg).analyze(synthetic_audio_path)
+    assert second == first
+    assert second.sections and second.sections[0].section_type == first.sections[0].section_type
+
+    # A changed relevant parameter (duration mode/target) is a different cache key.
+    with pytest.raises(AssertionError):
+        AudioAnalyzer(cfg).analyze(synthetic_audio_path, target_duration=2.0, duration_mode="fixed")
+
+    # Cache can be bypassed.
+    with pytest.raises(AssertionError):
+        AudioAnalyzer(cfg.model_copy(update={"enable_cache": False})).analyze(synthetic_audio_path)

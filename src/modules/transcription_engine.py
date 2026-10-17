@@ -1,9 +1,11 @@
 """Speech-to-Text and word-level dialogue boundary engine using faster-whisper."""
 
+import dataclasses
 import logging
 from pathlib import Path
 from typing import Any
 
+from src.core.analysis_cache import AnalysisCache
 from src.core.config import PipelineConfig, check_cuda_available
 from src.core.types import SentenceSegment, WordSegment
 
@@ -57,6 +59,25 @@ class TranscriptionEngine:
         if self._model is None:
             logger.info("Transcription skipped: faster-whisper model inactive.")
             return []
+
+        cache = AnalysisCache(self.config)
+        cache_key = cache.make_key(
+            media_path,
+            model=self.config.whisper_model_size,
+            vad=400,
+            words=True,
+        )
+        cached = cache.load("whisper", media_path, cache_key)
+        if cached is not None:
+            try:
+                restored = [
+                    SentenceSegment(**{**d, "words": [WordSegment(**w) for w in d.get("words", [])]})
+                    for d in cached
+                ]
+                logger.info("Transcript cache hit for %s (%d sentences).", media_path.name, len(restored))
+                return restored
+            except (TypeError, KeyError):
+                logger.debug("Ignoring incompatible transcript cache for %s", media_path.name)
 
         try:
             logger.info("Transcribing speech from %s with word-level timestamps...", media_path.name)
@@ -112,6 +133,7 @@ class TranscriptionEngine:
                 )
 
             logger.info("Transcribed %d sentence segments from %s.", len(sentences), media_path.name)
+            cache.save("whisper", media_path, cache_key, [dataclasses.asdict(x) for x in sentences])
             return sentences
         except Exception as e:
             logger.warning("Transcription failed on %s: %s", media_path.name, e)

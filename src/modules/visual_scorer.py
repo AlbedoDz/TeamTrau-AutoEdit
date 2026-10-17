@@ -2,14 +2,18 @@
 
 import logging
 import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 
+from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig, check_cuda_available
 from src.core.types import SceneCut, ScoredScene
+from src.modules.keyframe_cache import KeyframeStore, scorer_timestamps
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,18 @@ def hamming_distance(hash1: str, hash2: str) -> int:
         return 64
 
 
+AESTHETIC_BATCH_SIZE = 32
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def _hash_to_int(h: str) -> int | None:
+    try:
+        return int(h, 16)
+    except ValueError:
+        return None
+
+
 class VisualScorer:
     """Evaluates sharpness, composition, and visual appeal across scene candidates."""
 
@@ -56,6 +72,7 @@ class VisualScorer:
         self.config = config
         self.cuda_available = check_cuda_available()
         self._torch_model = None
+        self._model_lock = threading.Lock()
         self._init_aesthetic_model()
 
     def _init_aesthetic_model(self) -> None:
@@ -73,8 +90,8 @@ class VisualScorer:
             model = models.mobilenet_v3_small(weights=weights)
             model.eval()
             if torch.cuda.is_available():
-                model = model.to("cuda")
-                logger.info("Loaded MobileNetV3 visual scorer on CUDA device.")
+                model = model.to("cuda").half()
+                logger.info("Loaded MobileNetV3 visual scorer on CUDA device (fp16).")
             self._torch_model = model
             self._torch_transforms = weights.transforms()
         except Exception as exc:
@@ -101,52 +118,73 @@ class VisualScorer:
         except ImportError:
             pass
 
-    def score_scene(self, scene: SceneCut) -> ScoredScene:
+    def score_scene(
+        self, scene: SceneCut, keyframes: KeyframeStore | None = None
+    ) -> ScoredScene:
         """Sample keyframes and compute sharpness, aesthetic, and composite scores."""
-        keyframes = self._extract_keyframes(
+        frames = self._scene_frames(scene, keyframes)
+        metrics = self._metrics_from_frames(frames, self._compute_aesthetic_batch(frames)) if frames else None
+        return self._scored_from_metrics(scene, metrics)
+
+    def _scene_frames(self, scene: SceneCut, keyframes: KeyframeStore | None) -> list[np.ndarray]:
+        """Frames for a scene: from the shared keyframe store when present, else a direct read."""
+        if keyframes is not None:
+            found = [
+                f
+                for ts in scorer_timestamps(scene, self.config.keyframes_per_scene)
+                if (f := keyframes.frame(scene.clip_path, ts)) is not None
+            ]
+            if found:
+                return found
+        return self._extract_keyframes(
             scene.clip_path, scene.start_time, scene.end_time, self.config.keyframes_per_scene
         )
 
-        if not keyframes:
-            # Degraded fallback if video reading failed
-            return ScoredScene(
-                scene=scene,
-                sharpness_score=0.0,
-                aesthetic_score=0.0,
-                composite_score=0.0,
-            )
-
-        sharpness_scores: list[float] = [self._compute_sharpness(img) for img in keyframes]
-        aesthetic_scores: list[float] = [self._compute_aesthetic(img) for img in keyframes]
-
-        avg_sharpness = float(np.mean(sharpness_scores))
-        avg_aesthetic = float(np.mean(aesthetic_scores))
-
+    def _metrics_from_frames(
+        self, keyframes: list[np.ndarray], aesthetic_scores: list[float]
+    ) -> dict[str, Any]:
+        """Raw per-scene metrics (JSON-serialisable, so they can be cached on disk)."""
+        sharpness_scores = [self._compute_sharpness(img) for img in keyframes]
         dhash_str = compute_dhash(keyframes[len(keyframes) // 2])
 
         # Inter-keyframe motion energy estimation
         motion_energy = 0.5
         if len(keyframes) >= 2:
-            diffs = []
-            for i in range(len(keyframes) - 1):
-                k1 = cv2.cvtColor(cv2.resize(keyframes[i], (160, 90)), cv2.COLOR_BGR2GRAY)
-                k2 = cv2.cvtColor(cv2.resize(keyframes[i + 1], (160, 90)), cv2.COLOR_BGR2GRAY)
-                diffs.append(float(np.mean(cv2.absdiff(k1, k2))) / 255.0)
+            small = [cv2.cvtColor(cv2.resize(k, (160, 90)), cv2.COLOR_BGR2GRAY) for k in keyframes]
+            diffs = [
+                float(np.mean(cv2.absdiff(small[i], small[i + 1]))) / 255.0
+                for i in range(len(small) - 1)
+            ]
             raw_motion = float(np.mean(diffs))
             # Non-linear scaling: 0.05 is calm (~0.35), 0.12+ is high action (0.75-1.0)
             motion_energy = float(min(1.0, max(0.0, raw_motion * 6.5)))
 
+        return {
+            "sharpness": float(np.mean(sharpness_scores)),
+            "aesthetic": float(np.mean(aesthetic_scores)),
+            "motion": motion_energy,
+            "dhash": dhash_str,
+            "n": len(keyframes),
+        }
+
+    @staticmethod
+    def _scored_from_metrics(scene: SceneCut, m: dict[str, Any] | None) -> ScoredScene:
+        if not m:
+            # Degraded fallback if video reading failed
+            return ScoredScene(
+                scene=scene, sharpness_score=0.0, aesthetic_score=0.0, composite_score=0.0
+            )
         return ScoredScene(
             scene=scene,
-            sharpness_score=avg_sharpness,
-            aesthetic_score=avg_aesthetic,
+            sharpness_score=float(m["sharpness"]),
+            aesthetic_score=float(m["aesthetic"]),
             composite_score=0.0,  # Computed during batch normalization
-            motion_energy=motion_energy,
+            motion_energy=float(m["motion"]),
             metadata={
                 "clip_name": scene.clip_path.name,
-                "keyframes_sampled": len(keyframes),
-                "dhash": dhash_str,
-                "motion_energy": motion_energy,
+                "keyframes_sampled": int(m["n"]),
+                "dhash": str(m["dhash"]),
+                "motion_energy": float(m["motion"]),
             },
         )
 
@@ -155,7 +193,8 @@ class VisualScorer:
     ) -> list[ScoredScene]:
         """Remove redundant/duplicate angle scenes based on perceptual dHash Hamming distance.
 
-        Preserves scenes with higher composite scores.
+        Preserves scenes with higher composite scores. Hashes are converted to ints once and
+        compared with XOR + popcount.
         """
         if not scored_scenes:
             return []
@@ -163,33 +202,34 @@ class VisualScorer:
         limit = threshold if threshold is not None else self.config.duplicate_hash_threshold
 
         kept: list[ScoredScene] = []
+        kept_hashes: list[tuple[int, ScoredScene]] = []
         for candidate in scored_scenes:
-            cand_hash = str(candidate.metadata.get("dhash", ""))
-            if not cand_hash:
+            cand_val = _hash_to_int(str(candidate.metadata.get("dhash", "")))
+            if cand_val is None:
                 kept.append(candidate)
                 continue
 
-            is_duplicate = False
-            for accepted in kept:
-                acc_hash = str(accepted.metadata.get("dhash", ""))
-                if not acc_hash:
-                    continue
-                dist = hamming_distance(cand_hash, acc_hash)
+            duplicate_of: ScoredScene | None = None
+            dist = 64
+            for acc_val, accepted in kept_hashes:
+                dist = (cand_val ^ acc_val).bit_count()
                 if dist <= limit:
-                    logger.debug(
-                        "Deduplicating scene %s [%.2f - %.2f] (matches %s, dist=%d <= %d)",
-                        candidate.scene.clip_path.name,
-                        candidate.scene.start_time,
-                        candidate.scene.end_time,
-                        accepted.scene.clip_path.name,
-                        dist,
-                        limit,
-                    )
-                    is_duplicate = True
+                    duplicate_of = accepted
                     break
 
-            if not is_duplicate:
+            if duplicate_of is not None:
+                logger.debug(
+                    "Deduplicating scene %s [%.2f - %.2f] (matches %s, dist=%d <= %d)",
+                    candidate.scene.clip_path.name,
+                    candidate.scene.start_time,
+                    candidate.scene.end_time,
+                    duplicate_of.scene.clip_path.name,
+                    dist,
+                    limit,
+                )
+            else:
                 kept.append(candidate)
+                kept_hashes.append((cand_val, candidate))
 
         return kept
 
@@ -198,22 +238,43 @@ class VisualScorer:
         scenes: list[SceneCut],
         progress_callback: Callable[[float, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        keyframes: KeyframeStore | None = None,
     ) -> list[ScoredScene]:
-        """Score all scenes and normalize composite scores for sequence assembly."""
+        """Score all scenes and normalize composite scores for sequence assembly.
+
+        Scenes are scored clip-by-clip in a thread pool (one VideoCapture per clip, or none
+        when ``keyframes`` already holds the frames); results of unchanged clips come from the
+        on-disk analysis cache.
+        """
         if not scenes:
             return []
 
-        scored_list: list[ScoredScene] = []
         total = len(scenes)
+        groups: dict[Path, list[tuple[int, SceneCut]]] = defaultdict(list)
         for idx, sc in enumerate(scenes):
-            if cancel_event and cancel_event.is_set():
-                logger.info("Visual scoring cancelled by user.")
-                break
-            scored = self.score_scene(sc)
-            scored_list.append(scored)
-            if progress_callback:
-                pct = ((idx + 1) / total) * 100.0
-                progress_callback(pct, f"Scored scene {idx+1}/{total}")
+            groups[sc.clip_path].append((idx, sc))
+
+        results: dict[int, ScoredScene] = {}
+        done = 0
+        workers = max(1, min(self.config.max_workers, len(groups)))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = {
+                pool.submit(self._score_clip, path, items, keyframes, cancel_event): len(items)
+                for path, items in groups.items()
+            }
+            for fut in as_completed(futures):
+                results.update(fut.result())
+                done += futures[fut]
+                if progress_callback:
+                    progress_callback(min(100.0, done / total * 100.0), f"Scored scene {done}/{total}")
+                if cancel_event and cancel_event.is_set():
+                    logger.info("Visual scoring cancelled by user.")
+                    break
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        scored_list: list[ScoredScene] = [results[i] for i in sorted(results)]
 
         if not scored_list:
             return []
@@ -247,6 +308,75 @@ class VisualScorer:
             scored_list = self.deduplicate_scenes(scored_list)
 
         return scored_list
+
+    def _cache_params(self, from_store: bool) -> dict[str, Any]:
+        return {
+            "kf": self.config.keyframes_per_scene,
+            "backend": "mobilenetv3_fp16" if self._torch_model is not None else "opencv",
+            "src": "kf960" if from_store else "full",
+        }
+
+    def cached_scene_keys(
+        self, scenes: list[SceneCut], from_store: bool = True
+    ) -> set[tuple[Path, str]]:
+        """Scenes whose scores are already on disk (their frames need not be decoded)."""
+        cache = AnalysisCache(self.config)
+        if not cache.enabled:
+            return set()
+        hits: set[tuple[Path, str]] = set()
+        by_clip: dict[Path, list[SceneCut]] = defaultdict(list)
+        for sc in scenes:
+            by_clip[sc.clip_path].append(sc)
+        for path, items in by_clip.items():
+            entry = cache.load("visual", path, cache.make_key(path, **self._cache_params(from_store)))
+            if not entry:
+                continue
+            for sc in items:
+                if scene_key(sc.start_time, sc.end_time) in entry:
+                    hits.add((path, scene_key(sc.start_time, sc.end_time)))
+        return hits
+
+    def _score_clip(
+        self,
+        path: Path,
+        items: list[tuple[int, SceneCut]],
+        keyframes: KeyframeStore | None,
+        cancel_event: threading.Event | None,
+    ) -> dict[int, ScoredScene]:
+        """Score every scene of one clip (cache lookup, one batched aesthetic pass)."""
+        cache = AnalysisCache(self.config)
+        key = cache.make_key(path, **self._cache_params(keyframes is not None))
+        entry: dict[str, Any] = cache.load("visual", path, key) or {}
+        dirty = False
+
+        out: dict[int, ScoredScene] = {}
+        pending: list[tuple[int, SceneCut, list[np.ndarray]]] = []
+        for idx, sc in items:
+            if cancel_event and cancel_event.is_set():
+                break
+            hit = entry.get(scene_key(sc.start_time, sc.end_time))
+            if hit:
+                out[idx] = self._scored_from_metrics(sc, hit)
+                continue
+            frames = self._scene_frames(sc, keyframes)
+            if not frames:
+                out[idx] = self._scored_from_metrics(sc, None)
+            else:
+                pending.append((idx, sc, frames))
+
+        if pending:
+            flat = [f for _i, _s, frames in pending for f in frames]
+            aesthetics = self._compute_aesthetic_batch(flat)
+            pos = 0
+            for idx, sc, frames in pending:
+                metrics = self._metrics_from_frames(frames, aesthetics[pos : pos + len(frames)])
+                pos += len(frames)
+                out[idx] = self._scored_from_metrics(sc, metrics)
+                entry[scene_key(sc.start_time, sc.end_time)] = metrics
+                dirty = True
+        if dirty:
+            cache.save("visual", path, key, entry)
+        return out
 
     @staticmethod
     def calculate_speed_for_score(
@@ -306,25 +436,44 @@ class VisualScorer:
 
     def _compute_aesthetic(self, bgr_img: np.ndarray) -> float:
         """Compute composition and visual appeal using PyTorch CUDA or OpenCV heuristics."""
+        return self._compute_aesthetic_batch([bgr_img])[0]
+
+    @staticmethod
+    def _preprocess_for_mobilenet(bgr_img: np.ndarray) -> np.ndarray:
+        """Resize(256) + CenterCrop(224) + ImageNet normalisation -> CHW float32."""
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        scale = 256.0 / min(h, w)
+        nh, nw = max(224, int(round(h * scale))), max(224, int(round(w * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=interp)
+        top, left = (nh - 224) // 2, (nw - 224) // 2
+        crop = rgb[top : top + 224, left : left + 224].astype(np.float32) / 255.0
+        return ((crop - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)
+
+    def _compute_aesthetic_batch(self, images: list[np.ndarray]) -> list[float]:
+        """Aesthetic scores for many frames: batched (32/forward, fp16) on CUDA, else OpenCV."""
+        if not images:
+            return []
         if self._torch_model is not None:
             try:
                 import torch
-                from PIL import Image
 
-                rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(rgb)
-                tensor = self._torch_transforms(pil_img).unsqueeze(0).to("cuda")
-
-                with torch.no_grad():
-                    features = self._torch_model(tensor)
-                    # Use activation energy / entropy across top features as visual richness proxy
-                    score = float(torch.norm(features, p=2).item())
-                    return score
+                scores: list[float] = []
+                for i in range(0, len(images), AESTHETIC_BATCH_SIZE):
+                    chunk = images[i : i + AESTHETIC_BATCH_SIZE]
+                    arr = np.stack([self._preprocess_for_mobilenet(im) for im in chunk])
+                    with self._model_lock, torch.no_grad():
+                        tensor = torch.from_numpy(arr).to("cuda").half()
+                        features = self._torch_model(tensor).float()
+                        # L2 energy of the logits as a visual-richness proxy.
+                        scores.extend(torch.linalg.vector_norm(features, dim=1).cpu().tolist())
+                return [float(x) for x in scores]
             except Exception as exc:
                 logger.debug("PyTorch inference error (%s); using OpenCV heuristic.", exc)
 
         # OpenCV Heuristic: rule of thirds contrast + color saturation + dynamic range
-        return self._compute_aesthetic_opencv(bgr_img)
+        return [self._compute_aesthetic_opencv(im) for im in images]
 
     def _compute_aesthetic_opencv(self, bgr_img: np.ndarray) -> float:
         """Evaluate color dynamic range, saturation variance, and rule-of-thirds contrast."""

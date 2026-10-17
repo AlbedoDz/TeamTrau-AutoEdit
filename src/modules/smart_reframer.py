@@ -1,14 +1,22 @@
 """AI Smart 9:16 Re-framing module with YOLO subject tracking and EMA jitter smoothing."""
 
+import dataclasses
 import logging
 import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 
-from src.core.config import PipelineConfig
+from src.core.analysis_cache import AnalysisCache, scene_key
+from src.core.config import PipelineConfig, check_cuda_available
 from src.core.types import CropWindow, LayoutMode, SceneCut, ScoredScene
+from src.modules.keyframe_cache import KeyframeStore, reframer_timestamps
+
+YOLO_IMGSZ = 640
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,7 @@ class SmartReframer:
     def __init__(self, config: PipelineConfig, model: Any | None = None) -> None:
         self.config = config
         self._model = model
+        self._infer_lock = threading.Lock()
         if self._model is None and self.config.enable_smart_reframing:
             self._init_model()
 
@@ -78,36 +87,53 @@ class SmartReframer:
 
     def detect_subject_centers(self, frame: np.ndarray) -> list[tuple[float, float, float]]:
         """Detect human subjects in frame and return sorted list of (center_x, area, confidence)."""
-        if self._model is None or frame is None or frame.size == 0:
+        if frame is None or frame.size == 0:
             return []
+        out = self.detect_subject_centers_batch([frame])
+        return out[0] if out else []
+
+    def detect_subject_centers_batch(
+        self, frames: list[np.ndarray]
+    ) -> list[list[tuple[float, float, float]]]:
+        """Run YOLO once over a list of frames (imgsz=640, fp16 on CUDA).
+
+        Returns one ``[(center_x, area, confidence), ...]`` list per input frame, sorted by
+        area x confidence (largest person first).
+        """
+        if self._model is None or not frames:
+            return [[] for _ in frames]
 
         try:
-            results = self._model(
-                frame,
-                classes=[0],  # Person class in COCO dataset
-                conf=self.config.reframer_confidence_threshold,
-                verbose=False,
-            )
-            candidates: list[tuple[float, float, float]] = []
-            for r in results:
-                if not hasattr(r, "boxes") or r.boxes is None:
-                    continue
-                for box in r.boxes:
-                    xy = box.xyxy[0]
-                    coords = xy.tolist() if hasattr(xy, "tolist") else list(xy)
-                    x1, y1, x2, y2 = float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])
-                    conf_raw = box.conf[0]
-                    conf = float(conf_raw.item()) if hasattr(conf_raw, "item") else float(conf_raw)
-                    area = (x2 - x1) * (y2 - y1)
-                    center_x = (x1 + x2) / 2.0
-                    candidates.append((center_x, area, conf))
-
-            # Prioritize largest person bounding box area weighted by confidence
-            candidates.sort(key=lambda c: c[1] * c[2], reverse=True)
-            return candidates
+            kwargs: dict[str, Any] = {
+                "classes": [0],  # Person class in COCO dataset
+                "conf": self.config.reframer_confidence_threshold,
+                "imgsz": YOLO_IMGSZ,
+                "verbose": False,
+            }
+            if check_cuda_available():
+                kwargs["half"] = True
+            with self._infer_lock:
+                results = list(self._model(list(frames), **kwargs))
+            per_frame: list[list[tuple[float, float, float]]] = []
+            for r in results[: len(frames)]:
+                candidates: list[tuple[float, float, float]] = []
+                if hasattr(r, "boxes") and r.boxes is not None:
+                    for box in r.boxes:
+                        xy = box.xyxy[0]
+                        coords = xy.tolist() if hasattr(xy, "tolist") else list(xy)
+                        x1, y1, x2, y2 = float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])
+                        conf_raw = box.conf[0]
+                        conf = float(conf_raw.item()) if hasattr(conf_raw, "item") else float(conf_raw)
+                        candidates.append(((x1 + x2) / 2.0, (x2 - x1) * (y2 - y1), conf))
+                # Prioritize largest person bounding box area weighted by confidence
+                candidates.sort(key=lambda c: c[1] * c[2], reverse=True)
+                per_frame.append(candidates)
+            while len(per_frame) < len(frames):
+                per_frame.append([])
+            return per_frame
         except Exception as e:
-            logger.debug("YOLO inference failed on frame: %s", e)
-            return []
+            logger.debug("YOLO inference failed on frame batch: %s", e)
+            return [[] for _ in frames]
 
     def calculate_crop_window(
         self,
@@ -169,8 +195,13 @@ class SmartReframer:
         scene: SceneCut,
         target_aspect_ratio: float = 9.0 / 16.0,
         layout_mode: str | LayoutMode | None = None,
+        keyframes: KeyframeStore | None = None,
     ) -> CropWindow:
-        """Sample keyframes across scene duration, apply EMA smoothing to subject position, and return CropWindow."""
+        """Sample keyframes across scene duration, apply EMA smoothing to subject position, and return CropWindow.
+
+        ``keyframes`` (shared store) supplies pre-decoded, downscaled frames; any missing
+        timestamp falls back to a direct read from the clip.
+        """
         clip_path = scene.clip_path
         if not clip_path.is_file():
             raise FileNotFoundError(f"Video file not found: {clip_path}")
@@ -178,14 +209,26 @@ class SmartReframer:
         mode_val = layout_mode or getattr(self.config, "reframing_mode", "auto_hybrid")
         mode = mode_val.value if isinstance(mode_val, LayoutMode) else str(mode_val)
 
-        cap = cv2.VideoCapture(str(clip_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file: {clip_path}")
+        cap: cv2.VideoCapture | None = None
+        size = keyframes.source_size(clip_path) if keyframes is not None else None
+
+        def _cap() -> cv2.VideoCapture:
+            nonlocal cap
+            if cap is None:
+                cap = cv2.VideoCapture(str(clip_path))
+                if not cap.isOpened():
+                    raise RuntimeError(f"Could not open video file: {clip_path}")
+            return cap
 
         try:
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+            if size is not None:
+                width, height = size
+                fps = 0.0
+            else:
+                c = _cap()
+                width = int(c.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = float(c.get(cv2.CAP_PROP_FPS)) or 30.0
 
             if width <= 0 or height <= 0:
                 width, height = self.config.canvas_width, self.config.canvas_height
@@ -200,23 +243,29 @@ class SmartReframer:
                     tracking_subject="blur_backdrop",
                 )
 
-            num_samples = max(2, self.config.reframer_sample_frames)
-            sample_times = np.linspace(scene.start_time, scene.end_time, num_samples)
+            sample_times = reframer_timestamps(scene, self.config.reframer_sample_frames)
+
+            frames: list[np.ndarray] = []
+            scales: list[float] = []  # detection coordinates -> source pixels
+            for t in sample_times:
+                frame = keyframes.frame(clip_path, t) if keyframes is not None else None
+                if frame is None:
+                    c = _cap()
+                    if fps <= 0:
+                        fps = float(c.get(cv2.CAP_PROP_FPS)) or 30.0
+                    c.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
+                    ret, frame = c.read()
+                    if not ret or frame is None:
+                        continue
+                frames.append(frame)
+                scales.append(width / float(frame.shape[1]) if frame.shape[1] > 0 else 1.0)
 
             detected_centers: list[float] = []
             confidences: list[float] = []
-
-            for t in sample_times:
-                target_frame = int(round(t * fps))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    continue
-
-                detections = self.detect_subject_centers(frame)
+            for scale, detections in zip(scales, self.detect_subject_centers_batch(frames)):
                 if detections:
                     primary_x, _, conf = detections[0]
-                    detected_centers.append(primary_x)
+                    detected_centers.append(primary_x * scale)
                     confidences.append(conf)
 
             if not detected_centers:
@@ -254,7 +303,8 @@ class SmartReframer:
                 confidence=avg_conf,
             )
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
 
     def reframe_all_scenes(
         self,
@@ -263,8 +313,13 @@ class SmartReframer:
         layout_mode: str | LayoutMode | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
         cancel_event: threading.Event | None = None,
+        keyframes: KeyframeStore | None = None,
     ) -> list[ScoredScene]:
-        """Compute smooth 9:16 crop coordinates for each scene if target preset is vertical."""
+        """Compute smooth 9:16 crop coordinates for each scene if target preset is vertical.
+
+        Scenes are processed clip-by-clip in a thread pool; crop windows of unchanged clips
+        are served from the on-disk analysis cache.
+        """
         if not scored_scenes:
             return []
 
@@ -279,32 +334,79 @@ class SmartReframer:
         )
 
         total_scenes = len(scored_scenes)
-        for idx, s in enumerate(scored_scenes):
+        groups: dict[Path, list[ScoredScene]] = defaultdict(list)
+        for s in scored_scenes:
+            groups[s.scene.clip_path].append(s)
+
+        def _check_cancel() -> None:
             if cancel_event is not None and cancel_event.is_set():
-                logger.info("Smart reframing cancelled by user at scene %d/%d.", idx, total_scenes)
+                logger.info("Smart reframing cancelled by user.")
                 raise InterruptedError("Smart reframing cancelled.")
 
-            try:
-                crop_win = self.reframe_scene(
-                    s.scene,
-                    target_aspect_ratio=target_aspect_ratio,
-                    layout_mode=layout_mode,
-                )
-                s.crop_window = crop_win
-            except Exception as e:
-                logger.warning("Reframing failed for scene %s (%s). Using center fallback.", s.scene.clip_path.name, e)
-                # Safe fallback
-                s.crop_window = self.calculate_crop_window(
-                    source_width=self.config.canvas_width,
-                    source_height=self.config.canvas_height,
-                    target_aspect_ratio=target_aspect_ratio,
-                    subject_x=None,
-                    confidence=0.0,
-                )
+        mode_val = layout_mode or getattr(self.config, "reframing_mode", "auto_hybrid")
+        mode = mode_val.value if isinstance(mode_val, LayoutMode) else str(mode_val)
+        cache = AnalysisCache(self.config)
 
-            if progress_callback is not None:
-                pct = ((idx + 1) / total_scenes) * 100.0
-                progress_callback(pct, f"Reframed scene {idx + 1}/{total_scenes}")
+        def _do_clip(path: Path, items: list[ScoredScene]) -> int:
+            key = cache.make_key(
+                path,
+                mode=mode,
+                samples=self.config.reframer_sample_frames,
+                conf=self.config.reframer_confidence_threshold,
+                alpha=self.config.reframer_smoothing_alpha,
+                model=self.config.reframer_model if self._model is not None else "none",
+                aspect=round(target_aspect_ratio, 5),
+                src="kf960" if keyframes is not None else "full",
+            )
+            entry: dict[str, Any] = cache.load("reframe", path, key) or {}
+            dirty = False
+            for s in items:
+                _check_cancel()
+                sk = scene_key(s.scene.start_time, s.scene.end_time)
+                hit = entry.get(sk)
+                if hit:
+                    try:
+                        s.crop_window = CropWindow(**hit)
+                        continue
+                    except TypeError:
+                        pass
+                try:
+                    crop_win = self.reframe_scene(
+                        s.scene,
+                        target_aspect_ratio=target_aspect_ratio,
+                        layout_mode=layout_mode,
+                        keyframes=keyframes,
+                    )
+                    s.crop_window = crop_win
+                    entry[sk] = dataclasses.asdict(crop_win)
+                    dirty = True
+                except Exception as e:
+                    logger.warning(
+                        "Reframing failed for scene %s (%s). Using center fallback.", s.scene.clip_path.name, e
+                    )
+                    # Safe fallback (not cached)
+                    s.crop_window = self.calculate_crop_window(
+                        source_width=self.config.canvas_width,
+                        source_height=self.config.canvas_height,
+                        target_aspect_ratio=target_aspect_ratio,
+                        subject_x=None,
+                        confidence=0.0,
+                    )
+            if dirty:
+                cache.save("reframe", path, key, entry)
+            return len(items)
+
+        done = 0
+        workers = max(1, min(self.config.max_workers, len(groups)))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(_do_clip, path, items) for path, items in groups.items()]
+            for fut in futures:
+                done += fut.result()
+                if progress_callback is not None:
+                    progress_callback(min(100.0, done / total_scenes * 100.0), f"Reframed scene {done}/{total_scenes}")
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
         logger.info("Successfully reframed %d scenes for vertical 9:16 playback.", len(scored_scenes))
         return scored_scenes
