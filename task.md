@@ -1,0 +1,162 @@
+# Task Checklist: Production-Grade Automated 4K Video Editing Toolkit Orchestrator
+
+- [x] Phase 1 - Diagnostic: System verification (Python 3.11, NVIDIA RTX 3070 CUDA, FFmpeg NVENC 8.1.2, DaVinci Resolve Studio 21 API).
+- [x] Phase 2 - Scaffolding: Virtual environment (`.venv`), modular architecture (`src/core`, `src/modules`, `src/dispatchers`, `tests/`), dependencies installed.
+- [x] Phase 3 - Implementation:
+  - [x] `src/core/types.py`: Domain dataclasses (`VideoMetadata`, `SceneCut`, `ActiveSegment`, `BeatMarker`, `ScoredScene`, `RenderPreset`).
+  - [x] `src/core/config.py`: Central configurations, hardware discovery helpers, multi-resolution presets with `1080p30` default.
+  - [x] `src/modules/ingest_detector.py`: Non-destructive PySceneDetect (`detect-adaptive`) + Auto-Editor/OpenCV motion pre-trimming, CSV and CMX 3600 EDL export.
+  - [x] `src/modules/audio_analyzer.py`: Librosa BPM tempo, beat tracking, downbeat isolation, and strict micro-cut filtering (<0.4s).
+  - [x] `src/modules/visual_scorer.py`: Keyframe extraction, Tenengrad/Laplacian sharpness, PyTorch CUDA / OpenCV aesthetic scoring.
+  - [x] `src/modules/timeline_builder.py`: OpenTimelineIO multi-track sequence assembly, FCPXML and Premiere XML serialization.
+  - [x] `src/dispatchers/resolve_dispatcher.py`: DaVinci Resolve Studio API client (project init, canvas geometry, timeline import, render queue).
+  - [x] `src/dispatchers/nvenc_renderer.py`: Headless 4K/1080p master video renderer using dynamic FFmpeg `filter_complex_script` and `hevc_nvenc` with CPU fallback.
+  - [x] `main.py`: Unified Click CLI (`run`, `check-env`, `list-presets`).
+- [x] Phase 4 - Verification:
+  - [x] 24 unit & integration tests passing under `pytest`.
+  - [x] Ruff lint checks passing with zero errors.
+  - [x] End-to-end integration test validating FCPXML, Premiere XML, and NVENC master MP4 generation.
+- [x] Phase 5 - Algorithmic Enhancements (`mazsola2k/ai-video-editor` Integration):
+  - [x] Dual Silence & Freeze Dead-Air Detector (`silencedetect` + `freezedetect` in `src/modules/ingest_detector.py`).
+  - [x] Perceptual 64-bit dHash Deduplication with Hamming Distance (`src/modules/visual_scorer.py`).
+  - [x] Dynamic Retention Teaser Hook Assembly (`src/modules/timeline_builder.py` & `src/dispatchers/nvenc_renderer.py`).
+  - [x] CLI Flags (`--no-dead-air`, `--no-dedup`, `--no-teaser` in `main.py`).
+  - [x] Full regression test suite: 31/31 unit & integration tests passing (`pytest`), 0 ruff errors.
+
+# Enterprise Studio Expansion Master Plan
+- [x] Phase 1: Music Structural Energy-Sync & Duration Decoupling
+  - [x] Librosa continuous RMS, spectral novelty, and 12-dim pitch-class Chroma profile.
+  - [x] Song section detection (`INTRO`, `BUILDUP`, `DROP / CLIMAX`, `OUTRO`).
+  - [x] Decoupled duration modes (`fixed`, `footage_driven`, `full_track`) with parametric cosine fade-out.
+  - [x] Downbeat snapping algorithm for footage-driven duration.
+  - [x] Structure-aware pacing: 0.8s micro-cut filter in standard sections, 0.4s fast cuts in DROP.
+  - [x] Action-to-Drop alignment: motion energy mapping ($E \ge 0.70$ -> DROP, scenic -> INTRO/OUTRO).
+  - [x] CLI options (`--duration-mode`, `--action-drop-threshold`) in `main.py`.
+  - [x] Unit & regression test suite: 41/41 tests passing, 0 ruff errors.
+- [x] Phase 2: AI Smart Re-framing 9:16 (Auto Subject Tracking via YOLOv8/11 & EMA Smoothing)
+  - [x] `src/modules/smart_reframer.py`: YOLO human subject detector + keyframe sequence tracking.
+  - [x] Exponential Moving Average (EMA) smoothing to eliminate camera jitter.
+  - [x] Non-destructive 9:16 crop box calculations (`CropWindow`) with even dimensions.
+  - [x] Offline / missing weight safe fallback to rule-of-thirds / center-crop without crashing.
+  - [x] Integration with `src/dispatchers/nvenc_renderer.py` dynamic `crop=w:h:x:y` filter complex.
+  - [x] Metadata injection into `src/modules/timeline_builder.py` OTIO clips.
+  - [x] CLI flag `--no-reframe` in `main.py`.
+  - [x] Unit test suite: 6/6 smart reframer tests passing, 47/47 regression suite passing, 0 ruff errors.
+- [x] Phase 3: Speech-to-Text & Word-Level Dialogue Condensation (faster-whisper & VideoLingo)
+  - [x] Installed `faster-whisper>=1.0.0` (CTranslate2 with automatic CUDA to CPU int8 fallback).
+  - [x] `src/core/types.py`: added `WordSegment`, `SentenceSegment`, `PackedDurationResult`.
+  - [x] `src/modules/transcription_engine.py`: word-level timestamps (`word_timestamps=True`), sentence grouping, and audio ducking range calculation.
+  - [x] `src/modules/duration_packer.py`: Knapsack duration solver allocating optimal ratio between high-value dialogue and visual B-roll.
+  - [x] `main.py`: CLI flags `--enable-transcription` and `--whisper-model` wired into pipeline execution and summary reports.
+  - [x] Unit & regression test suite: 7/7 new speech & packing tests passing, 55/55 regression suite passing, 0 ruff errors.
+- [x] Phase 4: Non-Destructive Multi-NLE Handoff & CapCut Ecosystem (pyCapCut & OTIO)
+  - [x] `src/modules/capcut_exporter.py`: native CapCut Desktop project generation (`draft_content.json` & `draft_meta_info.json`).
+  - [x] Microsecond timecode translation for tracks, materials, and segment boundaries.
+  - [x] CapCut draft path discovery and custom directory export support.
+  - [x] Integration with `src/modules/timeline_builder.py` (`export_all` produces CapCut draft alongside FCPXML, Premiere XML, and OTIO).
+  - [x] CLI flag `--no-capcut` in `main.py` and CapCut draft path logging in summary.
+  - [x] Unit & regression test suite: 3/3 CapCut exporter tests passing, 58/58 regression suite passing, 0 ruff errors.
+- [x] Phase 5: LLM / VLM Context Integration & Model Context Protocol (MCP)
+  - [x] Declared and installed `mcp>=2.0.0` and `openai>=1.0.0`.
+  - [x] `src/core/types.py`: added `SceneVLMAnalysis` typed dataclass and `vlm_analysis` field on `ScoredScene`.
+  - [x] `src/core/config.py`: added `enable_vlm_tagging`, `vlm_provider`, `vlm_base_url`, `vlm_model`, `vlm_temperature`, `vlm_timeout_sec`.
+  - [x] `src/modules/vlm_assistant.py`: OpenAI-compatible REST client supporting OpenRouter, Ollama, LM Studio, and OpenAI endpoints, with zero heavy local weights and rule-based heuristic fallback.
+  - [x] `src/modules/mcp_server.py`: Standard FastMCP/MCPServer JSON-RPC stdio protocol exposing `analyze_soundtrack`, `detect_scenes`, `reframe_video`, `export_timeline`, `render_master`.
+  - [x] `main.py`: added `mcp` CLI command (`main.py mcp --transport stdio`) and `--enable-vlm`, `--vlm-provider`, `--vlm-model` flags on `run`.
+  - [x] Unit & regression test suite: 12/12 Phase 5 tests passing (`tests/test_vlm_assistant.py`, `tests/test_mcp_server.py`), 70/70 full regression suite passing, 0 ruff errors.
+- [x] Phase 6: Cross-Platform Asynchronous Desktop Studio (PySide6 / Qt GUI)
+  - [x] Phase 6.1: Service Layer Refactoring & Subprocess Streaming
+    - [x] Implemented `StudioBackendAdapter`, `JobHandle`, and `JobCallbacks` in `src/core/service.py`.
+    - [x] Injected non-breaking progress callbacks and cancellation tokens into `ingest_detector.py`, `visual_scorer.py`, `smart_reframer.py`.
+    - [x] Converted `NvencRenderer` from blocking `subprocess.run` to `subprocess.Popen` reading real-time stdout progress (`-progress pipe:1`).
+    - [x] Eliminated pipeline duplication: refactored `main.py` and `src/modules/mcp_server.py` to delegate to `StudioBackendAdapter`.
+    - [x] Created `tests/test_service_adapter.py`: verified sync/async execution, callbacks, and cancellation.
+  - [x] Phase 6.2: PySide6 Scaffolding & Core Application Shell
+    - [x] Installed `pyside6>=6.7.0` (version 6.12.0) and declared in `pyproject.toml`.
+    - [x] Built modern dark studio stylesheet in `src/ui/styles/dark_studio.qss`.
+    - [x] Implemented `BackendSignalBridge` in `src/ui/adapter_bridge.py` for thread-safe Qt signals.
+    - [x] Implemented `StudioMainWindow` in `src/ui/main_window.py` with menubar, toolbar, preset selector, progress indicators, console log, and graceful close handler.
+    - [x] Built application bootstrap in `src/ui/app.py` with high-DPI scaling and dark theme.
+    - [x] Added `gui` command to `main.py` (`main.py gui [--dry-run]`).
+    - [x] Created `tests/test_gui_shell.py`: 6/6 tests passing, 83/83 full regression suite passing, 0 ruff errors.
+  - [x] Phase 6.3: Media Ingestion & Asset Library Widget
+    - [x] Implemented `MediaBrowserWidget` in `src/ui/widgets/media_browser.py` with drag-and-drop, path pickers, and video metadata table.
+    - [x] Integrated non-blocking background metadata probing via `QThreadPool` and `QRunnable`.
+    - [x] Added input validation and dynamic status readiness updates.
+    - [x] Created `tests/test_media_browser.py`: 7/7 tests passing, full regression suite passing, 0 ruff errors.
+  - [x] Phase 6.4: Interactive Scene Grid & Visual Quality Dashboard
+    - [x] Implemented `SceneGridWidget` (`src/ui/widgets/scene_grid.py`) with thumbnail cards/table, sharpness/aesthetic badges, dead-air indicators, and manual scene include/exclude toggles.
+    - [x] Integrated asynchronous thumbnail extraction via `ThumbnailRunnable` and `QThreadPool`.
+    - [x] Built interactive scene inspector panel with VLM analysis, 9:16 crop window metadata, and action drop indicators.
+    - [x] Added dynamic multi-criteria filtering (composite score threshold, dead-air toggle, search query, inclusion state).
+    - [x] Integrated into `StudioMainWindow` tabbed workspace (`Media Assets`, `Scene Quality & Review`, `Execution Console`).
+  - [x] Phase 6.5: Multi-Track Timeline & Beat-Grid Inspector
+    - [x] Implemented `TimelineViewWidget` and `TimelineCanvas` (`src/ui/widgets/timeline_view.py`).
+    - [x] Rendered Timecode Ruler, Track V2 (Teaser Hook), Track V1 (Master Video), and Track A1 (BGM Music & Structure).
+    - [x] Implemented visual song section blocks (`INTRO`, `BUILDUP`, `DROP / CLIMAX`, `OUTRO`) with distinct color palettes.
+    - [x] Visualized Librosa rhythm beat markers and downbeat tick indicators.
+    - [x] Added interactive playhead scrubbing, zoom controls, fit-to-window, and clip/section inspection pane.
+    - [x] Integrated into `StudioMainWindow` tabbed workspace (`Multi-Track Timeline`) with auto-population on job finish.
+    - [x] Created `tests/test_timeline_view.py`: 7/7 tests passing, 108/108 full regression suite passing, 0 ruff errors.
+  - [x] Phase 6.6: Export Dispatcher & Live NVENC Render Monitor
+    - [x] Implemented `ExportPanelWidget` (`src/ui/widgets/export_panel.py`) for multi-NLE exports (FCPXML, Premiere XML, OTIO, CapCut).
+    - [x] Added auto-detection and custom directory configuration for CapCut Desktop project drafts.
+    - [x] Implemented real-time NVENC render monitor with live frame count, encoding speed, encoder status, and progress bar.
+    - [x] Wired one-click deliverable handoffs (open export directory, play master MP4, open CapCut draft).
+    - [x] Connected export options and render controls to `StudioMainWindow` tabbed workspace and `StudioBackendAdapter`.
+    - [x] Created `tests/test_export_panel.py`: 8/8 tests passing, 116/116 full regression suite passing, 0 ruff errors.
+- [x] Phase 7: Advanced Features Integration (`mazsola2k/ai-video-editor`)
+  - [x] Audio Fix: BWF timecode metadata stripping & 24-bit PCM WAV normalization via non-destructive cache (`src/modules/audio_normalizer.py`).
+  - [x] Dynamic Speed Ramping (1x - 8x variable speed) mapped to aesthetic score (`src/modules/visual_scorer.py`, `src/modules/timeline_builder.py`, `src/dispatchers/nvenc_renderer.py`).
+  - [x] Watermark & Branding Engine with dynamic position, margin, opacity calculation (`src/dispatchers/watermark_helper.py`, `src/dispatchers/nvenc_renderer.py`).
+  - [x] Three Workflow Presets (`standard`, `build_timelapse`, `unboxing_narration`) integrated in `src/core/config.py`, `main.py`, and `ExportPanelWidget`.
+  - [x] Full regression test suite: 131/131 tests passing (`pytest`), 0 ruff errors.
+- [x] Phase 8: Single-Window Unified NLE Desktop Studio & Professional Control Integration
+  - [x] Module A: Centralized `ShortcutManager` (`src/ui/controllers/shortcut_manager.py`) with strict Focus Guard invariant protecting input widgets, J-K-L shuttle controls, navigation, I/O ranges, P/X/F curation hotkeys, and system accelerators.
+  - [x] Module B: Granular `PreferencesDialog` (`src/ui/widgets/settings_dialog.py`) with 4 tabs (AI & LLM Engine Hub with async test ping, Ingest & Dead-Air thresholds, Audio & BWF normalization, Subtitles & Whisper transcription) and persistent JSON storage.
+  - [x] Module C: Smart Inspector Sidebar (`src/ui/widgets/inspector_panel.py`) with workflow presets, knapsack duration slider, speed-ramping, watermark branding, teaser retention hooks, and AI toggles.
+  - [x] Module D: Program Monitor Viewport (`src/ui/widgets/player_widget.py`) with 9:16 vertical HUD guide overlay, SMPTE timecode readout, frame stepping, shuttle rates, and bidirectional timeline playhead synchronization.
+  - [x] Module E: Sleek `ExportDialog` modal (`src/ui/widgets/export_dialog.py`) replacing full-page export panel.
+  - [x] Refactored `StudioMainWindow` (`src/ui/main_window.py`) into single-window nested QSplitter architecture (Upper: Left Media/Scene Review dock, Center Program Monitor, Right Smart Inspector; Lower: Docked Full-Width Multi-Track Timeline).
+  - [x] Full regression test suite: 150/150 tests passing (`pytest`), 0 ruff errors.
+  - [x] Phase 9: High-Retention Video Optimization, Visual Continuity & Kinetic Engine Integration
+  - [x] Module 1: Visual Continuity & Exposure Guard (`src/modules/visual_flow.py`):
+    - Bhattacharyya distance calculation (>0.45 threshold) on normalized 64-bin Y-channel histograms.
+    - Automatic 10-frame cross-dissolve transition insertion at high-contrast cut boundaries in `TimelineBuilder`.
+    - Subtle Ken Burns ambient motion (`1.0x -> 1.05x` zoompan filter) on static scenes with motion energy < 0.20.
+  - [x] Module 2: Smart Reframing & Blurred Backdrop (`src/modules/smart_reframer.py`):
+    - Multi-mode reframing (`LayoutMode.SMART_CROP`, `LayoutMode.BLUR_BACKDROP`, `LayoutMode.AUTO_HYBRID`).
+    - Dynamic FFmpeg filtergraph: dual-layer composition with `boxblur=20:5`, eq brightness -15%, scale/crop foreground overlay.
+  - [x] Module 3: Kinetic Dialogue Typography & Subtitles (`src/modules/subtitle_formatter.py` & `src/modules/kinetic_subtitle.py`):
+    - Word-level highlighted subtitles (`SubtitleStyle.KINETIC_ASS`) with dynamic color highlighting (`{\c&H0000FFFF&}`).
+    - 72pt Montserrat/Arial Black styling, vertical safe-zone positioning (`MarginV = 320px` for 9:16 vertical presets).
+  - [x] Module 4: Timeline Quality Assurance & Boundary Sanitization (`src/modules/timeline_qa.py`):
+    - Flash-frame clamp enforcing strict minimum clip threshold (>= 6 frames).
+    - Audio boundary verification with 20ms parametric crossfade to eliminate clip boundary pops.
+  - [x] Module 5: End-to-End System Integration:
+    - Wired retention options into `PipelineConfig`, `StudioBackendAdapter` (Stage 5 subtitle export, Stage 6 QA pre-dispatch), `TimelineBuilder`, and `NvencRenderer`.
+    - Added UI controls to `InspectorPanelWidget` ("High-Retention Visual & Subtitle Controls" group).
+  - [x] Test Suite & Stability Fix:
+  - [x] Phase 10: Model Context Protocol (MCP) & Universal AI Agent Hub Integration
+    - [x] Full MCP Server Suite (`src/modules/mcp_server.py`):
+      - 23 specialized editing tools covering all system capabilities (environment probe, presets, media probe, PySceneDetect batch detection, Librosa rhythm analysis, BWF audio stripping, Faster-Whisper transcription, visual aesthetics/dHash, 9:16 reframing, Bhattacharyya continuity, kinetic subtitles, OTIO timeline synthesis, NLE exports, NVENC master renders, QA validation, job control, project persistence, VLM tagging, config generation).
+      - Standard MCP Resources (`system://environment`, `config://presets`, `config://workflows`).
+      - Standard MCP Prompts (`autoedit_high_retention`, `autoedit_cinematic`).
+      - Multi-transport execution support: Standard I/O CLI (`stdio`) and Server-Sent Events (`sse`).
+      - Automated JSON config generation for Antigravity, Claude Desktop, and Cursor.
+    - [x] Universal AI Agent Controller (`src/modules/agent_controller.py`):
+      - Multi-provider support: OpenRouter (DeepSeek v3/v4/R1, Claude 3.5 Sonnet, GPT-4o, Gemini 2.5), DeepSeek Cloud API, OpenAI, local Ollama/LM Studio LAN, or custom OpenAI-compatible endpoints.
+      - Autonomous ReAct function-calling loop mapping MCP tools to OpenAI schemas.
+      - Intelligent local heuristic rule-based planner for offline operation without API keys.
+    - [x] CLI Orchestration (`main.py`):
+      - `main.py mcp [--transport stdio|sse] [--host] [--port] [--export-config]`.
+      - `main.py agent "Yêu cầu dựng phim..." [--provider] [--model] [--api-key] [--base-url]`.
+    - [x] Desktop Studio GUI Integration:
+      - `PreferencesDialog` Tab 5 ("AI Agent & MCP Hub") with provider selector, model selection, port config, and 1-click clipboard config copy.
+      - `AgentConsoleDialog` (`src/ui/widgets/agent_console_dialog.py`): interactive co-pilot console with real-time thought/tool/result streaming and quick chips.
+      - `StudioMainWindow` topbar button ("🤖 AI Co-Pilot") and menubar `AI Agent` menu.
+    - [x] Full regression test suite: 189/189 tests passing (`pytest`), 0 ruff errors.
+
+
+
+

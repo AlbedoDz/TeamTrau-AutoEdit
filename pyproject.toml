@@ -1,0 +1,42 @@
+[project]
+name = "teamtrau-autoedit"
+version = "0.1.0"
+description = "Production-Grade Automated Video Editing Toolkit Orchestrator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opentimelineio>=0.16.0",
+    "opentimelineio-plugins>=0.18.1",
+    "scenedetect[opencv]>=0.6.4",
+    "librosa>=0.10.2",
+    "soundfile>=0.12.1",
+    "auto-editor>=24.0.0",
+    "pydantic>=2.7.0",
+    "click>=8.1.7",
+    "numpy>=1.24.0",
+    "opencv-python>=4.9.0",
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "ffmpeg-python>=0.2.0",
+    "ultralytics>=8.0.0",
+    "faster-whisper>=1.0.0",
+    "openai>=1.0.0",
+    "mcp>=2.0.0",
+    "pyside6>=6.7.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

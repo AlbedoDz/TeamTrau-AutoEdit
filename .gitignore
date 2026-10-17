@@ -1,0 +1,70 @@
+# Agent infrastructure (local dev tooling, not project source)
+.agent/
+.codegraph/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Cache
+.cache/
+*.cache
+
+# Test footage & demo media (binary, not source)
+test/*.MP4
+test/*.mp4
+test/*.mov
+test/*.MOV
+test/*.avi
+test/*.AVI
+test/audio/
+footage/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+*.mp3
+*.wav
+*.aac
+*.flac
+*.m4a
+*.mkv
+*.MKV
+
+# Output artifacts
+output/
+*.fcpxml
+*.otio
+*.edl
+*.xml
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.pkl
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Agent memory (local session only)
+.agent/memory/
+.agent/logs/
