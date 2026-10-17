@@ -193,6 +193,7 @@ class _AssetRec:
     drop_frame: bool = False
     width: int = 0
     height: int = 0
+    fps: Fraction = Fraction(0)  # media frame rate (0 = unknown)
 
 
 class _Resources:
@@ -273,6 +274,7 @@ class _Resources:
             src_fps = frame_rate(info.fps) if info.fps else self.fps
             fmt_id = self._add_format(info.width, info.height, src_fps, colorspace_for(info))
             rec.width, rec.height = info.width, info.height
+            rec.fps = src_fps
             parsed = timecode_to_seconds(info.start_timecode, src_fps)
             if parsed is not None:
                 rec.start, rec.drop_frame = parsed
@@ -476,8 +478,15 @@ def timeline_to_fcpxml(
             # in-point as start * speed). So `start` is the in-point divided by the speed and
             # timeMap is the pure linear map through the origin. With a source start
             # timecode the in-point is asset start + cut point (unverified on Resolve).
+            # Verified on Resolve Studio 21 with a 01:00:00:00 source: for RETIMED clips Resolve
+            # ignores the asset's source timecode and reads the in-point as start * speed relative
+            # to the media start (non-retimed clips use asset start + in-point instead). So
+            # start = in-point / speed, with the in-point snapped to the media frame grid
+            # (otherwise Resolve floors 29.97 fps in-points one frame early) and a linear
+            # timeMap through the origin.
             sp = Fraction(speed).limit_denominator(1000)
-            clip_start = media_in / sp
+            snapped_in = Fraction(round(src_in * rec.fps)) / rec.fps if rec.fps else src_in
+            clip_start = snapped_in / sp
             clip_el.set("start", fmt_time(clip_start))
             tm = ET.SubElement(clip_el, "timeMap")
             ET.SubElement(tm, "timept", time="0s", value="0s", interp="linear")

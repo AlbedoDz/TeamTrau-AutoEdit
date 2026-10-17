@@ -266,3 +266,7 @@
   - [x] Premiere XML: real audio channels (Link Media fix), sequence format = chosen canvas (was empty -> copied from first clip), Time Remap for speed ramps with correct in/out, Basic Motion scale/center for fit-to-frame and 9:16 crop, silent sources get no audio clipitem.
   - [x] CapCut draft: real speed (source = output x speed + speed materials), gaps, real source width/height, 9:16 crop transform, camera audio ducked under music and not duplicated as an audio track.
   - [ ] NOT verified in the real apps: Premiere Pro import, CapCut 8.8 (needs a reference draft made by CapCut to confirm schema; the draft folder was empty). Basic Motion center sign and CapCut transform units follow documented conventions only.
+- [x] Phase 22 (steps 1,2,4,6): DeliverSettings + NTSC/portrait/square presets, media_info, relink originals, master codecs (HEVC/H.264/ProRes/DNxHR, colour tags, HDR tonemap, fit modes, rendered dissolves, subtitles), FCPXML per-asset formats/colour/timecode/reframe.
+  - [x] Verified on real Resolve Studio 21.0.4.5 (matrix: 4K 29.97 + TC 01:00:00:00 in 1080p, 9:16 canvas with crop window, square canvas, all-retimed clips + music): imports, frame counts, audio lanes and frame-exact stills OK.
+  - [x] Found via Resolve: retimed clips ignore the asset source timecode (in-point = start*speed relative to media start; non-retimed use asset start + in-point); in-point snapped to media frame grid.
+  - [ ] Step 7 (Deliver settings UI/CLI/MCP + service wiring), Step 3 (Premiere) and Step 5 (CapCut, need user reference files) pending.

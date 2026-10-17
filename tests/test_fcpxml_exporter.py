@@ -284,7 +284,8 @@ def test_asset_start_is_source_timecode_and_clips_stay_consistent(tmp_path, fake
     assert _t(asset.get("start")) == 3600
     items = root.findall("library/event/project/sequence/spine/asset-clip")
     assert _t(items[0].get("start")) == 3602  # asset start + in-point
-    assert _t(items[1].get("start")) * 2 == 3604  # retime: (asset start + in-point) / speed
+    # retime (verified on Resolve with a 01:00:00:00 source): in-point / speed, timecode ignored
+    assert _t(items[1].get("start")) * 2 == 4
 
 
 def test_ntsc_timecode_counts_nominal_frames_and_drop_frame_skips():

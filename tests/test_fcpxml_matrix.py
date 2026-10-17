@@ -151,9 +151,15 @@ def test_matrix(tmp_path, fake_probe, fps, canvas, src_key):
             if tm is not None:
                 p0, p1 = tm.findall("timept")
                 speed = _t(p1.get("value")) / _t(p1.get("time"))
-            media_t = _t(el.get("start")) * speed
-            assert _on_grid(media_t, media_rate), "clip in-point must land on a source frame"
-            assert media_t >= asset_start
+            if speed == 1:
+                media_t = _t(el.get("start"))  # normal clips: asset start + in-point
+                assert media_t >= asset_start
+            else:
+                # retimed clips (verified on Resolve): in-point = start * speed, relative to
+                # the media start (the asset's source timecode is ignored)
+                media_t = _t(el.get("start")) * speed
+            rel = media_t - (asset_start if speed == 1 else 0)
+            assert _on_grid(rel, media_rate), "clip in-point must land on a source frame"
         if el.tag == "transition":
             assert _on_grid(_t(el.get("duration")), rate)
     # spine durations sum to the sequence duration
