@@ -554,6 +554,67 @@ def test_classification_is_fast(tmp_path: Path):
 **Expected red:** `ImportError` / `ModuleNotFoundError` for `ContentRole` / `src.modules.media_classifier`.
 **Commit:** `feat(curation): content role classifier (A-roll / B-roll / ambient)`.
 
+### Task 2-fix (review follow-up)
+
+The installed OpenCV is **5.0**, which has no `cv2.CascadeClassifier`, so face detection is silently off (`face_ratio` is always 0). Roles are unaffected (D6), but this must be visible. Real face detection = Milestone B10.
+
+- `media_classifier.face_detector_available() -> bool` (public): `True` only when the Haar cascade loaded. The first failed load logs **one** `logger.warning` naming the reason (no `CascadeClassifier` in this OpenCV build / cascade file missing).
+- `classify_clip`: after a successful `extractor` call, append the reason `"face_detector_unavailable"` when `face_detector_available()` is `False`. Folder results and `probe_failed` results are unchanged.
+- `extract_signals`: the ffmpeg audio call gets `timeout=60.0` (a hung decode becomes `probe_failed`, never a stuck pipeline).
+
+**Contract test — `tests/test_media_classifier_face_fallback.py`:**
+```python
+"""Face detector availability is reported, never silently ignored."""
+
+import logging
+from pathlib import Path
+
+import src.modules.media_classifier as mc
+from src.core.ontology import ContentRole
+
+
+def _speech(_p: Path) -> mc.ClipSignals:
+    return mc.ClipSignals(has_audio=True, voice_ratio=0.6, snr_db=20.0, face_ratio=0.0, motion=1.0)
+
+
+def test_missing_face_detector_is_a_reason(monkeypatch):
+    monkeypatch.setattr(mc, "face_detector_available", lambda: False)
+    r = mc.classify_clip(Path("talk.mp4"), extractor=_speech)
+    assert r.role == ContentRole.A_ROLL
+    assert "face_detector_unavailable" in r.reasons
+
+
+def test_available_face_detector_adds_no_reason(monkeypatch):
+    monkeypatch.setattr(mc, "face_detector_available", lambda: True)
+    r = mc.classify_clip(Path("talk.mp4"), extractor=_speech)
+    assert "face_detector_unavailable" not in r.reasons
+
+
+def test_folder_and_failure_results_are_unchanged(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(mc, "face_detector_available", lambda: False)
+    r = mc.classify_clip(tmp_path / "A-roll" / "x.mp4", extractor=_speech)
+    assert r.reasons == ["folder:a_roll"]
+
+    def broken(_p: Path) -> mc.ClipSignals:
+        raise RuntimeError("boom")
+
+    assert mc.classify_clip(tmp_path / "y.mp4", extractor=broken).reasons == ["probe_failed"]
+
+
+def test_unavailable_cascade_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr(mc, "_FACE_CASCADE", None)
+    monkeypatch.setattr(mc, "_CASCADE_LOADED", False)
+    monkeypatch.delattr(mc.cv2, "CascadeClassifier", raising=False)
+    with caplog.at_level(logging.WARNING, logger=mc.__name__):
+        assert mc.face_detector_available() is False
+        assert mc.face_detector_available() is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+```
+
+**Expected red:** `AttributeError: module 'src.modules.media_classifier' has no attribute 'face_detector_available'`.
+**Commit:** `fix(curation): report missing face detector; timeout classifier audio decode`.
+
 ---
 
 ## Task 3 — Golden window selection (Stage 2)
@@ -1494,6 +1555,7 @@ def test_folder_to_nle_files(tmp_path: Path):
 | B4 | HFR (≥ 100 fps) conform: B-roll slow-mo, A-roll real time (voice-safety guard) | Decide timeline speed model (`EditClip.speed` + speed ramping) |
 | B5 | A-roll sentence snapping (use `TranscriptionEngine` sentences) | After T4 is in use |
 | B6 | GUI: role colours in the selects canvas + one-click role override | After T4 |
+| B10 | Real face / subject presence for the classifier (OpenCV 5 has no `CascadeClassifier`): reuse the YOLO person detector of `SmartReframer`, or YuNet with a bundled model | Decide the model asset; face only changes A-roll confidence (D6), never the role |
 | B7 | Multi-channel camera audio (spec §9.4 / matrix #13): pick the cleanest-SNR channel for A-roll analysis, keep all channels in NLE XML | Real 2–4 channel camera files; check what the exporters emit today |
 | B8 | Corrupted media guard (matrix #11): hard probe/decode timeout + quarantine list | Reproduce with a truncated MP4 (missing `moov`) |
 | B9 | Cache size cap / LRU (matrix #14) | Measure cache growth on a real project |
