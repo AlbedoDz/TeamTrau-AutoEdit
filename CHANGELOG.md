@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(curation): genre-aware golden window selection
 - fix(curation): report missing face detector; timeout classifier audio decode
 - feat(curation): content role classifier (A-roll / B-roll / ambient)
 - fix(ui): media browser follows A-roll/B-roll/Music folder rules

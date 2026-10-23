@@ -399,3 +399,130 @@ class SubWindowPlanner:
     def reset_epoch(self) -> None:
         """Forget used ranges (footage was exhausted); in-point history is kept to vary repeats."""
         self.used.clear()
+
+
+def select_golden_windows(
+    curve: QualityCurve | None,
+    start: float,
+    end: float,
+    min_len: float,
+    max_len: float,
+    max_takes: int = 1,
+    tolerance: float = 0.05,
+) -> list[tuple[float, float]]:
+    """Select up to ``max_takes`` non-overlapping golden windows inside ``[start, end]``.
+
+    Uses ``score_window`` on ``curve``, preferring the longest candidate length
+    (from ``{max_len, (min_len + max_len) / 2, min_len}``) within ``tolerance`` of the best score.
+    Returns windows sorted by start time.
+    """
+    if max_takes <= 0 or start >= end:
+        return []
+
+    span = end - start
+    if span <= max_len:
+        return [(start, end)]
+
+    if curve is None or len(curve) == 0:
+        takes: list[tuple[float, float]] = []
+        cur_t0 = start
+        while len(takes) < max_takes:
+            cur_t1 = cur_t0 + max_len
+            if cur_t1 > end + 1e-9:
+                break
+            takes.append((cur_t0, cur_t1))
+            cur_t0 = cur_t1 + min_len
+        return takes
+
+    hz = curve.hz if curve.hz > 0 else 4.0
+
+    # Candidate lengths in descending order: {max_len, (min_len + max_len) / 2, min_len}
+    candidate_lengths: list[float] = [max_len]
+    mid_len = (min_len + max_len) / 2.0
+    if abs(mid_len - max_len) > 1e-6:
+        candidate_lengths.append(mid_len)
+    if abs(min_len - mid_len) > 1e-6 and abs(min_len - max_len) > 1e-6:
+        candidate_lengths.append(min_len)
+
+    def _get_starts(length: float) -> list[float]:
+        max_start = end - length
+        if max_start < start - 1e-9:
+            return []
+        starts: list[float] = []
+        k = 0
+        while True:
+            t = start + k / hz
+            if t > max_start + 1e-9:
+                break
+            starts.append(t)
+            k += 1
+        if not starts:
+            starts.append(max_start)
+        elif abs(starts[-1] - max_start) > 1e-6 and max_start > starts[-1]:
+            starts.append(max_start)
+        return starts
+
+    # For each candidate length, find best start position and best score
+    results_by_len: dict[float, tuple[float, float, list[float]]] = {}
+    for L in candidate_lengths:
+        starts = _get_starts(L)
+        best_t0: float | None = None
+        best_score = float("-inf")
+        for t0 in starts:
+            s = score_window(curve, t0, t0 + L)
+            if best_t0 is None or s > best_score:
+                best_score = s
+                best_t0 = t0
+        if best_t0 is not None:
+            results_by_len[L] = (best_score, best_t0, starts)
+
+    if not results_by_len:
+        return [(start, end)]
+
+    s_star = max(res[0] for res in results_by_len.values())
+
+    # Choose longest L whose best score >= s* - tolerance
+    chosen_L: float = candidate_lengths[0]
+    chosen_t0: float = results_by_len[chosen_L][1]
+    chosen_starts: list[float] = results_by_len[chosen_L][2]
+    for L in candidate_lengths:
+        if L in results_by_len:
+            score_L, t0_L, starts_L = results_by_len[L]
+            if score_L >= s_star - tolerance - 1e-9:
+                chosen_L = L
+                chosen_t0 = t0_L
+                chosen_starts = starts_L
+                break
+
+    chosen_takes: list[tuple[float, float]] = [(chosen_t0, chosen_t0 + chosen_L)]
+
+    # Further takes up to max_takes using the same L
+    while len(chosen_takes) < max_takes:
+        best_t0_next: float | None = None
+        best_score_next = float("-inf")
+        for t0 in chosen_starts:
+            c0 = t0
+            c1 = t0 + chosen_L
+            # A candidate must not overlap any earlier take widened by min_len on each side.
+            # Overlap is strict: a0 < b1 and b0 < a1 (touching is allowed).
+            overlaps = False
+            for taken_0, taken_1 in chosen_takes:
+                w0 = taken_0 - min_len
+                w1 = taken_1 + min_len
+                if c0 < w1 - 1e-9 and c1 > w0 + 1e-9:
+                    overlaps = True
+                    break
+            if overlaps:
+                continue
+
+            s = score_window(curve, c0, c1)
+            if best_t0_next is None or s > best_score_next:
+                best_score_next = s
+                best_t0_next = c0
+
+        if best_t0_next is None:
+            break
+
+        chosen_takes.append((best_t0_next, best_t0_next + chosen_L))
+
+    return sorted(chosen_takes, key=lambda w: w[0])
