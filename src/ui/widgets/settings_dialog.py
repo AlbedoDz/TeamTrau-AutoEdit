@@ -57,8 +57,10 @@ class PreferencesDialog(QDialog):
 
         self._init_window()
         self._init_ui()
-        self.load_from_config(self.config)
-        self.load_from_disk()
+        if config is None:
+            self.load_from_disk()
+        else:
+            self.load_from_config(self.config)
         self.apply_to_config(self.config)
 
     def _init_window(self) -> None:

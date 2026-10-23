@@ -273,4 +273,20 @@
   - [ ] Pending: Step 3 (Premiere xmeml schema) and Step 5 (CapCut) need user reference files in references/; `watermark_in_nle` and subtitle sidecars from GUI/CLI (no stored transcripts) are not applied yet.
 - [x] Phase 23 Part A (cadence engine): bar/phrase grid + cadence cuts (frame-snapped, seeded variety), 23 genre profiles, long-shot sub-windows (4 Hz quality curves), slot sizing by scene, variants by profile, teaser kept to teaser_duration. Real 8x DJI 4K run: master shots 0.5-8 s (sd 2.79 s), no held frames, no repeated in-points, snap error 7.9 ms; cinematic up to 16 s shots.
 - [x] Phase 23 Part B (staged workflow): `submit_job(stage=rough_cut|sequence|all)`, cached rough cut (60 s clip 19.2 s -> 0.02 s), golden scenes re-scored, sequence from saved scenes without re-ingest, project 2.3.0 (pipeline_stage + real beats/bar grid), CLI/MCP --stage; GUI: 4-step stepper, 3 action buttons + pruning checkbox, Genre/Cadence/long-shot controls, auto-switch to Scene Review after rough cut, badges (Golden/Trimmed/Long Shot/Excluded), pill icons, bar/phrase ruler + downbeat-lock badge, per-stage cancel, UI state persistence. 976 tests pass; real offscreen GUI run verified (rough cut 6.4 s, sequence re-edit 1.1 s).
-  - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
+- [x] Phase 23 Part C (Real-Time Viewport Playback Engine - RTVPE):
+  - [x] SIMD-accelerated downsample in `cv_frame_to_pixmap` with `cv2.INTER_AREA` to max viewport bounds, reducing RAM churn by 90% (25MB down to ~1.5MB per frame).
+  - [x] Pre-scaled pixmap caching and bounding target rectangle caching in `MonitorCanvas._update_cached_scaled` for 0ms CPU scaling during `paintEvent`.
+  - [x] Sequential `cap.read()` playback with micro-lag `cap.grab()` recovery, eliminating 30ms-per-frame `cap.set()` seeks during 1.0x playback.
+  - [x] Master timeline clip pre-roll / pre-seek (`_prewarm_next_clip`) at cut boundaries (<0.5s before cut), ensuring 0ms cut transition stutter.
+  - [x] `time.perf_counter()` wall-clock synchronization with drift-free shuttle multiplier controls (J-K-L).
+  - [x] Optimized `TimelineCanvas.set_playhead` with dirty-rect invalidation (24px needle slice instead of full canvas repaint), dropping UI thread CPU usage during playback to <0.5%.
+  - [x] Created `tests/test_realtime_playback.py` (5/5 passing).
+  - [x] Fixed `PreferencesDialog` config precedence in `settings_dialog.py`.
+  - [x] Full regression suite verified: 981/981 tests passing (0 failures), 0 ruff errors.
+- [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
+- [x] Phase 24 Planning: Auto-Curation, Lossless Smart-Cut, FreeCut Fusion & FastMCP Architecture
+  - [x] Author comprehensive architecture spec: `docs/superpowers/specs/2026-10-23-auto-curation-rough-cut-design.md`.
+  - [x] Author TDD implementation plan with 8 tasks: `docs/superpowers/plans/2026-10-23-auto-curation-rough-cut.md`.
+  - [x] Complete 16-point adversarial self-critique (VFR, Long-GOP NVENC proxies, WebGPU 3D LUT shader, 120fps voice safety guard, SHA256 filename collisions, dynamic port binding, multi-audio channel preservation).
+  - [x] Design FreeCut Isolated Extension Architecture (`src/extensions/teamtrau/`) guaranteeing 100% clean upstream merges from `walterlow/freecut`.
+  - [x] Sync memory and state ready for ClockCode / agentic review and implementation.

@@ -258,9 +258,23 @@ class TimelineCanvas(QWidget):
         self._update_geometry_size()
 
     def set_playhead(self, time_sec: float) -> None:
-        """Position playhead cursor and redraw."""
-        self.playhead_time = max(0.0, min(self.total_duration, time_sec))
-        self.update()
+        """Position playhead cursor and redraw dirty region."""
+        new_time = max(0.0, min(self.total_duration, time_sec))
+        if abs(new_time - self.playhead_time) < 1e-4:
+            return
+
+        old_x = self.LEFT_MARGIN + int(self.playhead_time * self.px_per_sec)
+        self.playhead_time = new_time
+        new_x = self.LEFT_MARGIN + int(new_time * self.px_per_sec)
+
+        h = self.height()
+        r_old = QRect(old_x - 12, 0, 24, h)
+        r_new = QRect(new_x - 12, 0, 24, h)
+        if abs(old_x - new_x) < 40:
+            self.update(r_old.united(r_new))
+        else:
+            self.update(r_old)
+            self.update(r_new)
 
     def seek_playhead(self, time_sec: float) -> None:
         """Position playhead cursor and redraw (alias for set_playhead)."""
