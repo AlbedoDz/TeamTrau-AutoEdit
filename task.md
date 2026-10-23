@@ -284,9 +284,12 @@
   - [x] Fixed `PreferencesDialog` config precedence in `settings_dialog.py`.
   - [x] Full regression suite verified: 981/981 tests passing (0 failures), 0 ruff errors.
 - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
-- [x] Phase 24 Planning: Auto-Curation, Lossless Smart-Cut, FreeCut Fusion & FastMCP Architecture
-  - [x] Author comprehensive architecture spec: `docs/superpowers/specs/2026-10-23-auto-curation-rough-cut-design.md`.
-  - [x] Author TDD implementation plan with 8 tasks: `docs/superpowers/plans/2026-10-23-auto-curation-rough-cut.md`.
-  - [x] Complete 16-point adversarial self-critique (VFR, Long-GOP NVENC proxies, WebGPU 3D LUT shader, 120fps voice safety guard, SHA256 filename collisions, dynamic port binding, multi-audio channel preservation).
-  - [x] Design FreeCut Isolated Extension Architecture (`src/extensions/teamtrau/`) guaranteeing 100% clean upstream merges from `walterlow/freecut`.
-  - [x] Sync memory and state ready for ClockCode / agentic review and implementation.
+- [/] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
+  - [x] Task 0: Hygiene & baseline (no production code)
+  - [ ] Task 1: Role folders (Mode B ingestion)
+  - [ ] Task 2: Content role classifier
+  - [ ] Task 3: Golden window selection
+  - [ ] Task 4: Rough-cut wiring & duration packaging
+  - [ ] Task 5: NLE preflight (Unicode & audio rate)
+  - [ ] Task 6: Curation core & MCP tools
+  - [ ] Task 7: CLI, E2E verification & release

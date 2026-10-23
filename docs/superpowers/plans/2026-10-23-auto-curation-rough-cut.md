@@ -1,3 +1,5 @@
+> **SUPERSEDED by 2026-10-23-auto-curation-v2.md — do not execute.**
+
 # AI-Assisted Auto-Curation & Selects Stringout Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

@@ -1,3 +1,8 @@
+## [Unreleased]
+- chore: start auto-curation v2 (branch, superseded v1 plan, task list)
+
+---
+
 ## Commits 46978b3..3838675 (Phase 22-23)
 Grouped by feature. Commit hashes in parentheses.
 
