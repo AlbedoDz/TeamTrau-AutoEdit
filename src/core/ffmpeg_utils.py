@@ -31,6 +31,19 @@ def run_tool(
     )
 
 
+def run_tool_bytes(
+    cmd: list[str], timeout: float | None = None, check: bool = False
+) -> subprocess.CompletedProcess[bytes]:
+    """Run an ffmpeg-family command capturing binary stdout/stderr."""
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=check,
+    )
+
+
 def popen_tool(cmd: list[str]) -> subprocess.Popen[str]:
     """Spawn an ffmpeg-family command with line-buffered UTF-8 pipes."""
     return subprocess.Popen(

@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(curation): content role classifier (A-roll / B-roll / ambient)
 - fix(ui): media browser follows A-roll/B-roll/Music folder rules
 - feat(ingest): A-roll/B-roll/Music role folders (Mode B)
 - chore: start auto-curation v2 (branch, superseded v1 plan, task list)

@@ -17,6 +17,12 @@ class CameraRole(str, Enum):
     EXTERNAL_AUDIO = "audio"   # Dedicated high-fidelity audio stem
 
 
+class ContentRole(str, Enum):
+    A_ROLL = "a_roll"                  # speech is the anchor
+    B_ROLL = "b_roll"                  # visual cutaway
+    AMBIENT_B_ROLL = "ambient_b_roll"  # some / unclear speech, usable as cutaway or soundbite
+
+
 @dataclass
 class MediaFolderEntry:
     """Represents a discrete source directory ingested with an assigned camera role."""
