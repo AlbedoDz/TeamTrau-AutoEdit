@@ -17,7 +17,7 @@ from typing import Any, Callable, Literal
 
 from src.core.analysis_cache import scene_key as span_key
 from src.core.config import PipelineConfig
-from src.core.ontology import infer_camera_role, role_folder_of
+from src.core.ontology import ContentRole, infer_camera_role, role_folder_of
 from src.core.types import (
     ALL_DELIVER_FORMATS,
     UNSUPPORTED_RAW_EXTENSIONS,
@@ -278,6 +278,9 @@ def _golden_scenes(
             "defects_count": len(seg.defects_removed),
             "original_scene_duration": round(orig, 4),
         }
+        for field in ("content_role", "role_confidence", "golden_window"):
+            if field in seg.metadata:
+                meta[(cut.clip_path, span_key(cut.start_time, cut.end_time))][field] = seg.metadata[field]
     return cuts, meta
 
 
@@ -1214,6 +1217,71 @@ class StudioBackendAdapter:
             )
             if golden and not cleaned_segments:
                 raise ValueError("Rough cut kept no usable takes - every scene was pruned as defective.")
+
+            if golden and cleaned_segments:
+                roles: dict[Path, ContentRole] = {}
+                confidences: dict[Path, float] = {}
+                if config.auto_classify_roles:
+                    from src.modules.media_classifier import classify_batch
+
+                    unique_clips: list[tuple[Path, Path]] = []
+                    seen_clips: set[Path] = set()
+                    for seg in cleaned_segments:
+                        if seg.clip_path not in seen_clips:
+                            seen_clips.add(seg.clip_path)
+                            orig = (
+                                Path(seg.scene.original_path)
+                                if seg.scene.original_path
+                                else seg.clip_path
+                            )
+                            unique_clips.append((seg.clip_path, orig))
+
+                    if unique_clips:
+                        _notify_progress(
+                            0.0, c_idx, f"Classifying media roles ({len(unique_clips)} clips)"
+                        )
+                        for clip_path, orig_path in unique_clips:
+                            _check_cancel()
+                            res_list = classify_batch([orig_path])
+                            if res_list:
+                                roles[clip_path] = res_list[0].role
+                                confidences[clip_path] = res_list[0].confidence
+                        _check_cancel()
+
+                if roles:
+                    new_segs = []
+                    for seg in cleaned_segments:
+                        role = roles.get(seg.clip_path)
+                        conf = confidences.get(seg.clip_path)
+                        if role is not None:
+                            meta = dict(seg.metadata)
+                            meta["content_role"] = (
+                                role.value if hasattr(role, "value") else str(role)
+                            )
+                            if conf is not None:
+                                meta["role_confidence"] = float(conf)
+                            new_segs.append(dataclasses.replace(seg, metadata=meta))
+                        else:
+                            new_segs.append(seg)
+                    cleaned_segments = new_segs
+
+                if config.enable_golden_windows and cleaned_segments:
+                    from src.core.analysis_cache import AnalysisCache
+                    from src.modules.golden_takes import window_cleaned_segments
+                    from src.modules.shot_windows import QualityCurve, compute_quality_curve
+
+                    analysis_cache = AnalysisCache(config)
+
+                    def _curve_fn(path: Path, s: float, e: float) -> QualityCurve | None:
+                        return compute_quality_curve(path, s, e, hz=4.0, cache=analysis_cache)
+
+                    cleaned_segments = window_cleaned_segments(
+                        cleaned_segments,
+                        roles,
+                        config.golden_window_min_sec,
+                        config.golden_window_max_sec,
+                        _curve_fn,
+                    )
 
         ranked_scenes: list[ScoredScene]
         if legacy_rough:

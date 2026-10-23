@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(curation): roles and golden windows in the rough-cut stage
 - feat(curation): genre-aware golden window selection
 - fix(curation): report missing face detector; timeout classifier audio decode
 - feat(curation): content role classifier (A-roll / B-roll / ambient)
