@@ -293,5 +293,5 @@
   - [x] Task 3: Golden window selection
   - [x] Task 4: Wire roles and golden windows into the rough-cut stage
   - [x] Task 5: NLE pre-flight report
-  - [ ] Task 6: Curation core & MCP tools
+  - [x] Task 6: Curation core & MCP tools
   - [ ] Task 7: CLI, E2E verification & release

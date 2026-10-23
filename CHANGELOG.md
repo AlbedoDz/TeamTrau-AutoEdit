@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(mcp): curate_footage / assemble_cadence_timeline / export_nle_project macro-tools
 - feat(deliver): NLE pre-flight report (media, VFR, fps, audio layout, URI round trip)
 - feat(curation): roles and golden windows in the rough-cut stage
 - feat(curation): genre-aware golden window selection
