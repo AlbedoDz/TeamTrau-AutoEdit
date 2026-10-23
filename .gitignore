@@ -1,6 +1,7 @@
 # Agent infrastructure (local dev tooling, not project source)
 .agent/
 .codegraph/
+.claude/
 
 # Python
 __pycache__/
