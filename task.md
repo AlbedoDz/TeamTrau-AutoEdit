@@ -289,7 +289,7 @@
   - [ ] Task 1: Role folders (Mode B ingestion)
   - [ ] Task 2: Content role classifier
   - [ ] Task 3: Golden window selection
-  - [ ] Task 4: Rough-cut wiring & duration packaging
-  - [ ] Task 5: NLE preflight (Unicode & audio rate)
+  - [ ] Task 4: Wire roles and golden windows into the rough-cut stage
+  - [ ] Task 5: NLE pre-flight report
   - [ ] Task 6: Curation core & MCP tools
   - [ ] Task 7: CLI, E2E verification & release

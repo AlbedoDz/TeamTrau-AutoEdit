@@ -1392,7 +1392,10 @@ def test_folder_to_nle_files(tmp_path: Path):
 | B4 | HFR (≥ 100 fps) conform: B-roll slow-mo, A-roll real time (voice-safety guard) | Decide timeline speed model (`EditClip.speed` + speed ramping) |
 | B5 | A-roll sentence snapping (use `TranscriptionEngine` sentences) | After T4 is in use |
 | B6 | GUI: role colours in the selects canvas + one-click role override | After T4 |
-| C1 | FreeCut adapter + local media server | FreeCut schema available in repo |
+| B7 | Multi-channel camera audio (spec §9.4 / matrix #13): pick the cleanest-SNR channel for A-roll analysis, keep all channels in NLE XML | Real 2–4 channel camera files; check what the exporters emit today |
+| B8 | Corrupted media guard (matrix #11): hard probe/decode timeout + quarantine list | Reproduce with a truncated MP4 (missing `moov`) |
+| B9 | Cache size cap / LRU (matrix #14) | Measure cache growth on a real project |
+| C1 | FreeCut in-app fusion (spec §8, matrix #1, #2, #15) + local media server + 3D LUT preview (§9.2) | FreeCut checked out under `frontend/` with its schema; separate plan |
 
 ---
 
