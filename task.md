@@ -292,6 +292,6 @@
   - [x] Task 2-fix: face detector availability + audio timeout
   - [x] Task 3: Golden window selection
   - [x] Task 4: Wire roles and golden windows into the rough-cut stage
-  - [ ] Task 5: NLE pre-flight report
+  - [x] Task 5: NLE pre-flight report
   - [ ] Task 6: Curation core & MCP tools
   - [ ] Task 7: CLI, E2E verification & release

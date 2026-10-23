@@ -17,6 +17,7 @@ from typing import Any, Callable, Literal
 
 from src.core.analysis_cache import scene_key as span_key
 from src.core.config import PipelineConfig
+from src.core.nle_preflight import preflight_timeline
 from src.core.ontology import ContentRole, infer_camera_role, role_folder_of
 from src.core.types import (
     ALL_DELIVER_FORMATS,
@@ -661,9 +662,11 @@ class StudioBackendAdapter:
         for attr in (
             "render_path", "encoder_used", "duration", "fcpxml_path", "premiere_xml_path",
             "otio_path", "capcut_draft_path", "resolve_status", "master_codec",
+            "preflight_path",
         ):
             setattr(combined, attr, getattr(first, attr))
         combined.subtitle_paths = list(first.subtitle_paths)
+        combined.preflight_issues = list(first.preflight_issues)
         combined.success = not errors
         combined.error_message = "; ".join(errors) or None
         eff = settings or DeliverSettings.from_timeline(edit_tl, config)
@@ -830,6 +833,21 @@ class StudioBackendAdapter:
             edit_tl = retarget_timeline(edit_tl, settings)
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_audio_rate = settings.audio_rate if settings is not None else 48000
+            pf_report = preflight_timeline(edit_tl, audio_rate=target_audio_rate)
+            pf_path = output_dir / "preflight.json"
+            pf_path.write_text(
+                json.dumps(pf_report.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result.preflight_path = pf_path
+            result.preflight_issues = [
+                f"{i.severity}:{i.code}:{i.path.name}" for i in pf_report.issues
+            ]
+        except Exception as pf_err:
+            logger.warning("NLE preflight report failed: %s", pf_err)
+
         name = base_name or f"{edit_tl.name}"
         nle_formats = {f for f in formats if f != "mp4"}
         if resolve or dry_run_resolve:

@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(deliver): NLE pre-flight report (media, VFR, fps, audio layout, URI round trip)
 - feat(curation): roles and golden windows in the rough-cut stage
 - feat(curation): genre-aware golden window selection
 - fix(curation): report missing face detector; timeout classifier audio decode

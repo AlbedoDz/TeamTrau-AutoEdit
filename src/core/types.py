@@ -509,6 +509,8 @@ class DeliverResult:
     settings: "DeliverSettings | None" = None
     # Per-variant outcomes (key -> result) when several timelines were delivered into subfolders.
     variant_results: dict[str, "DeliverResult"] = field(default_factory=dict)
+    preflight_path: Path | None = None
+    preflight_issues: list[str] = field(default_factory=list)
 
 
 @dataclass
