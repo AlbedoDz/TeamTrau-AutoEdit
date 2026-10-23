@@ -284,7 +284,7 @@
   - [x] Fixed `PreferencesDialog` config precedence in `settings_dialog.py`.
   - [x] Full regression suite verified: 981/981 tests passing (0 failures), 0 ruff errors.
 - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
-- [/] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
+- [x] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
   - [x] Task 0: Hygiene & baseline (no production code)
   - [x] Task 1: Role folders (Mode B ingestion)
   - [x] Task 1b: Media Browser follows Mode B folder rules
@@ -294,4 +294,15 @@
   - [x] Task 4: Wire roles and golden windows into the rough-cut stage
   - [x] Task 5: NLE pre-flight report
   - [x] Task 6: Curation core & MCP tools
-  - [ ] Task 7: CLI, E2E verification & release
+  - [x] Task 7: CLI, E2E verification & release
+- [ ] Milestone B: Post-v2 Auto-Curation Enhancements
+  - [ ] B1: NVENC playback proxies (short-GOP, cache key path+size+mtime, CPU fallback)
+  - [ ] B2: "Export selects" with `-c copy`, keyframe-snapped in/out
+  - [ ] B3: GOP smart-cut (re-encode head/tail only)
+  - [ ] B4: HFR (>= 100 fps) conform: B-roll slow-mo, A-roll real time (voice-safety guard)
+  - [ ] B5: A-roll sentence snapping (use `TranscriptionEngine` sentences)
+  - [ ] B6: GUI: role colours in the selects canvas + one-click role override
+  - [ ] B7: Multi-channel camera audio (cleanest-SNR channel for A-roll, all channels in NLE XML)
+  - [ ] B8: Corrupted media guard (hard probe/decode timeout + quarantine list)
+  - [ ] B9: Cache size cap / LRU
+  - [ ] B10: Real face / subject presence for the classifier (YOLO person detector or YuNet)

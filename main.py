@@ -1,11 +1,13 @@
 """Production-Grade Automated Video Editing Orchestrator CLI."""
 
+import json
 import logging
 import sys
 from pathlib import Path
 
 import click
 
+from src.core import curation
 from src.core.config import (
     DEFAULT_PRESET_NAME,
     PRESETS,
@@ -748,6 +750,89 @@ def _print_deliver_summary(res, label: str, settings, preview: bool) -> None:
                 click.echo(f"{prefix}{name:<22}: {path}")
         for sub_path in sub.subtitle_paths:
             click.echo(f"{prefix}{'Subtitles':<22}: {sub_path}")
+
+
+@cli.command("curate")
+@click.option(
+    "--input-dir",
+    "-i",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    required=True,
+    help="Directory containing raw source media (supports A-roll, B-roll, Music role folders).",
+)
+@click.option(
+    "--genre",
+    "-g",
+    default=None,
+    help="Genre preset key (e.g. travel_daily_vlog, cinematic_travel, sports_extreme) driving pacing.",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=Path("./output"),
+    show_default=True,
+    help="Directory to save curation summary and exports.",
+)
+@click.option(
+    "--top",
+    type=int,
+    default=12,
+    show_default=True,
+    help="Number of top takes to include in summary.",
+)
+@click.option(
+    "--export/--no-export",
+    "export",
+    default=False,
+    help="Export NLE projects (FCPXML, Premiere XML, CapCut draft) for curated selects.",
+)
+def curate_cmd(
+    input_dir: Path,
+    genre: str | None,
+    output_dir: Path,
+    top: int,
+    export: bool,
+) -> None:
+    """Execute rough-cut curation and defect pruning on source footage."""
+    try:
+        adapter = StudioBackendAdapter()
+        session, summary = curation.run_curation(
+            adapter=adapter,
+            input_dir=Path(input_dir),
+            genre=genre,
+            output_dir=Path(output_dir),
+            top_n=top,
+        )
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        summary_file = out_path / "curation_summary.json"
+        summary_file.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        click.echo(json.dumps(summary, indent=2, ensure_ascii=False))
+
+        if export:
+            export_res = curation.export_session(
+                adapter=adapter,
+                session=session,
+                output_dir=Path(output_dir),
+            )
+            if isinstance(export_res, dict):
+                click.echo("\nExported NLE Project Files:")
+                for key, label in (
+                    ("fcpxml_path", "FCPXML"),
+                    ("premiere_xml_path", "Premiere XML"),
+                    ("otio_path", "OTIO"),
+                    ("capcut_draft_path", "CapCut Draft"),
+                    ("preview_mp4", "Preview MP4"),
+                ):
+                    val = export_res.get(key)
+                    if val:
+                        click.echo(f"  * {label:<16}: {val}")
+    except (ValueError, FileNotFoundError) as exc:
+        raise click.BadParameter(str(exc)) from exc
 
 
 if __name__ == "__main__":

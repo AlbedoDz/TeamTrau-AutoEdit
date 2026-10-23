@@ -1,6 +1,6 @@
 # TECHNICAL HANDOFF DOSSIER: TEAMTRAU-AUTOEDIT ORCHESTRATOR
 **Confidential & Proprietary — Engineering Handoff Blueprint**  
-**Document Revision:** 2.3.0 (Post-Phase 23: Deliver settings, cadence engine, staged workflow; Resolve-verified FCPXML)  
+**Document Revision:** 2.4.0 (Post-Phase 24: Auto-Curation & Selects Stringout v2, Mode B Role Ingestion, Golden Windows, NLE Preflight, FastMCP Macro-Tools, CLI Curate)  
 **System Target:** Windows 11 Enterprise (x64), NVIDIA CUDA 12+, NVENC Gen 8 (RTX 3070+), DaVinci Resolve Studio 19/21, PySide6  
 **Audience:** Incoming Principal AI Software Architect & Autonomous Coding Agents
 
@@ -507,7 +507,15 @@ Per-module mapping below. Rows added in 2.2.0 and 2.3.0 cover the GUI, FCPXML, R
 
 ## 4. CRITICAL GAP ANALYSIS, TECHNICAL DEBT & LIMITATIONS
 
-### 4.0 Cleared Debt (Resolved in Phase 17-23)
+### 4.0 Cleared Debt (Resolved in Phase 17-24)
+- **Auto-Curation & Selects Stringout v2 (Phase 24):** Resolved. End-to-end non-destructive curation pipeline:
+  * Mode B Ingestion: Case-insensitive, punctuation-stripped role folders (`A-roll/`, `B-roll/`, `Music/`).
+  * Fast Content Role Classifier (`content_classifier.py`): Speech vs. B-roll classification via VAD energy ratio, audio decode timeout protection, and safe fallback if face detector is unavailable.
+  * Genre-Aware Golden Window Selection (`golden_curator.py`): Clamps window duration to genre `golden_window_max_sec` and extracts highest composite quality segment.
+  * Rough-Cut Stage Integration: A-roll speech continuity preserved (D6/D10); B-roll takes refined to golden windows.
+  * NLE Preflight Integrity Report (`nle_preflight.py`): Verifies file existence, VFR, fps mismatch, 48kHz audio layout, and RFC 3986 URI lossless round-trip.
+  * Curation Core & FastMCP Macro-Tools (`curation.py`, `mcp_server.py`): `curate_footage`, `assemble_cadence_timeline`, `export_nle_project` maintaining strict $\le 2000$ char (~500 tokens) JSON budget.
+  * CLI `main.py curate`: Autonomous curation and NLE selects export (`--export`) writing UTF-8 `curation_summary.json`.
 - **Master audio dropped the last ~0.17 s under load:** Resolved. `apad+atrim` after mix (`aca58ba`).
 - **Premiere refused stereo media ("2 audio channel(s) vs 1"):** Resolved in XML by `premiere_xml_fix` (`91b4dcd`). Not yet verified in Premiere itself.
 - **Teaser length drifted with uneven beat cuts:** Resolved. Teaser ends at nearest half-bar to `teaser_duration` (`179b27d`).

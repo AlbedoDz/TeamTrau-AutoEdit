@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(cli): main.py curate + auto-curation E2E; docs rev 2.4.0
 - feat(mcp): curate_footage / assemble_cadence_timeline / export_nle_project macro-tools
 - feat(deliver): NLE pre-flight report (media, VFR, fps, audio layout, URI round trip)
 - feat(curation): roles and golden windows in the rough-cut stage
@@ -8,6 +9,19 @@
 - fix(ui): media browser follows A-roll/B-roll/Music folder rules
 - feat(ingest): A-roll/B-roll/Music role folders (Mode B)
 - chore: start auto-curation v2 (branch, superseded v1 plan, task list)
+
+---
+
+## Phase 24: Auto-Curation & Selects Stringout v2 (Release 2.4.0)
+- **Mode B Ingestion** (`ontology.py`, `service.py`): Ingests footage from `A-roll/`, `B-roll/`, and `Music/` role subfolders (case-insensitive, punctuation-stripped).
+- **Media Browser** (`media_browser.py`): Adheres to Mode B role folder hierarchy and rules.
+- **Content Role Classifier** (`content_classifier.py`): Ultra-fast audio VAD energy ratio classifier (<0.3s/clip) detecting speech/talking-head vs visual B-roll; audio decode timeout protection and safe face detector fallback.
+- **Golden Window Selection** (`golden_curator.py`): Sliding-window 4Hz quality curve scoring; window size clamped to genre `golden_window_max_sec`.
+- **Rough-Cut Pipeline Integration** (`rough_cut_cleaner.py`, `service.py`): Excises defect segments (shake, whip pan, defocus, occlusion, bad exposure); preserves complete speech span for A-roll and isolates optimal golden windows for B-roll.
+- **NLE Preflight Report** (`nle_preflight.py`): Verifies file availability, CFR/VFR status, framerate consistency, audio sample rate, and RFC 3986 URI round-trip integrity.
+- **Curation Core & FastMCP Macro-Tools** (`curation.py`, `mcp_server.py`): `curate_footage`, `assemble_cadence_timeline`, and `export_nle_project` tools strictly bounded to $\le 2000$ characters JSON token budget (~500 tokens).
+- **CLI Curate** (`main.py curate`): Autonomous rough-cut curation and NLE selects export (`--export`) writing UTF-8 `curation_summary.json`.
+- **E2E Integration** (`test_auto_curation_e2e.py`): Verifies end-to-end pipeline on real ffmpeg media (A-roll talking clip, B-roll scenic clip, Music click track) through DaVinci Resolve FCPXML 1.8, Premiere XML, and CapCut Desktop draft.
 
 ---
 
