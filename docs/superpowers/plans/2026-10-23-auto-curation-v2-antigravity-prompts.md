@@ -114,6 +114,28 @@ Traps to avoid:
 - Run tests/test_multifolder_ingest.py: the existing role assertions must stay green.
 ```
 
+## TASK T1b — Media Browser follows Mode B folder rules (review follow-up)
+
+```text
+ADDENDUM from the architect (do this BEFORE the T1b tests, as a separate first commit):
+Commit the architect's pending edits to docs/superpowers/plans/2026-10-23-auto-curation-v2.md and
+docs/superpowers/plans/2026-10-23-auto-curation-v2-antigravity-prompts.md (new Task 1b) and add
+"  - [ ] Task 1b: Media Browser follows Mode B folder rules" under Task 1 in task.md, with message:
+"docs: plan v2 task 1b (media browser role folders)".
+
+Execute Task 1b of docs/superpowers/plans/2026-10-23-auto-curation-v2.md (its own commit).
+
+Traps to avoid:
+- role_folder_of: iterate reversed(Path(p).parent.parts) so the NEAREST role folder wins.
+  Nothing else changes in ontology.py.
+- media_browser.py: import collect_video_files and find_soundtrack from src.core.service and use them
+  in _scan_directory, add_footage_folder and is_valid_setup. Do not write a new scanner.
+- add_footage_folder: role per file = default_role or infer_camera_role(f).value.
+- set_input_dir: auto-fill the Music soundtrack ONLY when get_soundtrack_path() is None.
+- Do not touch main_window.py or any other GUI file.
+- GUI tests run headless (QT_QPA_PLATFORM=offscreen is set inside the tests).
+```
+
 ## TASK T2 — Content role classifier
 
 ```text
