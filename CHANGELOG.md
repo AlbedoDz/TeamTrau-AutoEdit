@@ -1,4 +1,5 @@
 ## [Unreleased]
+- fix(curation): report missing face detector; timeout classifier audio decode
 - feat(curation): content role classifier (A-roll / B-roll / ambient)
 - fix(ui): media browser follows A-roll/B-roll/Music folder rules
 - feat(ingest): A-roll/B-roll/Music role folders (Mode B)

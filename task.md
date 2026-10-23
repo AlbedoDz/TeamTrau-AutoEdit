@@ -289,7 +289,7 @@
   - [x] Task 1: Role folders (Mode B ingestion)
   - [x] Task 1b: Media Browser follows Mode B folder rules
   - [x] Task 2: Content role classifier
-  - [ ] Task 2-fix: face detector availability + audio timeout
+  - [x] Task 2-fix: face detector availability + audio timeout
   - [ ] Task 3: Golden window selection
   - [ ] Task 4: Wire roles and golden windows into the rough-cut stage
   - [ ] Task 5: NLE pre-flight report

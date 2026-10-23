@@ -7,6 +7,7 @@ and Ambient B-roll (mixed or low-SNR sound) for automated curation and selects s
 import logging
 import math
 import shutil
+import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -30,17 +31,34 @@ def _get_face_cascade() -> Any:
     if not _CASCADE_LOADED:
         _CASCADE_LOADED = True
         cascade_cls = getattr(cv2, "CascadeClassifier", None)
-        if cascade_cls is not None:
-            data_dir = getattr(cv2.data, "haarcascades", "")
-            xml_path = data_dir + "haarcascade_frontalface_default.xml"
-            if Path(xml_path).is_file():
-                try:
-                    clf = cascade_cls(xml_path)
-                    if not clf.empty():
-                        _FACE_CASCADE = clf
-                except Exception:
-                    _FACE_CASCADE = None
+        if cascade_cls is None:
+            logger.warning(
+                "Face detector unavailable: cv2 has no CascadeClassifier in this OpenCV build"
+            )
+            _FACE_CASCADE = None
+            return None
+        data_dir = getattr(cv2.data, "haarcascades", "")
+        xml_path = data_dir + "haarcascade_frontalface_default.xml"
+        if not Path(xml_path).is_file():
+            logger.warning("Face detector unavailable: cascade file missing (%s)", xml_path)
+            _FACE_CASCADE = None
+            return None
+        try:
+            clf = cascade_cls(xml_path)
+            if clf.empty():
+                logger.warning("Face detector unavailable: empty cascade loaded from %s", xml_path)
+                _FACE_CASCADE = None
+            else:
+                _FACE_CASCADE = clf
+        except Exception as exc:
+            logger.warning("Face detector unavailable: failed to load cascade: %s", exc)
+            _FACE_CASCADE = None
     return _FACE_CASCADE
+
+
+def face_detector_available() -> bool:
+    """Return True if Haar cascade face detector is loaded and available."""
+    return _get_face_cascade() is not None
 
 
 @dataclass(frozen=True)
@@ -270,7 +288,7 @@ def extract_signals(path: Path, max_audio_sec: float = 120.0) -> ClipSignals:
             "f32le",
             "-",
         ]
-        proc = run_tool_bytes(cmd)
+        proc = run_tool_bytes(cmd, timeout=60.0)
         if proc.returncode == 0 and proc.stdout:
             samples = np.frombuffer(proc.stdout, dtype=np.float32)
             voice_ratio, snr_db = voice_activity(samples, 16000)
@@ -313,12 +331,18 @@ def classify_clip(
     try:
         signals = extractor(p)
         decision = decide_role(signals)
+        reasons = list(decision.reasons)
+        detector_fn = getattr(
+            sys.modules[__name__], "face_detector_available", face_detector_available
+        )
+        if not detector_fn():
+            reasons.append("face_detector_unavailable")
         return ClassificationResult(
             path=p,
             role=decision.role,
             confidence=decision.confidence,
             has_speech=decision.has_speech,
-            reasons=decision.reasons,
+            reasons=reasons,
             signals=signals,
             error=None,
         )
