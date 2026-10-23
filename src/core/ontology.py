@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 class CameraRole(str, Enum):
@@ -26,8 +27,31 @@ class MediaFolderEntry:
     total_duration: float = 0.0
 
 
+def role_folder_of(path: str | Path) -> Literal["a_roll", "b_roll"] | None:
+    """Return 'a_roll' or 'b_roll' if any directory ancestor matches, else None.
+
+    Inspects directory components only (Path(p).parent.parts), never the file name.
+    Component is normalised: lowercased, with '-', '_', and ' ' removed.
+    Exact match only ('aroll' or 'broll'), no substring matches.
+    """
+    parent = Path(path).parent
+    for part in parent.parts:
+        norm = part.lower().replace("-", "").replace("_", "").replace(" ", "")
+        if norm == "aroll":
+            return "a_roll"
+        if norm == "broll":
+            return "b_roll"
+    return None
+
+
 def infer_camera_role(path_or_name: str | Path) -> CameraRole:
     """Infer the most probable CameraRole from directory or file naming heuristics."""
+    folder_role = role_folder_of(path_or_name)
+    if folder_role == "a_roll":
+        return CameraRole.CAM_A
+    if folder_role == "b_roll":
+        return CameraRole.B_ROLL
+
     full_path_str = str(path_or_name).replace("\\", "/").lower()
 
     if any(k in full_path_str for k in ("cam_b", "camb", "cam-b", "angle_b", "angle2", "guest", "reaction", "close_up")):

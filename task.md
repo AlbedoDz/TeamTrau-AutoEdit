@@ -286,7 +286,7 @@
 - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
 - [/] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
   - [x] Task 0: Hygiene & baseline (no production code)
-  - [ ] Task 1: Role folders (Mode B ingestion)
+  - [x] Task 1: Role folders (Mode B ingestion)
   - [ ] Task 2: Content role classifier
   - [ ] Task 3: Golden window selection
   - [ ] Task 4: Wire roles and golden windows into the rough-cut stage

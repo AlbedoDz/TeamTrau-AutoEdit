@@ -17,7 +17,7 @@ from typing import Any, Callable, Literal
 
 from src.core.analysis_cache import scene_key as span_key
 from src.core.config import PipelineConfig
-from src.core.ontology import infer_camera_role
+from src.core.ontology import infer_camera_role, role_folder_of
 from src.core.types import (
     ALL_DELIVER_FORMATS,
     UNSUPPORTED_RAW_EXTENSIONS,
@@ -162,10 +162,14 @@ def _enforce_vram_headroom(max_allowed_gb: float = 2.0) -> None:
         pass
 
 
+AUDIO_EXTENSIONS: frozenset[str] = frozenset({".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"})
+
+
 def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[Path]]:
     """Footage found in a folder / file (or a list of them) and the unsupported RAW files skipped.
 
-    Folders are scanned one level deep; extensions come from ``VIDEO_EXTENSIONS``.
+    Folders are scanned at the top level, plus one level inside subfolders whose name is a
+    role folder (e.g. A-roll, B-roll). Extensions come from ``VIDEO_EXTENSIONS``.
     """
     collected: list[Path] = []
     skipped: list[Path] = []
@@ -175,9 +179,41 @@ def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[
             files = [f for f in p.iterdir() if f.is_file()]
             collected.extend(f for f in files if f.suffix.lower() in VIDEO_EXTENSIONS)
             skipped.extend(f for f in files if f.suffix.lower() in UNSUPPORTED_RAW_EXTENSIONS)
+
+            subdirs = sorted(
+                [d for d in p.iterdir() if d.is_dir() and role_folder_of(d / "x") is not None],
+                key=lambda d: d.name.lower(),
+            )
+            for sub in subdirs:
+                sub_files = [f for f in sub.iterdir() if f.is_file()]
+                collected.extend(f for f in sub_files if f.suffix.lower() in VIDEO_EXTENSIONS)
+                skipped.extend(f for f in sub_files if f.suffix.lower() in UNSUPPORTED_RAW_EXTENSIONS)
         elif p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
             collected.append(p)
     return collected, skipped
+
+
+def find_soundtrack(input_dir: Path) -> Path | None:
+    """Find a single soundtrack audio file inside a direct subfolder named 'music'.
+
+    Case-insensitive directory name ('music', 'Music', etc.).
+    Returns the audio file path if exactly one audio file (per ``AUDIO_EXTENSIONS``) exists,
+    otherwise None.
+    """
+    p = Path(input_dir)
+    if not p.is_dir():
+        return None
+    music_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.lower() == "music"]
+    if not music_dirs:
+        return None
+    audio_files: list[Path] = []
+    for md in music_dirs:
+        audio_files.extend(
+            f for f in md.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+        )
+    if len(audio_files) == 1:
+        return audio_files[0]
+    return None
 
 
 def _camera_role(scene: SceneCut) -> str:
