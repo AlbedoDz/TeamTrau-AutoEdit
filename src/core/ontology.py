@@ -35,7 +35,7 @@ def role_folder_of(path: str | Path) -> Literal["a_roll", "b_roll"] | None:
     Exact match only ('aroll' or 'broll'), no substring matches.
     """
     parent = Path(path).parent
-    for part in parent.parts:
+    for part in reversed(parent.parts):
         norm = part.lower().replace("-", "").replace("_", "").replace(" ", "")
         if norm == "aroll":
             return "a_roll"
