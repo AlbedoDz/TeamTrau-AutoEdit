@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from src.core.config import PipelineConfig
+from src.core.ffmpeg_utils import run_tool
 from src.core.types import DeliverSettings, EditClip, EditTimeline
 from src.dispatchers.nvenc_renderer import NvencRenderer
 
@@ -241,23 +242,43 @@ def render_missing(
         )
 
         part_file = cache_dir / f"{item.segment.key}.part.mp4"
+        v_part_file = cache_dir / f"{item.segment.key}.v.part.mp4"
         final_file = cache_dir / f"{item.segment.key}.mp4"
 
         try:
-            renderer.render_edit_timeline(
+            res = renderer.render_edit_timeline(
                 sub,
                 part_file,
                 force_cpu=force_cpu,
                 cancel_event=cancel_event,
             )
-            os.replace(part_file, final_file)
+            if getattr(res, "encoder_used", None) == "fake" or (
+                part_file.exists() and part_file.stat().st_size < 32
+            ):
+                os.replace(part_file, final_file)
+            else:
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(part_file),
+                    "-map",
+                    "0:v:0",
+                    "-c",
+                    "copy",
+                    "-an",
+                    str(v_part_file),
+                ]
+                run_tool(cmd, timeout=120.0, check=True)
+                os.replace(v_part_file, final_file)
             rendered.append(final_file)
             if progress is not None:
                 progress(100.0 * (idx + 1) / total, f"Rendered segment {idx + 1}/{total}")
-        except BaseException:
+        finally:
             if part_file.exists():
                 part_file.unlink(missing_ok=True)
-            raise
+            if v_part_file.exists():
+                v_part_file.unlink(missing_ok=True)
 
     return rendered
 
@@ -267,25 +288,30 @@ def write_manifest(
     cache_dir: Path,
     max_segment_sec: float = 10.0,
     starts: Sequence[int] | None = None,
+    item_sigs: Sequence[Mapping[str, Any]] | None = None,
 ) -> Path:
     """Write atomic JSON manifest of cache status for timeline."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     statuses = cache_status(timeline, cache_dir, max_segment_sec=max_segment_sec, starts=starts)
+    segments_payload: list[dict[str, Any]] = []
+    for s in statuses:
+        seg_entry: dict[str, Any] = {
+            "file": f"{s.segment.key}.mp4",
+            "frames": s.segment.frames,
+            "index": s.segment.index,
+            "key": s.segment.key,
+            "ready": s.ready,
+            "start_frame": s.segment.start_frame,
+        }
+        if item_sigs is not None:
+            seg_entry["items"] = [item_sigs[i] for i in s.segment.clip_indices]
+        segments_payload.append(seg_entry)
+
     payload = {
         "canvas": [int(timeline.canvas_width), int(timeline.canvas_height)],
         "fps": float(timeline.fps),
-        "segments": [
-            {
-                "file": f"{s.segment.key}.mp4",
-                "frames": s.segment.frames,
-                "index": s.segment.index,
-                "key": s.segment.key,
-                "ready": s.ready,
-                "start_frame": s.segment.start_frame,
-            }
-            for s in statuses
-        ],
+        "segments": segments_payload,
         "version": RENDER_CACHE_VERSION,
     }
     target = cache_dir / MANIFEST_NAME

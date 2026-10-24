@@ -329,6 +329,7 @@
   - [x] P2.3: Shell integration: workspace bridge, preload, engine client (`electron/workspace-registry.cjs`, `electron/preload.cjs`, `src/features/teamtrau/engine/*`)
   - [x] P2.4: Offline-safe shell assets and product name
   - [ ] P2.5: Vietnamese locale (`src/i18n/locales/vi.json`)
+  - [x] P4.0: Render cache for Studio (`src/modules/render_cache.py`, `src/engine_api/runners.py`)
   - [ ] P4.1: Render-cache sidecar store & invalidation
   - [ ] P4.2: Composition model segment substitution
   - [ ] P4.3: Playback meter & benchmark

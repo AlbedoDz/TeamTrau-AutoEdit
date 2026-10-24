@@ -7,8 +7,10 @@ a FreeCutTimeline containing an EditTimeline and clip start frames.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from src.core.types import EditClip, EditTimeline
 from src.integrations.freecut_writer import sanitize_workspace_filename
@@ -19,6 +21,7 @@ class FreeCutTimeline:
     timeline: EditTimeline  # V1 (top-most video track) items in time order
     starts: tuple[int, ...]  # timeline start frame of each clip (gaps allowed)
     project_id: str
+    items: tuple[Mapping[str, Any], ...] = ()
 
 
 def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
@@ -77,6 +80,7 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
 
     starts: list[int] = []
     clips: list[EditClip] = []
+    item_signatures: list[dict[str, Any]] = []
 
     for item in video_items:
         start_frame = int(item.get("from", 0))
@@ -85,6 +89,27 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
         media_id = item.get("mediaId")
         if not media_id:
             raise ValueError(f"Video item {item.get('id', 'unknown')} missing mediaId")
+
+        duration_frames = int(item.get("durationInFrames", 0))
+        raw_source_start = item.get("sourceStart", 0)
+        if "sourceEnd" in item:
+            raw_source_end = item["sourceEnd"]
+        else:
+            raw_source_end = raw_source_start + duration_frames
+
+        raw_speed = item.get("speed", 1.0)
+
+        item_signatures.append(
+            {
+                "id": item.get("id"),
+                "mediaId": media_id,
+                "from": item.get("from", start_frame),
+                "durationInFrames": item.get("durationInFrames", duration_frames),
+                "sourceStart": raw_source_start,
+                "sourceEnd": raw_source_end,
+                "speed": raw_speed,
+            }
+        )
 
         media_dir = workspace / "media" / str(media_id)
         if not media_dir.exists():
@@ -128,14 +153,9 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
             raise ValueError(f"media {media_id} source path could not be resolved")
 
         source_fps = float(item.get("sourceFps") or fps)
-        source_start = float(item.get("sourceStart", 0))
-        duration_frames = int(item.get("durationInFrames", 0))
-        speed = float(item.get("speed", 1.0))
-
-        if "sourceEnd" in item:
-            source_end = float(item["sourceEnd"])
-        else:
-            source_end = source_start + duration_frames
+        source_start = float(raw_source_start)
+        source_end = float(raw_source_end)
+        speed = float(raw_speed)
 
         source_in = source_start / source_fps if source_fps > 0 else 0.0
         frames = duration_frames
@@ -165,4 +185,5 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
         timeline=timeline,
         starts=tuple(starts),
         project_id=project_id,
+        items=tuple(item_signatures),
     )

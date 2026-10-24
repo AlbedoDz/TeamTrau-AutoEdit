@@ -65,15 +65,19 @@ def run_render_cache(
     Params:
         workspace: Path to FreeCut workspace directory.
         project_id: FreeCut project identifier.
-        cache_dir: Directory to store cache segment files and manifest.
+        cache_dir: Optional directory to store cache segment files and manifest
+            (defaults to workspace/.teamtrau/render-cache/project_id).
         max_segment_sec: Optional max segment length in seconds (default: 10.0).
 
     Returns:
-        {"manifest": manifest_path, "rendered": count}
+        {"manifest": manifest_path, "cache_dir": cache_dir_path, "rendered": count}
     """
     workspace = Path(params["workspace"])
     project_id = str(params["project_id"])
-    cache_dir = Path(params["cache_dir"])
+    if params.get("cache_dir"):
+        cache_dir = Path(params["cache_dir"])
+    else:
+        cache_dir = workspace / ".teamtrau" / "render-cache" / project_id
     max_segment_sec = float(params.get("max_segment_sec", 10.0))
 
     freecut_tl = read_freecut_project(workspace, project_id)
@@ -95,10 +99,12 @@ def run_render_cache(
         cache_dir,
         starts=freecut_tl.starts,
         max_segment_sec=max_segment_sec,
+        item_sigs=freecut_tl.items,
     )
 
     return {
         "manifest": str(manifest_path),
+        "cache_dir": str(cache_dir),
         "rendered": len(rendered),
     }
 

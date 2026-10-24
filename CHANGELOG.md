@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(render-cache): studio manifest item signatures, workspace cache dir, video-only segments
 - refactor(engine): phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
 - refactor(curation): review polish (batch classify, export guard, top_n clamp, docs)
 - feat(engine-api): loopback job service (auth, SSE events, cancel) + main.py serve
