@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(render-cache): content-hashed all-intra segment cache + intra_only renderer option
 - feat(integrations): FreeCut project reader (V1 timeline, gaps, schema guard)
 - feat(integrations): production FreeCut writer (atomic, source links, proxy adoption)
 - feat(proxy): production proxy generator (heuristics, caps-driven encoder fallback, atomic output)
