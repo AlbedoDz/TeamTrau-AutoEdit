@@ -1007,3 +1007,184 @@ def test_server_binds_loopback_only():
 - `main.py serve` starts, `GET /v1/health` answers, `POST /v1/jobs/proxies` on `E:\antigravity\perf-samples\4k60_hevc_422_10bit.mov` produces an all-intra proxy that the Studio adopts (manual check by architect with the S0.3 harness).
 - `render_cache` job on a FreeCut project written by the engine produces a manifest whose segments are all `ready` and all-intra.
 - Phase 2 (Studio shell) and Phase 4 (Studio plays the render cache) are planned in detail only after these pass.
+
+---
+
+## P1.7 — Phase 1 review polish (added after the Phase 1 review)
+
+Fix exactly these review findings, nothing else:
+1. `src/core/platform_caps.py` `probe`: the `-encoders` and `-hwaccels` calls must not crash `probe`/`get_caps`. On `subprocess.TimeoutExpired` or `OSError` from `run`, treat that list as empty (same style as the smoke test handling).
+2. `src/integrations/freecut_writer.py`:
+   - Read and parse `index.json` **before** creating `projects/{id}/`, so a corrupt index leaves no orphan directory.
+   - Remove the cv2 fallback in `probe_file_stats` together with its bare `except Exception: pass`. `probe_media` is the only probe; when it finds no video stream, the existing defaults apply.
+3. `src/integrations/freecut_reader.py`:
+   - A corrupt `source.link.json` or `metadata.json` raises `ValueError` naming the media id. Do not silently fall through, and use no bare `except`.
+   - Select video tracks by `kind == "video"` only, and remove the `startswith("track-v")` and `type` heuristics. FreeCut `TimelineTrack.kind` is `'video' | 'audio'`.
+4. `src/dispatchers/nvenc_renderer.py`:
+   - Document in the `_derive` docstring that `settings=None` keeps the receiver's settings.
+   - Wrap the `__init__` signature to at most 100 characters.
+5. `src/engine_api/`:
+   - `create_app` raises `ValueError` for an empty or whitespace token.
+   - `_AuthMiddleware` compares with `hmac.compare_digest`.
+   - `main.py serve` rejects an empty token file with `click.BadParameter` before starting the server.
+   - `JobRegistry.__init__(self, max_finished: int = 200)`: on every `submit`, evict the oldest *finished* jobs (status not `running`) so at most `max_finished` remain. Running jobs are never evicted.
+6. `src/modules/visual_scorer.py` `_init_aesthetic_model`: when `torch.cuda.is_available()` is false, log at INFO ("PyTorch build has no CUDA; using OpenCV aesthetic engine") and do **not** load the model.
+   - Today a CPU-only torch on a GPU machine loads MobileNet, then every batch fails on `.to("cuda")` and silently falls back.
+
+**Files:**
+- `src/core/platform_caps.py`
+- `src/integrations/freecut_writer.py`
+- `src/integrations/freecut_reader.py`
+- `src/dispatchers/nvenc_renderer.py`
+- `src/engine_api/app.py`
+- `src/engine_api/jobs.py`
+- `main.py`
+- `src/modules/visual_scorer.py`
+- tests: `tests/test_phase1_polish.py` (LOCKED)
+
+**Related suites:**
+- `tests/test_platform_caps.py`
+- `tests/test_freecut_writer.py`
+- `tests/test_freecut_writer_index.py`
+- `tests/integration/test_freecut_writer_real.py`
+- `tests/integration/test_freecut_reader_real.py`
+- `tests/test_engine_api.py`
+- `tests/test_render_cache.py`
+- `tests/test_visual_scorer*.py`
+
+All existing tests stay green without editing them.
+
+**Contract test — `tests/test_phase1_polish.py`:**
+```python
+"""Phase 1 review polish: failure paths of probe, writer, reader, engine API, visual scorer."""
+
+import json
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from src.core.config import PipelineConfig
+from src.core.platform_caps import probe
+from src.core.types import EditClip, EditTimeline
+from src.engine_api.app import create_app
+from src.engine_api.jobs import JobRegistry
+from src.integrations.freecut_reader import read_freecut_project
+from src.integrations.freecut_writer import write_freecut_project
+
+
+def _tl(path: Path) -> EditTimeline:
+    clip = EditClip(source_path=path, source_in=0.0, frames=30, available=1.0)
+    return EditTimeline(name="t", fps=30.0, canvas_width=1920, canvas_height=1080, clips=[clip])
+
+
+@pytest.mark.parametrize("exc", [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=15),
+                                 OSError("ffmpeg vanished")])
+def test_probe_survives_ffmpeg_list_failure(exc):
+    def boom(*_a, **_k):
+        raise exc
+
+    caps = probe(ffmpeg="ffmpeg", os_name="linux", run=boom, smoke_test=False,
+                 torch_device="cpu")
+    assert caps.h264_encoders == () and caps.hevc_encoders == () and caps.hwaccels == ()
+    assert caps.best_h264 is None
+
+
+def test_corrupt_index_leaves_no_orphan_project_dir(tmp_path: Path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "index.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        write_freecut_project(_tl(tmp_path / "a.mp4"), ws, "x")
+    projects = ws / "projects"
+    assert not projects.exists() or not any(projects.iterdir())
+
+
+@pytest.mark.parametrize("name", ["source.link.json", "metadata.json"])
+def test_reader_rejects_corrupt_media_json(tmp_path: Path, name: str):
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"not really video")
+    ws = tmp_path / "ws"
+    pid = write_freecut_project(_tl(src), ws, "x")
+    proj = json.loads((ws / "projects" / pid / "project.json").read_text(encoding="utf-8"))
+    mid = next(i["mediaId"] for i in proj["timeline"]["items"] if i["type"] == "video")
+    if name == "metadata.json":
+        (ws / "media" / mid / "source.link.json").unlink()
+    (ws / "media" / mid / name).write_text("{bad", encoding="utf-8")
+    with pytest.raises(ValueError, match=mid):
+        read_freecut_project(ws, pid)
+
+
+def test_create_app_rejects_empty_token():
+    with pytest.raises(ValueError):
+        create_app("", runners={})
+    with pytest.raises(ValueError):
+        create_app("   ", runners={})
+
+
+def test_serve_rejects_empty_token_file(tmp_path: Path, monkeypatch):
+    import uvicorn
+
+    from main import cli
+
+    started: list[bool] = []
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, *a, **k: started.append(True))
+    tok = tmp_path / "token"
+    tok.write_text("  \n", encoding="utf-8")
+    res = CliRunner().invoke(cli, ["serve", "--port", "8798", "--token-file", str(tok)])
+    assert res.exit_code != 0
+    assert started == []
+
+
+def _wait_done(reg: JobRegistry, job_id: str, timeout: float = 10.0) -> None:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        job = reg.get(job_id)
+        if job is not None and job["status"] != "running":
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
+def test_registry_evicts_oldest_finished_jobs():
+    reg = JobRegistry(max_finished=2)
+    ok = lambda params, emit, cancel: {"ok": True}  # noqa: E731
+    ids = []
+    for _ in range(3):
+        jid = reg.submit("k", ok, {})
+        _wait_done(reg, jid)
+        ids.append(jid)
+    gate = threading.Event()
+    running = reg.submit("k", lambda p, e, c: gate.wait(10) and {}, {})
+    assert reg.get(ids[0]) is None
+    assert reg.get(ids[1]) is not None and reg.get(ids[2]) is not None
+    assert reg.get(running)["status"] == "running"
+    gate.set()
+    _wait_done(reg, running)
+
+
+def test_visual_scorer_skips_torch_model_without_torch_cuda(monkeypatch):
+    import torch
+
+    import src.modules.visual_scorer as vs
+
+    monkeypatch.setattr(vs, "check_cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    scorer = vs.VisualScorer(PipelineConfig())
+    assert scorer._torch_model is None
+```
+**Expected red:** 8 failed, 1 passed.
+- The `metadata.json` case of `test_reader_rejects_corrupt_media_json` already passes, because the current code raises "source path could not be resolved". It is a guard.
+- The other 8 fail as follows:
+  - `TimeoutExpired`/`OSError` from `probe`
+  - the orphan-directory assertion
+  - DID NOT RAISE in the reader (`source.link.json` case)
+  - DID NOT RAISE in `create_app`
+  - `assert 0 != 0` in `serve`
+  - `TypeError` from `JobRegistry(max_finished=...)`
+  - a MobileNet model is loaded.
+
+**Commit:** `refactor(engine): phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)`.
