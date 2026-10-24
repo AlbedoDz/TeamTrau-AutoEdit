@@ -63,7 +63,7 @@
 | P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | **yes (below)** |
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
 | P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | **yes (below)** |
-| P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | later |
+| P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | **yes (below)** |
 | P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | later |
 | P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | later |
 | P3.6 | Studio | Agent console: prompt box, streamed thoughts and tool calls, cancel | later |
@@ -1380,3 +1380,193 @@ describe('buildIngestView', () => {
 **Expected red:** `Failed to resolve import "../ingest-rows"`.
 
 **Commit:** `feat(teamtrau): ingest panel (footage folder, role analysis, curate)`.
+
+
+---
+
+## P3.3 — Curation panel: golden-takes grid, P/X hotkeys, "Send to timeline" as ONE undo step (Studio repo)
+
+**API**
+```ts
+// src/features/teamtrau/curation/take-plan.ts (new, pure)
+export interface CurationShot { /* = engine shot_to_dict: shot_id, clip_path, start, end, duration, composite, sharpness,
+                                   aesthetic, motion_energy, content_role, role_confidence, included, golden, defects */ }
+export function takeWindow(s: CurationShot): { inSec: number; outSec: number }
+export function planTakeInsert(shots: CurationShot[], opts: { fps; startFrame; mediaIdForPath(path): string | null;
+                                normalizePath?(path): string }): { items: PlannedItem[]; skipped: {shotId; reason}[]; endFrame }
+export function applyShotKey(key: string, s: CurationShot): { included: boolean } | null
+```
+
+**Pure rules**
+- **`takeWindow`:** uses `golden.source_in`/`source_out` when both are numbers, otherwise the scene `start`/`end`.
+- **`planTakeInsert`:**
+  - Keeps the given order.
+  - A take with `included: false` is recorded as skipped with reason `excluded`.
+  - A take whose media is not found is recorded as skipped with reason `media-missing`. The path is passed through `normalizePath` first; the default is the identity function.
+  - Places takes back to back from `startFrame`, with `durationInFrames = max(1, round((out - in) * fps))`.
+- **`applyShotKey`:**
+  - `p` or `P` returns `{included: true}` when the take is excluded.
+  - `x` or `X` returns `{included: false}` when the take is included.
+  - Anything else, or no change, returns `null`.
+
+**Panel**: a Curation sub-tab of the TeamTrau panel.
+- **Loading:**
+  - Load the session from P3.2's session store with `GET /v1/sessions/{id}`.
+  - Show an empty state with a hint to run Ingest → Curate first.
+- **Media lookup (`mediaIdForPath`):**
+  - Read the `teamtrau` AI sidecars of the project's media (`media/{id}/cache/ai/teamtrau.json`, `data.sourcePath`).
+  - Add `'teamtrau'` to the closed `AiOutputKind` union, with a typed reader in the ai-outputs module.
+  - Normalise paths with `/` separators, lower-cased on Windows.
+- **Grid:**
+  - Use `@tanstack/react-virtual`; it is already a dependency.
+  - Each card shows: a thumbnail (FreeCut's thumbnail service via a deps contract), shot id, role badge, composite score bar, golden window length, defect chips (type and time), and an excluded state (dimmed, struck through).
+- **Card actions:**
+  - An include/exclude toggle calls `PATCH /v1/sessions/{id}` with `{included}`.
+  - A role select (`a_roll`, `b_roll`, `ambient_b_roll`) calls PATCH with `{content_role}`.
+  - Use optimistic UI, and roll back if the engine returns an error.
+- **Filters:** role, minimum score, and show/hide excluded. **Sort:** by score (default) or by source and time.
+- **Hotkeys:**
+  - Add `TEAMTRAU_PICK: 'p'` and `TEAMTRAU_REJECT: 'x'` to `HOTKEYS` in `src/config/hotkeys.ts`, with labels and a hotkey-editor section.
+  - They act on the focused card via `applyShotKey`.
+  - Gate them with `enabled: teamtrauTabActive && (pointer or focus within the panel)`. `p` and `x` are currently unbound.
+- **Send to timeline:**
+  1. Build the plan in the current sort order with `planTakeInsert(..., startFrame = playhead frame)`. Offer an "append at end of V1" option.
+  2. Build items with `buildMediaTimelineItems`, including linked audio, through a new teamtrau deps contract.
+  3. Insert everything inside ONE `executeTimelineCommand('TEAMTRAU_SEND_TAKES', () => …raw store mutators…)`, creating V1/A1 tracks if missing. Never call public timeline actions inside it.
+  4. Show a toast with "N takes inserted, M skipped (reasons)".
+- **i18n:** add the strings to every `teamtrau.json`, with `en` and `vi` translated.
+
+**Tests**
+- The LOCKED `take-plan` test below.
+- Your own tests:
+  - **Real-store test**, in the `color-timeline-navigator.test.tsx` style: seed the timeline stores, send 3 planned items, and assert 3 video items plus linked audio; ONE undo restores the previous item list exactly.
+  - **Component test** with mocked stores: X on a focused card PATCHes `{included: false}`.
+
+**Manual acceptance (paste in the HANDOFF):**
+- In Electron, open the P3.2 demo curated project. The grid shows the takes with scores and defects.
+- Exclude one take with X, then send to timeline. The items appear.
+- Press Ctrl+Z once and they all disappear.
+- Screenshot to `docs/superpowers/handoffs/p33_curation.png` (engine repo).
+
+**Ladder:** as in P3.1, plus `check:edge-budgets` (report the new teamtrau→timeline edges), then push WITH the hook.
+
+**Files:**
+- `src/features/teamtrau/curation/*`
+- `src/features/teamtrau/components/*`
+- `src/features/teamtrau/deps/*` (new contracts)
+- `src/config/hotkeys.ts` (+ labels and editor section)
+- the ai-outputs types and reader (the `teamtrau` kind)
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/curation/__tests__/take-plan.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/curation/__tests__/take-plan.test.ts`:**
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { applyShotKey, planTakeInsert, takeWindow, type CurationShot } from '../take-plan'
+
+function shot(id: string, extra: Partial<CurationShot> = {}): CurationShot {
+  return {
+    shot_id: id,
+    clip_path: 'D:/s/A-roll/a.mp4',
+    start: 10,
+    end: 14,
+    duration: 4,
+    composite: 0.8,
+    sharpness: 0.5,
+    aesthetic: 0.5,
+    motion_energy: 0.1,
+    content_role: 'a_roll',
+    role_confidence: 0.9,
+    included: true,
+    golden: null,
+    defects: [],
+    ...extra,
+  }
+}
+
+describe('takeWindow', () => {
+  it('uses the golden window when present, else the scene bounds', () => {
+    expect(takeWindow(shot('A01'))).toEqual({ inSec: 10, outSec: 14 })
+    expect(takeWindow(shot('A02', { golden: { source_in: 10.5, source_out: 12.25 } }))).toEqual({
+      inSec: 10.5,
+      outSec: 12.25,
+    })
+  })
+})
+
+describe('planTakeInsert', () => {
+  const media = new Map([
+    ['D:/s/A-roll/a.mp4', 'm-a'],
+    ['D:/s/B-roll/b.mp4', 'm-b'],
+  ])
+
+  it('places included takes back to back from startFrame, in the given order', () => {
+    const plan = planTakeInsert(
+      [
+        shot('A01'),
+        shot('B01', { clip_path: 'D:/s/B-roll/b.mp4', start: 2, end: 3.5, content_role: 'b_roll' }),
+        shot('A02', { golden: { source_in: 20, source_out: 21 } }),
+      ],
+      { fps: 30, startFrame: 90, mediaIdForPath: (p) => media.get(p) ?? null },
+    )
+    expect(plan.items).toEqual([
+      { shotId: 'A01', mediaId: 'm-a', from: 90, durationInFrames: 120, sourceStartSec: 10, sourceEndSec: 14 },
+      { shotId: 'B01', mediaId: 'm-b', from: 210, durationInFrames: 45, sourceStartSec: 2, sourceEndSec: 3.5 },
+      { shotId: 'A02', mediaId: 'm-a', from: 255, durationInFrames: 30, sourceStartSec: 20, sourceEndSec: 21 },
+    ])
+    expect(plan.endFrame).toBe(285)
+    expect(plan.skipped).toEqual([])
+  })
+
+  it('skips excluded takes and takes whose media is not in the project', () => {
+    const plan = planTakeInsert(
+      [
+        shot('A01', { included: false }),
+        shot('B09', { clip_path: 'D:/elsewhere/x.mp4' }),
+        shot('A03'),
+      ],
+      { fps: 25, startFrame: 0, mediaIdForPath: (p) => media.get(p) ?? null },
+    )
+    expect(plan.items.map((i) => i.shotId)).toEqual(['A03'])
+    expect(plan.items[0]!.durationInFrames).toBe(100)
+    expect(plan.skipped).toEqual([
+      { shotId: 'A01', reason: 'excluded' },
+      { shotId: 'B09', reason: 'media-missing' },
+    ])
+  })
+
+  it('never produces zero-length items', () => {
+    const plan = planTakeInsert([shot('A01', { start: 5, end: 5.001 })], {
+      fps: 30,
+      startFrame: 0,
+      mediaIdForPath: () => 'm-a',
+    })
+    expect(plan.items[0]!.durationInFrames).toBe(1)
+  })
+
+  it('matches media paths regardless of slash style and case on Windows-like paths', () => {
+    const plan = planTakeInsert([shot('A01', { clip_path: 'd:\\s\\A-roll\\A.MP4' })], {
+      fps: 30,
+      startFrame: 0,
+      mediaIdForPath: (p) => (p === 'd:/s/a-roll/a.mp4' ? 'm-a' : null),
+      normalizePath: (p) => p.replace(/\\/g, '/').toLowerCase(),
+    })
+    expect(plan.items.map((i) => i.mediaId)).toEqual(['m-a'])
+  })
+})
+
+describe('applyShotKey', () => {
+  it('maps P to include and X to exclude; other keys do nothing', () => {
+    expect(applyShotKey('p', shot('A01', { included: false }))).toEqual({ included: true })
+    expect(applyShotKey('P', shot('A01', { included: false }))).toEqual({ included: true })
+    expect(applyShotKey('x', shot('A01'))).toEqual({ included: false })
+    expect(applyShotKey('p', shot('A01'))).toBeNull()
+    expect(applyShotKey('x', shot('A01', { included: false }))).toBeNull()
+    expect(applyShotKey('k', shot('A01'))).toBeNull()
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../take-plan"`.
+
+**Commit:** `feat(teamtrau): curation grid with P/X hotkeys and one-undo send to timeline`.
