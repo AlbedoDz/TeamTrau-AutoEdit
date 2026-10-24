@@ -65,7 +65,7 @@
 | P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | **yes (below)** |
 | P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | **yes (below)** |
 | P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | **yes (below)** |
-| P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | later |
+| P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | **yes (below)** |
 | P3.6 | Studio | Agent console: prompt box, streamed thoughts and tool calls, cancel | later |
 | G3 | Owner | Feature-parity checklist against the PySide6 GUI (scene grid badges, inspector settings, export panel, agent console) → freeze PySide6 (spec S7) | — |
 
@@ -1718,3 +1718,172 @@ describe('analysisToRulerMarks', () => {
 **Expected red:** `Failed to resolve import "../ruler-marks"`.
 
 **Commit:** `feat(teamtrau): sequence panel with soundtrack analysis, beat-grid ruler overlay and cadence assemble`.
+
+
+---
+
+## P3.5 — Deliver panel: settings form, pre-flight, NLE export and master render (Studio repo)
+
+**API**
+```ts
+// src/features/teamtrau/deliver/deliver-form.ts (new, pure)
+export const DELIVER_FORMATS = ['mp4', 'fcpxml', 'premiere', 'otio', 'capcut'] as const
+export interface DeliverForm { outputDir; formats: DeliverFormat[]; master; fit; color; subtitles;
+                               canvasWidth; canvasHeight; fps; audioRate; audioChannels }
+export function buildDeliverRequest(form: DeliverForm, ctx: { workspace; projectId }):
+  | { ok: true; params: { workspace; project_id; output_dir; formats; settings: { canvas: 'WxH'; fps; fit; color; master;
+                                                                                     subtitles; audio_rate; audio_channels } } }
+  | { ok: false; errors: ('project' | 'output-dir' | 'formats' | 'canvas-even' | 'fps')[] }
+export function summarizePreflight(report: { ok; checked_files; issues: { code; severity; path; detail }[] }):
+  { checkedFiles; errors; warnings; blocking; groups: { code; severity; count; files: string[] }[] }
+```
+
+**Pure rules**
+- **`buildDeliverRequest`**
+  - A missing workspace or project returns only `['project']`.
+  - Otherwise every problem is collected, in this order:
+    - `output-dir`: blank output dir;
+    - `formats`: empty, or containing an unknown format;
+    - `canvas-even`: width or height not a positive even integer;
+    - `fps`: not greater than 0.
+  - The settings keys match the engine `deliver` runner (P3.0d) exactly.
+- **`summarizePreflight`**
+  - Groups by `code`; files are base names.
+  - Error groups come first, then groups ordered by code.
+  - `blocking` is `errors > 0`.
+
+**Panel**: a Deliver sub-tab of the TeamTrau panel.
+- **Defaults:** the form starts from the current project's canvas and fps. Master, fit, color and subtitle selects are filled from `GET /v1/presets` `deliver`, with translated labels. Audio rate offers 44100, 48000 and 96000; channels offer 1 and 2.
+- **Format checkboxes:** MP4 master, DaVinci (FCPXML), Premiere (XML), OTIO and CapCut.
+- **Output folder:** chosen with `teamtrauHost.pickFolder`.
+- **"Run pre-flight":** runs the `preflight` job and renders `summarizePreflight`.
+  - Errors are shown in red, each with the list of files.
+  - When the report is blocking, "Deliver" is disabled unless the user ticks "Deliver anyway".
+- **"Deliver":** runs the `deliver` job from `buildDeliverRequest` and shows progress in the jobs list. Validation errors appear inline next to the fields.
+- **Result card:**
+  - Lists each output with its file name; the encoder used is shown as a badge (e.g. `h264_nvenc`).
+  - "Open folder" uses a new preload `teamtrauHost.openPath(path)`, which goes through IPC `teamtrau:open-path` to `shell.openPath`.
+  - Main must only open paths inside the deliver output directory of a completed job, or inside the workspace. It rejects anything else.
+- **i18n:** `en` and `vi` translated, and every language file present.
+
+**Tests**
+- The LOCKED `deliver-form` test.
+- Your own tests:
+  - a component test: invalid fields show their messages, and a blocking pre-flight disables Deliver until the override is ticked;
+  - a node:test for the `teamtrau:open-path` guard, which rejects a path outside the allowed roots. Extract the guard into `electron/open-path-guard.cjs` so it is testable.
+
+**Manual acceptance (paste in the HANDOFF):**
+- In Electron, on the sequence project from P3.4:
+  1. Run pre-flight and see its result.
+  2. Deliver MP4 (h264) plus FCPXML plus CapCut into `E:\antigravity\deliver-test`.
+  3. The result card shows the files and `h264_nvenc`, and "Open folder" works.
+- Check the outputs with ffprobe:
+  - the MP4 codec and resolution;
+  - that the FCPXML file exists.
+- Paste the ffprobe output.
+- Screenshot to `docs/superpowers/handoffs/p35_deliver.png` (engine repo).
+
+**Ladder:** as in P3.3, plus `npm run test:electron`, plus push WITH the hook.
+
+**Files:**
+- `src/features/teamtrau/deliver/*`
+- `src/features/teamtrau/components/*`
+- `electron/main.cjs`, `electron/preload.cjs`, `electron/open-path-guard.cjs` (+ `electron/__tests__/open-path-guard.test.cjs`)
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/deliver/__tests__/deliver-form.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/deliver/__tests__/deliver-form.test.ts`:**
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { buildDeliverRequest, summarizePreflight, type DeliverForm } from '../deliver-form'
+
+const form: DeliverForm = {
+  outputDir: 'D:/out',
+  formats: ['mp4', 'fcpxml', 'premiere'],
+  master: 'h264',
+  fit: 'fill',
+  color: 'rec709',
+  subtitles: 'none',
+  canvasWidth: 1920,
+  canvasHeight: 1080,
+  fps: 59.94,
+  audioRate: 48000,
+  audioChannels: 2,
+}
+
+describe('buildDeliverRequest', () => {
+  it('maps the form to deliver job params', () => {
+    const r = buildDeliverRequest(form, { workspace: 'D:/ws', projectId: 'p-1' })
+    expect(r).toEqual({
+      ok: true,
+      params: {
+        workspace: 'D:/ws',
+        project_id: 'p-1',
+        output_dir: 'D:/out',
+        formats: ['mp4', 'fcpxml', 'premiere'],
+        settings: {
+          canvas: '1920x1080',
+          fps: 59.94,
+          fit: 'fill',
+          color: 'rec709',
+          master: 'h264',
+          subtitles: 'none',
+          audio_rate: 48000,
+          audio_channels: 2,
+        },
+      },
+    })
+  })
+
+  it('reports every validation problem at once', () => {
+    const r = buildDeliverRequest(
+      { ...form, outputDir: '  ', formats: [], canvasWidth: 1921, fps: 0 },
+      { workspace: 'D:/ws', projectId: 'p-1' },
+    )
+    expect(r).toEqual({ ok: false, errors: ['output-dir', 'formats', 'canvas-even', 'fps'] })
+  })
+
+  it('rejects unknown formats and a missing project', () => {
+    expect(buildDeliverRequest({ ...form, formats: ['mp4', 'gif' as never] }, { workspace: 'D:/ws', projectId: 'p-1' })).toEqual({
+      ok: false,
+      errors: ['formats'],
+    })
+    expect(buildDeliverRequest(form, { workspace: '', projectId: '' })).toEqual({ ok: false, errors: ['project'] })
+  })
+})
+
+describe('summarizePreflight', () => {
+  it('groups issues by code with errors first and marks blocking reports', () => {
+    const s = summarizePreflight({
+      ok: false,
+      checked_files: 3,
+      issues: [
+        { code: 'AUDIO_MONO', severity: 'warning', path: 'D:/s/a.mp4', detail: 'mono' },
+        { code: 'MEDIA_MISSING', severity: 'error', path: 'D:\\s\\gone.mp4', detail: 'missing' },
+        { code: 'AUDIO_MONO', severity: 'warning', path: 'D:/s/b.mp4', detail: 'mono' },
+        { code: 'VFR_SOURCE', severity: 'warning', path: 'D:/s/c.mp4', detail: 'vfr' },
+      ],
+    })
+    expect(s).toEqual({
+      checkedFiles: 3,
+      errors: 1,
+      warnings: 3,
+      blocking: true,
+      groups: [
+        { code: 'MEDIA_MISSING', severity: 'error', count: 1, files: ['gone.mp4'] },
+        { code: 'AUDIO_MONO', severity: 'warning', count: 2, files: ['a.mp4', 'b.mp4'] },
+        { code: 'VFR_SOURCE', severity: 'warning', count: 1, files: ['c.mp4'] },
+      ],
+    })
+  })
+
+  it('is not blocking when only warnings remain', () => {
+    const s = summarizePreflight({ ok: true, checked_files: 1, issues: [] })
+    expect(s).toEqual({ checkedFiles: 1, errors: 0, warnings: 0, blocking: false, groups: [] })
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../deliver-form"`.
+
+**Commit:** `feat(teamtrau): deliver panel with pre-flight, NLE export and NVENC master`.
