@@ -59,7 +59,7 @@
 | **P3.0a** | Engine | Server-side curation sessions; `GET /v1/presets`; `GET/PATCH /v1/sessions/{id}`; curate keeps the session, returns per-shot JSON, forwards progress and cancel | **yes (below)** |
 | P3.0b | Engine | Runners: `classify`, `analyze_soundtrack`, `preflight`, `assemble` (from session + include/exclude) | **yes (below)** |
 | P3.0d | Engine | Runners: `deliver` (DeliverSettings), `agent` (thought/tool events) | later |
-| P3.0c | Engine | FreeCut writer carries real take data: per file `data.takes[{shot_id, window, composite, sharpness, aesthetic, content_role, role_confidence, defects, included}]`; remove the placeholder fields | later |
+| P3.0c | Engine | FreeCut writer carries real take data: per file `data.takes[{shot_id, window, composite, sharpness, aesthetic, content_role, role_confidence, defects, included}]`; remove the placeholder fields | **yes (below)** |
 | P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | later |
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
 | P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | later |
@@ -654,3 +654,130 @@ def test_assemble_runner_reports_progress_and_cancels(tmp_path: Path):
 **Expected red:** `ImportError: cannot import name 'make_assemble_runner' (or make_classify_runner) from 'src.engine_api.runners'`.
 
 **Commit:** `feat(engine-api): classify, soundtrack, preflight and assemble job runners`.
+
+
+---
+
+## P3.0c — The FreeCut writer carries real take data (Engine repo, branch `feature/studio-engine`)
+
+**Problem.** `write_freecut_project` fills the `media/{id}/cache/ai/teamtrau.json` sidecar from `EditClip` attributes that do not exist (`camera_role`, `motion_energy`). As a result:
+- every clip gets `role="b_roll"`, `score=0.7` and `defects=[]`;
+- the curated takes never reach the Studio.
+
+**API**
+```python
+def write_freecut_project(timeline, workspace, project_name, proxies=None,
+                          shots: Mapping[str, ScoredScene] | None = None) -> str: ...
+```
+
+**Rules**
+- **Sidecar `data` keys:** exactly `{sourcePath, role, score, is_golden, takes}`. The envelope (`schemaVersion`, `kind`, `mediaId`, `service`, `model`, `params`, `createdAt`, `updatedAt`) is unchanged.
+- **Assigning takes to sources:** a take belongs to the source `Path(sc.scene.original_path or sc.scene.clip_path).resolve()`. Takes are listed in natural shot-id order (A01, A02, …, B01, …).
+- **Each take:** `{shot_id, start, end, composite, sharpness, aesthetic, content_role, role_confidence, included (default True), golden, defects}`.
+  - `golden` is the `metadata["golden"]` dict without its `defects` key, or `None`.
+  - `defects` is `golden["defects"]`, or `[]`.
+- **Source summary:**
+  - `role` is the soundtrack's fixed role `"music"`, or otherwise the `content_role` of the highest-`composite` take, or `None`.
+  - `score` is the best take's `composite`, or `None`.
+  - `is_golden` is true when any take has `golden`.
+  - No placeholder values: without shots, use `role=None`, `score=None`, `is_golden=False`, `takes=[]`.
+- **Callers:** `make_curate_runner` and `make_assemble_runner` (P3.0b) pass `shots=session.shots`.
+- **Compatibility:** the existing tests in `tests/test_freecut_writer.py` and `tests/integration/test_freecut_writer_real.py` stay green unedited.
+
+**Files:**
+- `src/integrations/freecut_writer.py`
+- `src/engine_api/runners.py`
+- `tests/test_freecut_writer_takes.py` (LOCKED)
+
+**Related suites:**
+- `tests/test_freecut_writer.py`
+- `tests/test_freecut_writer_index.py`
+- `tests/integration/test_freecut_writer_real.py`
+- `tests/test_engine_sessions.py`
+- `tests/test_engine_runners_p30b.py`
+
+**Contract test — `tests/test_freecut_writer_takes.py`:**
+```python
+"""P3.0c: the FreeCut writer carries real curated take data into the teamtrau.json sidecar."""
+
+import dataclasses
+import json
+import threading
+from pathlib import Path
+
+from src.core.types import EditClip, EditTimeline
+from src.engine_api.runners import make_curate_runner
+from src.engine_api.sessions import SessionStore
+from src.integrations.freecut_writer import write_freecut_project
+from tests.curation_fakes import FakeAdapter, pipeline_result, scene, timeline
+
+DATA_KEYS = {"sourcePath", "role", "score", "is_golden", "takes"}
+TAKE_KEYS = {"shot_id", "start", "end", "composite", "sharpness", "aesthetic", "content_role",
+             "role_confidence", "included", "golden", "defects"}
+
+
+def _sidecars(ws: Path) -> dict[str, dict]:
+    out = {}
+    for f in ws.glob("media/*/cache/ai/teamtrau.json"):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        out[Path(d["data"]["sourcePath"]).name] = d["data"]
+    return out
+
+
+def _shots():
+    a = scene(0, "a_roll", q=0.9)
+    a.metadata.update({"role_confidence": 0.8, "golden": {"source_in": 0.5, "source_out": 3.5,
+                       "defects": [{"type": "camera_shake", "start": 3.5, "end": 4.0,
+                                    "description": "x"}]}})
+    b = scene(1, "b_roll", q=0.4)
+    b.metadata["included"] = False
+    other = scene(2, "b_roll", q=0.7)
+    other.scene = dataclasses.replace(other.scene, clip_path=Path("other.mp4"))
+    return {"A01": a, "B01": b, "B02": other}
+
+
+def test_sidecar_lists_the_takes_of_each_source(tmp_path: Path):
+    ws = tmp_path / "ws"
+    write_freecut_project(timeline(), ws, "T", shots=_shots())
+    data = _sidecars(ws)["c.mp4"]
+    assert set(data) == DATA_KEYS
+    assert [t["shot_id"] for t in data["takes"]] == ["A01", "B01"]
+    a01, b01 = data["takes"]
+    assert set(a01) == TAKE_KEYS
+    assert (a01["start"], a01["end"], a01["content_role"]) == (0.0, 4.0, "a_roll")
+    assert a01["composite"] == 0.9 and a01["role_confidence"] == 0.8 and a01["included"] is True
+    assert a01["golden"] == {"source_in": 0.5, "source_out": 3.5}
+    assert a01["defects"] == [{"type": "camera_shake", "start": 3.5, "end": 4.0, "description": "x"}]
+    assert b01["included"] is False and b01["golden"] is None and b01["defects"] == []
+    # source-level summary comes from the best take, not from placeholders
+    assert data["role"] == "a_roll" and data["score"] == 0.9 and data["is_golden"] is True
+    json.dumps(data)
+
+
+def test_sidecar_without_shots_has_no_placeholder_values(tmp_path: Path):
+    ws = tmp_path / "ws"
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    tl = EditTimeline(name="t", fps=30.0, canvas_width=1920, canvas_height=1080,
+                      clips=[EditClip(source_path=Path("c.mp4"), source_in=0.0, frames=60,
+                                      available=2.0)], soundtrack_path=song)
+    write_freecut_project(tl, ws, "T")
+    side = _sidecars(ws)
+    assert side["c.mp4"] == {"sourcePath": side["c.mp4"]["sourcePath"], "role": None, "score": None,
+                             "is_golden": False, "takes": []}
+    assert side["song.wav"]["role"] == "music" and side["song.wav"]["takes"] == []
+
+
+def test_curate_runner_writes_take_data(tmp_path: Path):
+    res = pipeline_result(list(_shots().values()),
+                          timelines={"rough_cut": timeline("rough_cut", "rough_cut")})
+    runner = make_curate_runner(SessionStore(), adapter_factory=lambda: FakeAdapter(res))
+    runner({"input_dir": str(tmp_path), "workspace": str(tmp_path / "ws")},
+           lambda e: None, threading.Event())
+    data = _sidecars(tmp_path / "ws")["c.mp4"]
+    assert [t["shot_id"] for t in data["takes"]] == ["A01", "B01"]
+    assert data["role"] == "a_roll"
+```
+**Expected red:** `TypeError: write_freecut_project() got an unexpected keyword argument 'shots'`.
+
+**Commit:** `feat(integrations): FreeCut writer carries curated take data (no placeholder sidecar values)`.
