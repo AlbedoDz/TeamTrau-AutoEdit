@@ -327,7 +327,7 @@
   - [x] P2.1: Static server with engine proxy (`electron/static-server.cjs`)
   - [x] P2.2: Engine sidecar lifecycle (`electron/engine-sidecar.cjs`)
   - [x] P2.3: Shell integration: workspace bridge, preload, engine client (`electron/workspace-registry.cjs`, `electron/preload.cjs`, `src/features/teamtrau/engine/*`)
-  - [ ] P2.4: Offline-safe shell assets and product name
+  - [x] P2.4: Offline-safe shell assets and product name
   - [ ] P2.5: Vietnamese locale (`src/i18n/locales/vi.json`)
   - [ ] P4.1: Render-cache sidecar store & invalidation
   - [ ] P4.2: Composition model segment substitution
