@@ -325,11 +325,10 @@
 - [/] Phase 26: TeamTrau Studio v3 — Phase 2 Studio Shell & Phase 4 Render-Cache Playback (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase2-4.md`)
   - [x] P2.0: Studio hygiene (`NOTICE`, electron scripts, baseline metrics)
   - [x] P2.1: Static server with engine proxy (`electron/static-server.cjs`)
-  - [ ] P2.2: Path guard & Range contract tests
-  - [ ] P2.3: Child process engine sidecar
-  - [ ] P2.4: Workspace bridge by id
+  - [x] P2.2: Engine sidecar lifecycle (`electron/engine-sidecar.cjs`)
+  - [x] P2.3: Shell integration: workspace bridge, preload, engine client (`electron/workspace-registry.cjs`, `electron/preload.cjs`, `src/features/teamtrau/engine/*`)
+  - [ ] P2.4: Offline-safe shell assets and product name
   - [ ] P2.5: Vietnamese locale (`src/i18n/locales/vi.json`)
-  - [ ] P2.6: Offline asset bundling
   - [ ] P4.1: Render-cache sidecar store & invalidation
   - [ ] P4.2: Composition model segment substitution
   - [ ] P4.3: Playback meter & benchmark
