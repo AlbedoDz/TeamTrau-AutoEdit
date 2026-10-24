@@ -69,7 +69,8 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 2.3 Rebrand display strings, logo, theme tokens (`src/index.css`), landing page; keep internal ids.
 - 2.4 Vietnamese locale `vi` (+ English stays fallback).
 
-## Phase 3 — TeamTrau panels (parity with the PySide6 GUI)  *(detailed after G0)*
+## Phase 3 — TeamTrau panels (parity with the PySide6 GUI)
+**Rolling-wave plan: `2026-10-25-teamtrau-studio-v3-phase3.md` (P3.0a detailed; P3.0b–P3.6 detailed just in time).**
 - 3.1 `features/teamtrau` sidebar tab + typed engine client + job progress UI (SSE).
 - 3.2 Ingest & Roles (A-roll/B-roll/Music, classifier results, role override).
 - 3.3 Curation (golden takes grid with scores/defects, include/exclude, P/X/F hotkeys) → "Send to timeline" (S4 hand-off, one undo step).
