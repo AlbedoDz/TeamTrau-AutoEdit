@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(integrations): FreeCut project reader (V1 timeline, gaps, schema guard)
 - feat(integrations): production FreeCut writer (atomic, source links, proxy adoption)
 - feat(proxy): production proxy generator (heuristics, caps-driven encoder fallback, atomic output)
 - feat(platform): platform_caps (OS, encoders, hwaccels, torch, Resolve paths)
