@@ -324,7 +324,7 @@
   - [x] P1.7: Phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
 - [/] Phase 26: TeamTrau Studio v3 — Phase 2 Studio Shell & Phase 4 Render-Cache Playback (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase2-4.md`)
   - [x] P2.0: Studio hygiene (`NOTICE`, electron scripts, baseline metrics)
-  - [ ] P2.1: Static server with engine proxy (`electron/static-server.cjs`)
+  - [x] P2.1: Static server with engine proxy (`electron/static-server.cjs`)
   - [ ] P2.2: Path guard & Range contract tests
   - [ ] P2.3: Child process engine sidecar
   - [ ] P2.4: Workspace bridge by id
