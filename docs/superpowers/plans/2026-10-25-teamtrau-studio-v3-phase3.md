@@ -64,7 +64,7 @@
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
 | P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | **yes (below)** |
 | P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | **yes (below)** |
-| P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | later |
+| P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | **yes (below)** |
 | P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | later |
 | P3.6 | Studio | Agent console: prompt box, streamed thoughts and tool calls, cancel | later |
 | G3 | Owner | Feature-parity checklist against the PySide6 GUI (scene grid badges, inspector settings, export panel, agent console) → freeze PySide6 (spec S7) | — |
@@ -1570,3 +1570,151 @@ describe('applyShotKey', () => {
 **Expected red:** `Failed to resolve import "../take-plan"`.
 
 **Commit:** `feat(teamtrau): curation grid with P/X hotkeys and one-undo send to timeline`.
+
+
+---
+
+## P3.4 — Sequence panel: soundtrack analysis, beat/bar/section ruler overlay, cadence assemble (Studio repo)
+
+**API**
+```ts
+// src/features/teamtrau/sequence/ruler-marks.ts (new, pure)
+export interface SoundtrackAnalysis { /* = engine analyze_soundtrack result: path, tempo_bpm, duration, sample_rate,
+  beats[{timestamp, frame_idx, strength, is_downbeat}], bar_grid {..., bar_times[]} | null,
+  sections[{section_type, start_time, end_time, duration, avg_energy, chroma_profile, is_climax}],
+  cut_timestamps, cadence_cuts, extracted_audio_path */ }
+export function analysisToRulerMarks(a: SoundtrackAnalysis, opts: { fps; startFrame; timelineEndFrame }): {
+  beats: { frame; downbeat }[]; bars: { frame; index }[]; sections: { fromFrame; toFrame; label; climax }[] }
+```
+
+**Pure rules**
+- **Frame conversion:** `frame = startFrame + round(t * fps)`.
+- **Beats:** keep the first beat per frame and drop beats with `frame > timelineEndFrame`.
+- **Bars:** come from `bar_grid.bar_times`; `index` is 1-based in the original order. A `null` grid gives no bars, and bars after the end are dropped.
+- **Sections:** both bounds are clamped to `timelineEndFrame`. `label` is `section_type` and `climax` is `is_climax`.
+- **Missing arrays:** treated as empty.
+
+**Panel**: a Sequence sub-tab of the TeamTrau panel.
+- **Soundtrack:** defaults to the `classify`/Ingest soundtrack. "Change…" uses a new preload `teamtrauHost.pickFile(filters)` (audio extensions), backed by IPC `teamtrau:pick-file`.
+- **Analysis:** "Analyze soundtrack" runs the `analyze_soundtrack` job. Show BPM, duration, bar count, and a section list (type, time range, climax badge).
+- **Cadence:** a select filled from `GET /v1/presets` `cadences`, with labels translated in `teamtrau.json`.
+- **Assemble:** "Assemble sequence" runs the `assemble` job with `{session_id, workspace, soundtrack, cadence}`. When it is done, show "Open sequence project", reusing P3.2's open/refresh helper.
+- **Ruler overlay:**
+  - A store `useTeamTrauRulerStore` (zustand, in teamtrau) holds `{ marks, visible }`.
+  - A "Show beat grid" toggle.
+  - The marks are computed with `analysisToRulerMarks`:
+    - `startFrame` is the A2 music item's `from` when a soundtrack item exists, otherwise 0.
+    - `timelineEndFrame` is the furthest item end.
+- **Ruler hook:** the one allowed FreeCut timeline edit.
+  - New `src/features/timeline/components/timeline-teamtrau-marks.tsx`, mounted next to `TimelineProjectMarkers` inside `timeline-markers.tsx`.
+  - It reads the store through `src/features/timeline/deps/teamtrau-contract.ts` (plus its `export *` wrapper) and draws with `useTimelineCommittedZoomContext().frameToPixels`:
+    - beat ticks, with downbeats taller;
+    - bar numbers;
+    - translucent section bands, amber for a climax.
+  - It is pointer-events-none and has no cost when hidden.
+- **"Add bars as markers":** writes every bar as a `ProjectMarker` inside ONE `executeTimelineCommand('TEAMTRAU_BAR_MARKERS', () => useMarkersStore.getState().setMarkers([...existing, ...bars]))`, skipping frames that already have a marker.
+- **i18n:** `en` and `vi` translated, and every language file present.
+
+**Tests**
+- The LOCKED `ruler-marks` test.
+- Your own tests:
+  - an overlay component test: given marks, it renders N beat ticks and the section bands at the expected pixel x;
+  - a real-store test: "Add bars as markers" is one undo step and skips duplicates.
+
+**Manual acceptance (paste in the HANDOFF):**
+- In Electron, using the demo session from P3.2/P3.3:
+  1. Analyze the soundtrack: BPM and sections appear.
+  2. Toggle the beat grid: the overlay is visible on the ruler.
+  3. Assemble with a cadence, then open the sequence project: the clips are on the timeline.
+- Screenshot to `docs/superpowers/handoffs/p34_sequence.png` (engine repo), showing the overlay.
+
+**Ladder:** as in P3.3, plus push WITH the hook.
+
+**Files:**
+- `src/features/teamtrau/sequence/*`
+- `src/features/teamtrau/components/*`
+- `src/features/timeline/components/timeline-teamtrau-marks.tsx` (+ one mount line in `timeline-markers.tsx`)
+- `src/features/timeline/deps/teamtrau*.ts`
+- `electron/main.cjs` and `electron/preload.cjs` (pickFile)
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/sequence/__tests__/ruler-marks.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/sequence/__tests__/ruler-marks.test.ts`:**
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { analysisToRulerMarks, type SoundtrackAnalysis } from '../ruler-marks'
+
+const analysis: SoundtrackAnalysis = {
+  path: 'D:/s/Music/song.wav',
+  tempo_bpm: 120,
+  duration: 8,
+  sample_rate: 44100,
+  beats: [
+    { timestamp: 0.0, frame_idx: 0, strength: 1, is_downbeat: true },
+    { timestamp: 0.5, frame_idx: 15, strength: 0.5, is_downbeat: false },
+    { timestamp: 0.501, frame_idx: 15, strength: 0.4, is_downbeat: false },
+    { timestamp: 2.0, frame_idx: 60, strength: 1, is_downbeat: true },
+    { timestamp: 9.0, frame_idx: 270, strength: 1, is_downbeat: false },
+  ],
+  bar_grid: {
+    tempo_bpm: 120,
+    beats_per_bar: 4,
+    bar_times: [0.0, 2.0, 4.0, 6.0],
+    phrase_2: [],
+    phrase_4: [],
+    phrase_8: [],
+    confidence: 0.9,
+    bar_confidence: [],
+  },
+  sections: [
+    { section_type: 'INTRO', start_time: 0, end_time: 2.5, duration: 2.5, avg_energy: 0.2, chroma_profile: [], is_climax: false },
+    { section_type: 'DROP', start_time: 2.5, end_time: 8, duration: 5.5, avg_energy: 0.9, chroma_profile: [], is_climax: true },
+  ],
+  cut_timestamps: [],
+  cadence_cuts: null,
+  extracted_audio_path: null,
+}
+
+describe('analysisToRulerMarks', () => {
+  it('converts beats, bars and sections to timeline frames from the soundtrack offset', () => {
+    const marks = analysisToRulerMarks(analysis, { fps: 30, startFrame: 90, timelineEndFrame: 90 + 240 })
+    expect(marks.beats).toEqual([
+      { frame: 90, downbeat: true },
+      { frame: 105, downbeat: false },
+      { frame: 150, downbeat: true },
+    ])
+    expect(marks.bars).toEqual([
+      { frame: 90, index: 1 },
+      { frame: 150, index: 2 },
+      { frame: 210, index: 3 },
+      { frame: 270, index: 4 },
+    ])
+    expect(marks.sections).toEqual([
+      { fromFrame: 90, toFrame: 165, label: 'INTRO', climax: false },
+      { fromFrame: 165, toFrame: 330, label: 'DROP', climax: true },
+    ])
+  })
+
+  it('drops marks after the timeline end and tolerates a missing bar grid', () => {
+    const marks = analysisToRulerMarks({ ...analysis, bar_grid: null }, { fps: 25, startFrame: 0, timelineEndFrame: 60 })
+    expect(marks.beats.map((b) => b.frame)).toEqual([0, 13, 50])
+    expect(marks.bars).toEqual([])
+    expect(marks.sections).toEqual([
+      { fromFrame: 0, toFrame: 60, label: 'INTRO', climax: false },
+      { fromFrame: 60, toFrame: 60, label: 'DROP', climax: true },
+    ])
+  })
+
+  it('returns empty marks for an empty analysis', () => {
+    expect(analysisToRulerMarks({} as SoundtrackAnalysis, { fps: 30, startFrame: 0, timelineEndFrame: 100 })).toEqual({
+      beats: [],
+      bars: [],
+      sections: [],
+    })
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../ruler-marks"`.
+
+**Commit:** `feat(teamtrau): sequence panel with soundtrack analysis, beat-grid ruler overlay and cadence assemble`.
