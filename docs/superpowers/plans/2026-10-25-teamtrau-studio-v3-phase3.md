@@ -62,7 +62,7 @@
 | P3.0c | Engine | FreeCut writer carries real take data: per file `data.takes[{shot_id, window, composite, sharpness, aesthetic, content_role, role_confidence, defects, included}]`; remove the placeholder fields | **yes (below)** |
 | P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | **yes (below)** |
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
-| P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | later |
+| P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | **yes (below)** |
 | P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | later |
 | P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | later |
 | P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | later |
@@ -1219,3 +1219,164 @@ describe('engine jobs store', () => {
 **Expected red:** `Failed to resolve import "../jobs-store"`.
 
 **Commit:** `feat(teamtrau): TeamTrau sidebar tab with engine status and job progress`.
+
+
+---
+
+## P3.2 — Ingest panel: footage folder, role analysis, curate (Studio repo, branch `teamtrau/main`)
+
+Role *overrides* belong to the Curation grid (P3.3), which uses `PATCH /v1/sessions/{id}`. The classifier preview here is read-only, so no engine change is needed.
+
+**API**
+```ts
+// src/features/teamtrau/ingest/ingest-rows.ts (new, pure)
+export type Role = 'a_roll' | 'b_roll' | 'ambient_b_roll'
+export interface ClassifyFile { path; role; confidence; has_speech; reasons: string[]; error: string | null; signals: unknown }
+export interface ClassifyResult { files: ClassifyFile[]; skipped: string[]; soundtrack: string | null }   // = engine `classify` result
+export function folderRoleOf(path: string): Role | null
+export function buildIngestView(result: ClassifyResult): {
+  rows: Array<{ name; path; folderRole: Role | null; role; confidencePct; speech; reasons; error; mismatch }>
+  summary: { total; byRole: Record<Role, number>; errors; mismatches; skipped; soundtrackName: string | null }
+}
+```
+
+**Rules**
+- **`folderRoleOf`**
+  - Takes the parent directory name, accepting `/` or `\` separators.
+  - Lower-cases it and strips spaces, `_` and `-`.
+  - `aroll` maps to `a_roll`, `broll` to `b_roll`, anything else to `null`.
+- **`buildIngestView`**
+  - Rows are sorted by file name.
+  - `confidencePct = round(confidence * 100)`.
+  - `reasons` are joined with `' · '`.
+  - `mismatch` is true when `folderRole !== null`, there is no error, and `folderRole !== role`.
+  - Summary counts cover each role, errors, mismatches and skipped files; `soundtrackName` is the soundtrack's base name.
+- **Electron folder picker**
+  - The preload adds `teamtrauHost.pickFolder(title?: string): Promise<string | null>`. It calls IPC `teamtrau:pick-folder`, which runs `dialog.showOpenDialog({properties: ['openDirectory']})` in main.cjs.
+  - In the browser (not Electron), the button is disabled with a tooltip.
+- **Ingest sub-tab** in the TeamTrau panel:
+  1. "Choose footage folder" shows the chosen path.
+  2. A genre select is filled from `GET /v1/presets` (`genres[].display_name`, value `key`, optional).
+  3. "Analyze roles" starts a `classify` job through the P3.1 jobs store. When it is done, render the table from `buildIngestView`:
+     - columns: name, folder role, detected role (coloured badge), confidence %, speech icon, reasons (tooltip), error;
+     - mismatched rows are highlighted;
+     - summary chips show the counts and the soundtrack name.
+  4. "Curate" starts `curate` with `{input_dir, workspace: <resolveWorkspacePath(ensureWorkspaceId(root))>, genre?}`. When it is done:
+     - keep `{session_id, project_id}` in a small `useTeamTrauSessionStore` (zustand) for P3.3;
+     - show "Open curated project". Find FreeCut's project open/navigation API, make sure a project written to the workspace by the engine appears (refresh the project list if FreeCut caches it), and open it.
+- **i18n:** add every new string to `teamtrau.json` for all languages, with `en` and `vi` translated.
+
+**Tests**
+- The LOCKED `ingest-rows` test below.
+- Your own tests:
+  - a component test (mocked stores) that the table renders and mismatch rows get the highlight class;
+  - a test that "Curate" is disabled until a folder is chosen.
+
+**Manual acceptance (paste in the HANDOFF):**
+- Build a demo folder `E:\antigravity\demo-footage\{A-roll,B-roll,Music}` from the perf samples, using ffmpeg to cut 3 short clips per role plus one soundtrack. One B-roll clip should have speech-like audio, so a mismatch appears.
+- In Electron: choose the folder, analyze, see the table, curate, open the curated project.
+- Screenshot to `docs/superpowers/handoffs/p32_ingest.png` (engine repo).
+
+**Ladder:** as in P3.1, plus push WITH the hook.
+
+**Files:**
+- `src/features/teamtrau/ingest/*`
+- `src/features/teamtrau/components/*` (panel)
+- `src/features/teamtrau/session/*` (store)
+- `electron/main.cjs`, `electron/preload.cjs` (pickFolder)
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/ingest/__tests__/ingest-rows.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/ingest/__tests__/ingest-rows.test.ts`:**
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { buildIngestView, folderRoleOf, type ClassifyResult } from '../ingest-rows'
+
+const file = (path: string, role: string, confidence = 0.8, extra: Record<string, unknown> = {}) => ({
+  path,
+  role,
+  confidence,
+  has_speech: role === 'a_roll',
+  reasons: ['r1', 'r2'],
+  error: null,
+  signals: null,
+  ...extra,
+})
+
+describe('folderRoleOf', () => {
+  it.each([
+    ['D:/shoot/A-roll/x.mp4', 'a_roll'],
+    ['D:\\shoot\\a roll\\x.mp4', 'a_roll'],
+    ['D:/shoot/A_Roll/x.mp4', 'a_roll'],
+    ['D:/shoot/B-roll/x.mp4', 'b_roll'],
+    ['D:/shoot/broll/x.mp4', 'b_roll'],
+    ['D:/shoot/x.mp4', null],
+    ['D:/shoot/Music/x.mp4', null],
+  ])('%s -> %s', (path, role) => {
+    expect(folderRoleOf(path)).toBe(role)
+  })
+})
+
+describe('buildIngestView', () => {
+  const result: ClassifyResult = {
+    files: [
+      file('D:/s/B-roll/b2.mp4', 'b_roll', 0.61),
+      file('D:/s/A-roll/a1.mp4', 'a_roll', 0.92),
+      file('D:/s/A-roll/a2.mp4', 'b_roll', 0.55),
+      file('D:/s/loose.mp4', 'ambient_b_roll', 0.4),
+      file('D:/s/B-roll/bad.mp4', 'b_roll', 0, { error: 'decode failed' }),
+    ],
+    skipped: ['D:/s/raw.braw'],
+    soundtrack: 'D:\\s\\Music\\song.wav',
+  }
+
+  it('builds sorted rows with folder role, percent confidence and mismatch flags', () => {
+    const view = buildIngestView(result)
+    expect(view.rows.map((r) => r.name)).toEqual(['a1.mp4', 'a2.mp4', 'b2.mp4', 'bad.mp4', 'loose.mp4'])
+    const a2 = view.rows[1]!
+    expect(a2).toEqual({
+      name: 'a2.mp4',
+      path: 'D:/s/A-roll/a2.mp4',
+      folderRole: 'a_roll',
+      role: 'b_roll',
+      confidencePct: 55,
+      speech: false,
+      reasons: 'r1 · r2',
+      error: null,
+      mismatch: true,
+    })
+    expect(view.rows[0]!.mismatch).toBe(false)
+    expect(view.rows[4]!.folderRole).toBeNull()
+    expect(view.rows[4]!.mismatch).toBe(false)
+  })
+
+  it('summarises counts, errors, skipped files and the soundtrack', () => {
+    const view = buildIngestView(result)
+    expect(view.summary).toEqual({
+      total: 5,
+      byRole: { a_roll: 1, b_roll: 3, ambient_b_roll: 1 },
+      errors: 1,
+      mismatches: 1,
+      skipped: 1,
+      soundtrackName: 'song.wav',
+    })
+  })
+
+  it('handles an empty result', () => {
+    const view = buildIngestView({ files: [], skipped: [], soundtrack: null })
+    expect(view.rows).toEqual([])
+    expect(view.summary).toEqual({
+      total: 0,
+      byRole: { a_roll: 0, b_roll: 0, ambient_b_roll: 0 },
+      errors: 0,
+      mismatches: 0,
+      skipped: 0,
+      soundtrackName: null,
+    })
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../ingest-rows"`.
+
+**Commit:** `feat(teamtrau): ingest panel (footage folder, role analysis, curate)`.
