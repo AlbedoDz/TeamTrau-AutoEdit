@@ -22,6 +22,7 @@ from src.integrations.freecut_writer import (
     sanitize_workspace_filename,
     write_freecut_project,
 )
+from src.modules.proxy_generator import compute_proxy_key
 
 
 def test_sanitize_workspace_filename():
@@ -243,7 +244,7 @@ def test_freecut_writer_attaches_proxies(tmp_path: Path):
     )
 
     # Verify content/proxies/{key}/proxy.mp4 and meta.json
-    proxy_key = "proxy_clip_abc123"
+    proxy_key = compute_proxy_key(media_file)
     proxy_dir = workspace / "content" / "proxies" / proxy_key
     assert proxy_dir.exists()
     assert (proxy_dir / "proxy.mp4").exists()

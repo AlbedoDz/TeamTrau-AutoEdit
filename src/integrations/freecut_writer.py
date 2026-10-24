@@ -194,13 +194,11 @@ def write_freecut_project(
 
     # 3. Update index.json atomically
     index_file = workspace / "index.json"
-    projects_list = []
     if index_file.exists():
-        try:
-            index_content = json.loads(index_file.read_text(encoding="utf-8"))
-            projects_list = index_content.get("projects", [])
-        except Exception:
-            projects_list = []
+        index_content = json.loads(index_file.read_text(encoding="utf-8"))
+        projects_list = index_content.get("projects", [])
+    else:
+        projects_list = []
 
     # Filter out existing project if ID matches, then prepend new entry
     projects_list = [p for p in projects_list if p.get("id") != project_id]
@@ -267,10 +265,7 @@ def write_freecut_project(
 
         proxy_key: str | None = None
         if proxy_path and proxy_path.exists() and proxy_path.stat().st_size > 0:
-            if proxy_path.stem == "proxy_clip_abc123":
-                proxy_key = proxy_path.stem
-            else:
-                proxy_key = compute_proxy_key(resolved_path)
+            proxy_key = compute_proxy_key(resolved_path)
 
             proxy_dir = workspace / "content" / "proxies" / proxy_key
             proxy_dir.mkdir(parents=True, exist_ok=True)
