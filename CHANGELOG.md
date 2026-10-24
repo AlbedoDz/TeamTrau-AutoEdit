@@ -19,6 +19,7 @@
   - Review polish.
 - **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
 
+- feat(engine-api): curation sessions, presets endpoint, curate progress and cancel
 - build(deps): CUDA 12.6 torch/torchvision via uv index (Windows/Linux); faster-whisper on GPU
 - fix(render-cache): strip audio only for the built-in renderer, not by sniffing test fakes
 - feat(render-cache): studio manifest item signatures, workspace cache dir, video-only segments

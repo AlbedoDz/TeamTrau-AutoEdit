@@ -8,7 +8,7 @@ import hmac
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
-from typing import Any
+from typing import Any, get_args
 
 import uvicorn
 from starlette.applications import Starlette
@@ -17,9 +17,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from src.core.genre_presets import GENRE_PRESETS, ROUGH_CUT_PRESET
 from src.core.platform_caps import PlatformCaps, get_caps
+from src.core.stage_options import CADENCE_NAMES, GENRE_KEYS
+from src.core.types import DeliverColor, DeliverFitMode, DeliverMaster, DeliverSubtitles
 from src.engine_api.jobs import JobRegistry, JobRunner
 from src.engine_api.runners import default_runners
+from src.engine_api.sessions import SessionStore, session_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,7 @@ def create_app(
     caps_fn: Callable[[], PlatformCaps] = get_caps,
     registry: JobRegistry | None = None,
     max_body_bytes: int = 1_000_000,
+    sessions: SessionStore | None = None,
 ) -> Starlette:
     """Create and configure Starlette Engine API service application.
 
@@ -71,6 +76,7 @@ def create_app(
         caps_fn: Callable returning PlatformCaps (defaults to get_caps).
         registry: JobRegistry instance (created if None).
         max_body_bytes: Maximum allowed request body size in bytes (default: 1 MB).
+        sessions: SessionStore instance for curation sessions (created if None).
 
     Returns:
         Configured Starlette application instance.
@@ -78,7 +84,8 @@ def create_app(
     if not token or not token.strip():
         raise ValueError("token must not be empty or whitespace")
 
-    _runners: Mapping[str, JobRunner] = default_runners() if runners is None else runners
+    _sessions: SessionStore = SessionStore() if sessions is None else sessions
+    _runners: Mapping[str, JobRunner] = default_runners(_sessions) if runners is None else runners
     _registry: JobRegistry = JobRegistry() if registry is None else registry
 
     async def health_endpoint(request: Request) -> Response:
@@ -88,6 +95,73 @@ def create_app(
         caps = caps_fn()
         d = _tuples_to_lists(dataclasses.asdict(caps))
         return JSONResponse(d)
+
+    async def presets_endpoint(request: Request) -> Response:
+        genres = [
+            {
+                "key": k,
+                "display_name": (
+                    ROUGH_CUT_PRESET if k == "rough_cut_assembly" else GENRE_PRESETS[k]
+                ).display_name,
+            }
+            for k in GENRE_KEYS
+        ]
+        data = {
+            "genres": genres,
+            "cadences": list(CADENCE_NAMES),
+            "deliver": {
+                "master": list(get_args(DeliverMaster)),
+                "fit_mode": list(get_args(DeliverFitMode)),
+                "subtitles": list(get_args(DeliverSubtitles)),
+                "color": list(get_args(DeliverColor)),
+            },
+        }
+        return JSONResponse(data)
+
+    async def get_session_endpoint(request: Request) -> Response:
+        session_id = request.path_params.get("id", "")
+        session = _sessions.get(session_id)
+        if session is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        return JSONResponse(session_to_dict(session))
+
+    async def patch_session_endpoint(request: Request) -> Response:
+        session_id = request.path_params.get("id", "")
+        cl_str = request.headers.get("content-length")
+        if cl_str is not None:
+            try:
+                if int(cl_str) > max_body_bytes:
+                    return JSONResponse({"error": "request body too large"}, status_code=413)
+            except ValueError:
+                pass
+
+        body = await request.body()
+        if len(body) > max_body_bytes:
+            return JSONResponse({"error": "request body too large"}, status_code=413)
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        if not isinstance(data, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+
+        if "shots" not in data or len(data) != 1:
+            return JSONResponse({"error": "body must contain only 'shots' key"}, status_code=400)
+
+        shots_data = data["shots"]
+        if not isinstance(shots_data, dict):
+            return JSONResponse({"error": "'shots' must be a JSON object"}, status_code=400)
+
+        try:
+            updated = _sessions.patch(session_id, shots_data)
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        return JSONResponse(session_to_dict(updated), status_code=200)
 
     async def submit_job_endpoint(request: Request) -> Response:
         kind = request.path_params.get("kind", "")
@@ -172,6 +246,9 @@ def create_app(
     routes = [
         Route("/v1/health", health_endpoint, methods=["GET"]),
         Route("/v1/capabilities", capabilities_endpoint, methods=["GET"]),
+        Route("/v1/presets", presets_endpoint, methods=["GET"]),
+        Route("/v1/sessions/{id}", get_session_endpoint, methods=["GET"]),
+        Route("/v1/sessions/{id}", patch_session_endpoint, methods=["PATCH"]),
         Route("/v1/jobs/{kind}", submit_job_endpoint, methods=["POST"]),
         Route("/v1/jobs/{id}/events", get_job_events_endpoint, methods=["GET"]),
         Route("/v1/jobs/{id}/cancel", cancel_job_endpoint, methods=["POST"]),

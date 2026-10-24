@@ -335,6 +335,9 @@
   - [x] P4.3: Playback meter & benchmark
   - [x] P4.4: RTX GPU preference in Electron & diagnosis
   - [x] P4.5: Fix player pooled-element resume & verification
+- [/] Phase 27: TeamTrau Studio v3 — Phase 3 Panels in Studio (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase3.md`)
+  - [x] P3.0a: Curation sessions over the engine API (SessionStore, /v1/presets, /v1/sessions/{id}, curate progress & cancel)
+
 
 
 

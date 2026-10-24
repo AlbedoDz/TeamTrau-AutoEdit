@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.core import curation
-from src.core.service import StudioBackendAdapter
+from src.core.service import JobCallbacks, StudioBackendAdapter
 from src.engine_api.jobs import JobRunner
+from src.engine_api.sessions import SessionStore, session_to_dict
 from src.integrations.freecut_reader import read_freecut_project
 from src.integrations.freecut_writer import write_freecut_project
 from src.modules.proxy_generator import ProxySpec, make_proxy
@@ -109,66 +110,83 @@ def run_render_cache(
     }
 
 
+def make_curate_runner(
+    sessions: SessionStore,
+    adapter_factory: Callable[[], Any] = StudioBackendAdapter,
+) -> JobRunner:
+    """Create a curate job runner backed by a shared SessionStore and adapter factory."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        input_dir = Path(params["input_dir"])
+        workspace = Path(params["workspace"])
+        genre = params.get("genre")
+        top_n = int(params.get("top_n", 12))
+        project_name = str(params.get("project_name", "Curated Rough Cut"))
+        out_dir = Path(params.get("output_dir", workspace / ".curation_tmp"))
+
+        def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
+            emit({"type": "progress", "pct": total_pct, "msg": msg})
+
+        callbacks = JobCallbacks(on_progress=_on_progress)
+        adapter = adapter_factory()
+
+        session, summary = curation.run_curation(
+            adapter=adapter,
+            input_dir=input_dir,
+            genre=genre,
+            output_dir=out_dir,
+            top_n=top_n,
+            callbacks=callbacks,
+            cancel_event=cancel_event,
+        )
+
+        rough_tl = None
+        if session.result and session.result.edit_timelines:
+            rough_tl = (
+                session.result.edit_timelines.get("rough_cut")
+                or session.result.edit_timelines.get("master")
+            )
+        if rough_tl is None:
+            raise RuntimeError("No rough-cut timeline produced by curation.")
+
+        project_id = write_freecut_project(
+            timeline=rough_tl,
+            workspace=workspace,
+            project_name=project_name,
+        )
+
+        sessions.put(session)
+        shots = session_to_dict(session)["shots"]
+
+        return {
+            "session_id": session.session_id,
+            "project_id": project_id,
+            "summary": summary,
+            "shots": shots,
+        }
+
+    return runner
+
+
 def run_curate(
     params: dict[str, Any],
     emit: Callable[[dict[str, Any]], None],
     cancel_event: threading.Event,
 ) -> dict[str, Any]:
-    """Execute rough-cut curation and write FreeCut workspace project.
-
-    Params:
-        input_dir: Footage directory.
-        genre: Optional music/cadence genre profile.
-        workspace: FreeCut workspace directory.
-        top_n: Optional number of top selects (default: 12).
-        project_name: Optional FreeCut project name.
-        output_dir: Optional intermediate output directory.
-
-    Returns:
-        {"project_id": project_id, "summary": summary}
-    """
-    input_dir = Path(params["input_dir"])
-    genre = params.get("genre")
-    workspace = Path(params["workspace"])
-    top_n = int(params.get("top_n", 12))
-    project_name = str(params.get("project_name", "Curated Rough Cut"))
-    out_dir = Path(params.get("output_dir", workspace / ".curation_tmp"))
-
-    adapter = StudioBackendAdapter()
-    session, summary = curation.run_curation(
-        adapter=adapter,
-        input_dir=input_dir,
-        genre=genre,
-        output_dir=out_dir,
-        top_n=top_n,
-    )
-    if cancel_event.is_set():
-        raise InterruptedError("Curation cancelled.")
-
-    rough_tl = None
-    if session.result and session.result.edit_timelines:
-        rough_tl = (
-            session.result.edit_timelines.get("rough_cut")
-            or session.result.edit_timelines.get("master")
-        )
-    if rough_tl is None:
-        raise RuntimeError("No rough-cut timeline produced by curation.")
-
-    project_id = write_freecut_project(
-        timeline=rough_tl,
-        workspace=workspace,
-        project_name=project_name,
-    )
-    return {
-        "project_id": project_id,
-        "summary": summary,
-    }
+    """Execute rough-cut curation and write FreeCut workspace project."""
+    runner = make_curate_runner(SessionStore())
+    return runner(params, emit, cancel_event)
 
 
-def default_runners() -> dict[str, JobRunner]:
+def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner]:
     """Return dictionary of default engine job runners."""
+    store = sessions if sessions is not None else SessionStore()
     return {
         "proxies": run_proxies,
         "render_cache": run_render_cache,
-        "curate": run_curate,
+        "curate": make_curate_runner(store),
     }
