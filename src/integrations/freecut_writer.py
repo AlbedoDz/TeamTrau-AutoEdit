@@ -61,7 +61,27 @@ def probe_file_stats(file_path: Path, default_fps: float = 30.0) -> dict[str, An
 
     ext = file_path.suffix.lower()
     is_audio = ext in {".mp3", ".wav", ".aac", ".flac", ".m4a", ".ogg"}
-    mime_type = "audio/mpeg" if ext == ".mp3" else ("audio/wav" if ext == ".wav" else ("video/mp4" if ext == ".mp4" else "application/octet-stream"))
+    video_mimes = {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+    }
+    audio_mimes = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".aac": "audio/aac",
+        ".flac": "audio/flac",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+    }
+    if ext in video_mimes:
+        mime_type = video_mimes[ext]
+    elif ext in audio_mimes:
+        mime_type = audio_mimes[ext]
+    else:
+        mime_type = "application/octet-stream"
 
     width = 1920
     height = 1080
@@ -110,6 +130,7 @@ def write_freecut_project(
     timeline: EditTimeline,
     workspace: Path,
     project_name: str,
+    proxies: dict[Path, Path] | None = None,
 ) -> str:
     """Write an EditTimeline into a FreeCut workspace conforming to schema v15.
 
@@ -117,6 +138,7 @@ def write_freecut_project(
         timeline: Edit decision list with clips, tracks, sections, bar grid.
         workspace: Path to the target FreeCut workspace directory.
         project_name: Human-readable project display name.
+        proxies: Optional mapping of source video Path -> proxy video Path.
 
     Returns:
         str: Generated project ID.
@@ -198,6 +220,42 @@ def write_freecut_project(
                 except OSError:
                     shutil.copy2(resolved_path, target_link)
 
+        # Check if a proxy is attached for this media
+        proxy_path: Path | None = None
+        if proxies:
+            if resolved_path in proxies:
+                proxy_path = Path(proxies[resolved_path]).resolve()
+            elif Path(file_path) in proxies:
+                proxy_path = Path(proxies[Path(file_path)]).resolve()
+
+        proxy_key: str | None = None
+        if proxy_path and proxy_path.exists() and proxy_path.stat().st_size > 0:
+            proxy_key = proxy_path.stem
+            proxy_dir = workspace / "content" / "proxies" / proxy_key
+            proxy_dir.mkdir(parents=True, exist_ok=True)
+            proxy_dest = proxy_dir / "proxy.mp4"
+            if not proxy_dest.exists():
+                try:
+                    os.link(proxy_path, proxy_dest)
+                except OSError:
+                    try:
+                        os.symlink(proxy_path, proxy_dest)
+                    except OSError:
+                        shutil.copy2(proxy_path, proxy_dest)
+
+            proxy_meta = probe_file_stats(proxy_path, default_fps=timeline.fps)
+            meta_json = {
+                "version": 4,
+                "status": "ready",
+                "width": proxy_meta.get("width", 1920),
+                "height": proxy_meta.get("height", 1080),
+                "sourceWidth": meta["width"],
+                "sourceHeight": meta["height"],
+                "createdAt": now_ms,
+                "codec": "avc",
+            }
+            (proxy_dir / "meta.json").write_text(json.dumps(meta_json, indent=2), encoding="utf-8")
+
         # metadata.json (LINK mode -> storageType: "handle")
         metadata_json = {
             "id": media_id,
@@ -216,6 +274,8 @@ def write_freecut_project(
             "createdAt": now_ms,
             "updatedAt": now_ms,
         }
+        if proxy_key:
+            metadata_json["contentHash"] = proxy_key
         (item_media_dir / "metadata.json").write_text(json.dumps(metadata_json, indent=2), encoding="utf-8")
 
         # TeamTrau AI analysis sidecar: cache/ai/teamtrau.json

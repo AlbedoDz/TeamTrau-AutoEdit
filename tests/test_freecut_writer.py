@@ -211,3 +211,52 @@ def test_freecut_writer_link_mode_and_sidecars(tmp_path: Path):
     assert len(tracks) == 3
     track_names = [t["name"] for t in tracks]
     assert track_names == ["V1", "A1", "A2"]
+
+
+def test_freecut_writer_attaches_proxies(tmp_path: Path):
+    workspace = tmp_path / "studio_ws_proxies"
+    media_file = tmp_path / "clip.mp4"
+    media_file.write_bytes(b"dummy clip data")
+    proxy_file = tmp_path / "proxy_clip_abc123.mp4"
+    proxy_file.write_bytes(b"dummy proxy data")
+
+    clip = EditClip(
+        source_path=media_file,
+        source_in=0.0,
+        frames=30,
+        available=5.0,
+        label="Shot 1",
+    )
+    timeline = EditTimeline(
+        name="Proxy Timeline",
+        fps=30.0,
+        canvas_width=1920,
+        canvas_height=1080,
+        clips=[clip],
+    )
+
+    project_id = write_freecut_project(
+        timeline=timeline,
+        workspace=workspace,
+        project_name="Proxy Test",
+        proxies={media_file: proxy_file},
+    )
+
+    # Verify content/proxies/{key}/proxy.mp4 and meta.json
+    proxy_key = "proxy_clip_abc123"
+    proxy_dir = workspace / "content" / "proxies" / proxy_key
+    assert proxy_dir.exists()
+    assert (proxy_dir / "proxy.mp4").exists()
+    assert (proxy_dir / "meta.json").exists()
+
+    meta = json.loads((proxy_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["version"] == 4
+    assert meta["status"] == "ready"
+    assert meta["codec"] == "avc"
+
+    # Verify media metadata contains contentHash
+    links_file = workspace / "projects" / project_id / "media-links.json"
+    links = json.loads(links_file.read_text(encoding="utf-8"))
+    media_id = links["mediaIds"][0]["id"]
+    media_meta = json.loads((workspace / "media" / media_id / "metadata.json").read_text(encoding="utf-8"))
+    assert media_meta.get("contentHash") == proxy_key
