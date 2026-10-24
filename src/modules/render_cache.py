@@ -212,6 +212,9 @@ def render_missing(
     if not missing:
         return []
 
+    # Segments are video-only (Studio plays the timeline's own audio items). The renderer
+    # built here gets its audio stripped by a remux; an injected renderer owns its output.
+    strip_audio = renderer is None
     if renderer is None:
         settings = DeliverSettings(
             canvas_width=timeline.canvas_width,
@@ -246,15 +249,13 @@ def render_missing(
         final_file = cache_dir / f"{item.segment.key}.mp4"
 
         try:
-            res = renderer.render_edit_timeline(
+            renderer.render_edit_timeline(
                 sub,
                 part_file,
                 force_cpu=force_cpu,
                 cancel_event=cancel_event,
             )
-            if getattr(res, "encoder_used", None) == "fake" or (
-                part_file.exists() and part_file.stat().st_size < 32
-            ):
+            if not strip_audio:
                 os.replace(part_file, final_file)
             else:
                 cmd = [
