@@ -343,6 +343,7 @@
   - [x] P3.1: TeamTrau sidebar tab with engine status and job progress
   - [x] P3.2: Ingest panel (footage folder, role analysis, curate)
   - [x] P3.3: Curation panel (golden-takes grid, P/X hotkeys, "Send to timeline" as ONE undo step)
+  - [x] P3.0e: Curation score fix + short-clip diagnosis (composite normalisation, diagnosis table)
 
 
 

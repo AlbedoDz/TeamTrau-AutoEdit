@@ -19,6 +19,7 @@
   - Review polish.
 - **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
 
+- fix(scoring): normalise composites without zeroing single or uniform batches
 - feat(engine-api): deliver and agent job runners
 - feat(integrations): FreeCut writer carries curated take data (no placeholder sidecar values)
 - feat(engine-api): classify, soundtrack, preflight and assemble job runners
