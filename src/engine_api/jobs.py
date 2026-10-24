@@ -33,9 +33,10 @@ class _JobEntry:
 class JobRegistry:
     """Thread-safe registry for background asynchronous jobs."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_finished: int = 200) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, _JobEntry] = {}
+        self.max_finished = max_finished
 
     def submit(self, kind: str, runner: JobRunner, params: dict[str, Any]) -> str:
         """Submit a job to be executed in a background daemon thread.
@@ -56,6 +57,16 @@ class JobRegistry:
         )
 
         with self._lock:
+            finished_keys: list[str] = []
+            for jid, j in self._jobs.items():
+                with j.lock:
+                    if j.status != "running":
+                        finished_keys.append(jid)
+            excess = len(finished_keys) - max(0, self.max_finished)
+            if excess > 0:
+                for jid in finished_keys[:excess]:
+                    del self._jobs[jid]
+
             self._jobs[job_id] = entry
 
         def _worker() -> None:

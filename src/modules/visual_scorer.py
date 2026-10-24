@@ -83,6 +83,10 @@ class VisualScorer:
 
         try:
             import torch
+            if not torch.cuda.is_available():
+                logger.info("PyTorch build has no CUDA; using OpenCV aesthetic engine")
+                return
+
             from torchvision import models
 
             # Use lightweight MobileNetV3-Small for feature extraction

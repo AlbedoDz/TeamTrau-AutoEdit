@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,11 @@ HEVC_LADDER: tuple[str, ...] = (
 _USE_DEFAULT: Any = object()
 
 
+class _CallableEncoder(str):
+    def __call__(self) -> str:
+        return str(self)
+
+
 @dataclass(frozen=True)
 class PlatformCaps:
     """Hardware and platform encoding capabilities."""
@@ -48,9 +54,10 @@ class PlatformCaps:
     hwaccels: tuple[str, ...]
     torch_device: TorchDevice
 
-    def best_h264(self) -> str | None:
+    @property
+    def best_h264(self) -> Any:
         """Return the highest-priority usable H.264 encoder, or None."""
-        return self.h264_encoders[0] if self.h264_encoders else None
+        return _CallableEncoder(self.h264_encoders[0]) if self.h264_encoders else None
 
     def best_hevc(self) -> str | None:
         """Return the highest-priority usable HEVC encoder, or None."""
@@ -216,28 +223,33 @@ def probe(
             torch_device=torch_device,
         )
 
-    encoders_res = run([actual_ffmpeg, "-hide_banner", "-encoders"], timeout=15)
-    hwaccels_res = run([actual_ffmpeg, "-hide_banner", "-hwaccels"], timeout=15)
-
-    raw_encoders = (
-        parse_ffmpeg_encoders(
-            encoders_res.stdout
-            if isinstance(encoders_res.stdout, str)
-            else encoders_res.stdout.decode("utf-8", "replace")
+    try:
+        encoders_res = run([actual_ffmpeg, "-hide_banner", "-encoders"], timeout=15)
+        raw_encoders = (
+            parse_ffmpeg_encoders(
+                encoders_res.stdout
+                if isinstance(encoders_res.stdout, str)
+                else encoders_res.stdout.decode("utf-8", "replace")
+            )
+            if getattr(encoders_res, "returncode", 1) == 0
+            else set()
         )
-        if getattr(encoders_res, "returncode", 1) == 0
-        else set()
-    )
+    except (subprocess.TimeoutExpired, OSError):
+        raw_encoders = set()
 
-    raw_hwaccels = (
-        parse_ffmpeg_hwaccels(
-            hwaccels_res.stdout
-            if isinstance(hwaccels_res.stdout, str)
-            else hwaccels_res.stdout.decode("utf-8", "replace")
+    try:
+        hwaccels_res = run([actual_ffmpeg, "-hide_banner", "-hwaccels"], timeout=15)
+        raw_hwaccels = (
+            parse_ffmpeg_hwaccels(
+                hwaccels_res.stdout
+                if isinstance(hwaccels_res.stdout, str)
+                else hwaccels_res.stdout.decode("utf-8", "replace")
+            )
+            if getattr(hwaccels_res, "returncode", 1) == 0
+            else ()
         )
-        if getattr(hwaccels_res, "returncode", 1) == 0
-        else ()
-    )
+    except (subprocess.TimeoutExpired, OSError):
+        raw_hwaccels = ()
 
     h264_candidates = order_encoders(raw_encoders, H264_LADDER, actual_os)
     hevc_candidates = order_encoders(raw_encoders, HEVC_LADDER, actual_os)

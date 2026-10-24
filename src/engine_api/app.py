@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hmac
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -47,7 +48,7 @@ class _AuthMiddleware:
             if path.rstrip("/") != "/v1/health":
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode("latin-1").strip()
-                if auth != f"Bearer {self.token}":
+                if not hmac.compare_digest(auth, f"Bearer {self.token}"):
                     res = JSONResponse({"error": "unauthorized"}, status_code=401)
                     await res(scope, receive, send)
                     return
@@ -74,6 +75,9 @@ def create_app(
     Returns:
         Configured Starlette application instance.
     """
+    if not token or not token.strip():
+        raise ValueError("token must not be empty or whitespace")
+
     _runners: Mapping[str, JobRunner] = default_runners() if runners is None else runners
     _registry: JobRegistry = JobRegistry() if registry is None else registry
 

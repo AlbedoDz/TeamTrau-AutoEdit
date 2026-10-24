@@ -59,13 +59,7 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
     items = timeline_data.get("items") or []
 
     # Find the first video track in track order
-    video_tracks = [
-        t
-        for t in tracks
-        if t.get("kind") == "video"
-        or t.get("type") == "video"
-        or str(t.get("id", "")).startswith("track-v")
-    ]
+    video_tracks = [t for t in tracks if t.get("kind") == "video"]
     video_tracks.sort(key=lambda t: int(t.get("order", 0)))
 
     if video_tracks:
@@ -104,16 +98,20 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
         if source_link_file.exists():
             try:
                 link_data = json.loads(source_link_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as err:
+                raise ValueError(f"corrupt source.link.json for media {media_id}") from err
+            if isinstance(link_data, dict):
                 link_path_str = link_data.get("path")
                 if link_path_str:
                     source_path = Path(link_path_str)
-            except Exception:
-                pass
 
         if source_path is None:
             if metadata_file.exists():
                 try:
                     meta_data = json.loads(metadata_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError) as err:
+                    raise ValueError(f"corrupt metadata.json for media {media_id}") from err
+                if isinstance(meta_data, dict):
                     file_name = meta_data.get("fileName")
                     if file_name:
                         direct = media_dir / file_name
@@ -125,8 +123,6 @@ def read_freecut_project(workspace: Path, project_id: str) -> FreeCutTimeline:
                                 source_path = sanitized
                             else:
                                 source_path = direct
-                except Exception:
-                    pass
 
         if source_path is None:
             raise ValueError(f"media {media_id} source path could not be resolved")

@@ -853,6 +853,8 @@ def serve_cmd(port: int, token_file: Path | None) -> None:
         if not token_path.is_file():
             raise click.BadParameter(f"Token file not found: {token_path}")
         token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            raise click.BadParameter(f"Token file is empty: {token_path}")
     else:
         cfg = PipelineConfig()
         token_path = cfg.cache_dir / "engine_token"

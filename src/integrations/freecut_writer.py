@@ -120,27 +120,6 @@ def probe_file_stats(file_path: Path, default_fps: float = 30.0) -> dict[str, An
                 duration = info.duration
             if info.codec:
                 codec = info.codec
-        else:
-            # Fallback best-effort probe with cv2 if file is video without ffprobe stream
-            try:
-                import cv2
-                cap = cv2.VideoCapture(str(file_path))
-                if cap.isOpened():
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    f = float(cap.get(cv2.CAP_PROP_FPS))
-                    fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    if w > 0:
-                        width = w
-                    if h > 0:
-                        height = h
-                    if f > 0:
-                        fps = f
-                    if fc > 0 and fps > 0:
-                        duration = fc / fps
-                    cap.release()
-            except Exception:
-                pass
 
     return {
         "fileName": file_path.name,
@@ -187,18 +166,18 @@ def write_freecut_project(
         }
         _write_json_atomic(marker_file, marker_data)
 
-    # 2. Project ID & directory
-    project_id = f"p-{uuid.uuid4()}"
-    project_dir = workspace / "projects" / project_id
-    project_dir.mkdir(parents=True, exist_ok=True)
-
-    # 3. Update index.json atomically
+    # 2. Read and parse index.json before creating project directory
     index_file = workspace / "index.json"
     if index_file.exists():
         index_content = json.loads(index_file.read_text(encoding="utf-8"))
         projects_list = index_content.get("projects", [])
     else:
         projects_list = []
+
+    # 3. Project ID & directory
+    project_id = f"p-{uuid.uuid4()}"
+    project_dir = workspace / "projects" / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
 
     # Filter out existing project if ID matches, then prepend new entry
     projects_list = [p for p in projects_list if p.get("id") != project_id]

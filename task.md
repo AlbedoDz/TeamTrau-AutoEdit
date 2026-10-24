@@ -313,7 +313,7 @@
   - [ ] B8: Corrupted media guard (hard probe/decode timeout + quarantine list)
   - [ ] B9: Cache size cap / LRU
   - [ ] B10: Real face / subject presence for the classifier (YOLO person detector or YuNet)
-- [ ] Phase 25: TeamTrau Studio v3 — Phase 1 engine (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase1.md`)
+- [x] Phase 25: TeamTrau Studio v3 — Phase 1 engine (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase1.md`)
   - [x] P1.0: Hygiene & baseline (no production code)
   - [x] P1.1: Platform capabilities (`src/core/platform_caps.py`)
   - [x] P1.2: Production proxy generator (`src/modules/proxy_generator.py`)
@@ -321,4 +321,5 @@
   - [x] P1.4: FreeCut reader (`src/integrations/freecut_reader.py`)
   - [x] P1.5: Render cache (`src/modules/render_cache.py`) + intra-only renderer option
   - [x] P1.6: Engine API service (`src/engine_api/`) + `main.py serve`
+  - [x] P1.7: Phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
 

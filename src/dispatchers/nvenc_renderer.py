@@ -324,7 +324,12 @@ def plan_units(segments: Sequence[EditClip], fps: Fraction) -> list[_Unit]:
 class NvencRenderer:
     """Builds per-segment filter graphs and renders headless video via FFmpeg NVENC."""
 
-    def __init__(self, config: PipelineConfig, settings: DeliverSettings | None = None, intra_only: bool = False) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        settings: DeliverSettings | None = None,
+        intra_only: bool = False,
+    ) -> None:
         if intra_only and (settings is None or settings.master != "h264"):
             raise ValueError("intra_only requires DeliverSettings with master='h264'")
         self.intra_only = intra_only
@@ -879,7 +884,10 @@ class NvencRenderer:
         return proc.returncode, stderr or ""
 
     def _derive(self, settings: DeliverSettings | None, **config_updates: Any) -> "NvencRenderer":
-        """A renderer sharing this one's NVENC probe, with ``settings`` and config overrides applied."""
+        """A renderer sharing this one's NVENC probe, with ``settings`` and config overrides applied.
+
+        If ``settings`` is None, the receiver's settings are kept.
+        """
         cfg = self.config.model_copy(update=config_updates) if config_updates else self.config
         other = NvencRenderer.__new__(NvencRenderer)
         other.config = cfg

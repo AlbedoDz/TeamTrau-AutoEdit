@@ -1,4 +1,5 @@
 ## [Unreleased]
+- refactor(engine): phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
 - refactor(curation): review polish (batch classify, export guard, top_n clamp, docs)
 - feat(engine-api): loopback job service (auth, SSE events, cancel) + main.py serve
 - feat(render-cache): content-hashed all-intra segment cache + intra_only renderer option
