@@ -38,11 +38,6 @@ HEVC_LADDER: tuple[str, ...] = (
 _USE_DEFAULT: Any = object()
 
 
-class _CallableEncoder(str):
-    def __call__(self) -> str:
-        return str(self)
-
-
 @dataclass(frozen=True)
 class PlatformCaps:
     """Hardware and platform encoding capabilities."""
@@ -54,10 +49,9 @@ class PlatformCaps:
     hwaccels: tuple[str, ...]
     torch_device: TorchDevice
 
-    @property
-    def best_h264(self) -> Any:
+    def best_h264(self) -> str | None:
         """Return the highest-priority usable H.264 encoder, or None."""
-        return _CallableEncoder(self.h264_encoders[0]) if self.h264_encoders else None
+        return self.h264_encoders[0] if self.h264_encoders else None
 
     def best_hevc(self) -> str | None:
         """Return the highest-priority usable HEVC encoder, or None."""

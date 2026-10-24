@@ -1090,7 +1090,7 @@ def test_probe_survives_ffmpeg_list_failure(exc):
     caps = probe(ffmpeg="ffmpeg", os_name="linux", run=boom, smoke_test=False,
                  torch_device="cpu")
     assert caps.h264_encoders == () and caps.hevc_encoders == () and caps.hwaccels == ()
-    assert caps.best_h264 is None
+    assert caps.best_h264() is None
 
 
 def test_corrupt_index_leaves_no_orphan_project_dir(tmp_path: Path):
