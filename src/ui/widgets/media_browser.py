@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.ontology import CameraRole, get_role_display_name, infer_camera_role
-from src.core.service import StudioBackendAdapter
+from src.core.service import StudioBackendAdapter, collect_video_files, find_soundtrack
 from src.core.types import VIDEO_EXTENSIONS, VideoMetadata
 from src.modules.genre_recommender import GenreRecommendation, GenreRecommender
 
@@ -290,6 +290,10 @@ class MediaBrowserWidget(QWidget):
         self.edit_input_dir.setText(str(p.resolve()))
         self._input_dirs = [p]
         self._scan_directory(p)
+        if self.get_soundtrack_path() is None:
+            track = find_soundtrack(p)
+            if track:
+                self.set_soundtrack_path(track)
 
     def add_footage_folder(self, folder: Path | str, default_role: str | None = None) -> None:
         """Queue an additional camera footage directory and infer its camera role."""
@@ -301,15 +305,11 @@ class MediaBrowserWidget(QWidget):
         if not self.edit_input_dir.text().strip():
             self.edit_input_dir.setText(str(p.resolve()))
 
-        inferred = default_role or infer_camera_role(p).value
-        new_files = [
-            f for f in p.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTS
-        ]
+        new_files = collect_video_files(p)[0]
         for f in new_files:
             if f not in self._video_files:
                 self._video_files.append(f)
-                self._clip_roles[f] = inferred
+                self._clip_roles[f] = default_role or infer_camera_role(f).value
 
         self._rebuild_table()
         self._start_probing_queue()
@@ -333,15 +333,11 @@ class MediaBrowserWidget(QWidget):
         """Scan directory for video files and populate library table."""
         if not directory.is_dir():
             return
-        files = [
-            f for f in directory.iterdir()
-            if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTS
-        ]
-        inferred_role = infer_camera_role(directory).value
+        files = collect_video_files(directory)[0]
         self._video_files = sorted(files, key=lambda f: f.name)
         for f in self._video_files:
             if f not in self._clip_roles:
-                self._clip_roles[f] = infer_camera_role(f).value or inferred_role
+                self._clip_roles[f] = infer_camera_role(f).value
 
         self._rebuild_table()
         self._start_probing_queue()
@@ -605,11 +601,7 @@ class MediaBrowserWidget(QWidget):
         if not self.get_input_dir() and not self._video_files:
             return False, "No valid source video directory or clips loaded."
         if not self._video_files and self.get_input_dir():
-            files = [
-                f
-                for f in self.get_input_dir().iterdir()
-                if f.is_file() and f.suffix.lower() in SUPPORTED_VIDEO_EXTS
-            ]
+            files = collect_video_files(self.get_input_dir())[0]
             if not files:
                 return False, f"No supported video clips found in '{self.get_input_dir()}'."
         if not self.get_soundtrack_path() and workflow_mode != "rough_cut":

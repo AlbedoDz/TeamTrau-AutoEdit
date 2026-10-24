@@ -50,6 +50,7 @@ class SubGenrePreset:
     cadence_profile: str = CadenceProfile.BALANCED_NARRATIVE.value
     target_bar_multiples: tuple[float, ...] = PROFILE_MULTIPLES[CadenceProfile.BALANCED_NARRATIVE]
     allow_extended_shots: bool = True
+    golden_window_sec: tuple[float, float] = (3.0, 8.0)
 
     def apply(self, config: PipelineConfig) -> PipelineConfig:
         """Mutate a PipelineConfig with this preset's operational parameters."""
@@ -70,6 +71,8 @@ class SubGenrePreset:
         config.action_drop_threshold = self.action_drop_threshold
         config.cadence_profile = self.cadence_profile
         config.cadence_multiples = list(self.target_bar_multiples)
+        config.golden_window_min_sec = self.golden_window_sec[0]
+        config.golden_window_max_sec = self.golden_window_sec[1]
 
         # Update resolution preset if valid
         if self.preferred_render_preset in PRESETS:
@@ -155,7 +158,37 @@ def _with_cadence(presets: dict[str, SubGenrePreset]) -> dict[str, SubGenrePrese
     }
 
 
-GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = _with_cadence({
+_CINEMATIC_OVERRIDE_KEYS: Final[frozenset[str]] = frozenset({
+    "wedding_highlight",
+    "travel_cinematic",
+    "travel_luxury",
+    "narrative_shortfilm",
+    "social_reels_aesthetic",
+    "commercial_realestate",
+})
+
+
+def _with_golden_windows(presets: dict[str, SubGenrePreset]) -> dict[str, SubGenrePreset]:
+    """Fill golden_window_sec from major genre with cinematic overrides."""
+    result: dict[str, SubGenrePreset] = {}
+    for key, p in presets.items():
+        if key in _CINEMATIC_OVERRIDE_KEYS:
+            gw = (4.0, 8.0)
+        elif p.major_genre == MajorGenre.DOCUMENTARY_NARRATIVE or key == "rough_cut_assembly":
+            gw = (3.0, 8.0)
+        elif p.major_genre in (
+            MajorGenre.ACTION_SPORTS,
+            MajorGenre.TRAVEL_LIFESTYLE,
+            MajorGenre.COMMERCIAL_SOCIAL,
+        ):
+            gw = (2.5, 4.5)
+        else:
+            gw = (3.0, 8.0)
+        result[key] = replace(p, golden_window_sec=gw)
+    return result
+
+
+GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = _with_golden_windows(_with_cadence({
     # -------------------------------------------------------------
     # 1. Action & Sports (6 Sub-genres)
     # -------------------------------------------------------------
@@ -700,9 +733,10 @@ GENRE_PRESETS: Final[dict[str, SubGenrePreset]] = _with_cadence({
         action_drop_threshold=0.80,
         preferred_camera_roles=["b_roll", "cam_a", "drone"],
     ),
-})
+}))
 
-ROUGH_CUT_PRESET: Final[SubGenrePreset] = _with_cadence(
+ROUGH_CUT_PRESET: Final[SubGenrePreset] = _with_golden_windows(
+    _with_cadence(
     {"rough_cut_assembly": SubGenrePreset(
     key="rough_cut_assembly",
     major_genre=MajorGenre.DOCUMENTARY_NARRATIVE,
@@ -726,7 +760,7 @@ ROUGH_CUT_PRESET: Final[SubGenrePreset] = _with_cadence(
     action_drop_threshold=0.70,
     preferred_camera_roles=["cam_a", "cam_b", "drone", "action_cam", "b_roll"],
 )}
-)["rough_cut_assembly"]
+))["rough_cut_assembly"]
 
 
 def get_preset_by_key(key: str) -> SubGenrePreset:

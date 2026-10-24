@@ -17,7 +17,8 @@ from typing import Any, Callable, Literal
 
 from src.core.analysis_cache import scene_key as span_key
 from src.core.config import PipelineConfig
-from src.core.ontology import infer_camera_role
+from src.core.nle_preflight import preflight_timeline
+from src.core.ontology import ContentRole, infer_camera_role, role_folder_of
 from src.core.types import (
     ALL_DELIVER_FORMATS,
     UNSUPPORTED_RAW_EXTENSIONS,
@@ -162,10 +163,14 @@ def _enforce_vram_headroom(max_allowed_gb: float = 2.0) -> None:
         pass
 
 
+AUDIO_EXTENSIONS: frozenset[str] = frozenset({".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg"})
+
+
 def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[Path]]:
     """Footage found in a folder / file (or a list of them) and the unsupported RAW files skipped.
 
-    Folders are scanned one level deep; extensions come from ``VIDEO_EXTENSIONS``.
+    Folders are scanned at the top level, plus one level inside subfolders whose name is a
+    role folder (e.g. A-roll, B-roll). Extensions come from ``VIDEO_EXTENSIONS``.
     """
     collected: list[Path] = []
     skipped: list[Path] = []
@@ -175,9 +180,41 @@ def collect_video_files(input_dir: Path | list[Path]) -> tuple[list[Path], list[
             files = [f for f in p.iterdir() if f.is_file()]
             collected.extend(f for f in files if f.suffix.lower() in VIDEO_EXTENSIONS)
             skipped.extend(f for f in files if f.suffix.lower() in UNSUPPORTED_RAW_EXTENSIONS)
+
+            subdirs = sorted(
+                [d for d in p.iterdir() if d.is_dir() and role_folder_of(d / "x") is not None],
+                key=lambda d: d.name.lower(),
+            )
+            for sub in subdirs:
+                sub_files = [f for f in sub.iterdir() if f.is_file()]
+                collected.extend(f for f in sub_files if f.suffix.lower() in VIDEO_EXTENSIONS)
+                skipped.extend(f for f in sub_files if f.suffix.lower() in UNSUPPORTED_RAW_EXTENSIONS)
         elif p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS:
             collected.append(p)
     return collected, skipped
+
+
+def find_soundtrack(input_dir: Path) -> Path | None:
+    """Find a single soundtrack audio file inside a direct subfolder named 'music'.
+
+    Case-insensitive directory name ('music', 'Music', etc.).
+    Returns the audio file path if exactly one audio file (per ``AUDIO_EXTENSIONS``) exists,
+    otherwise None.
+    """
+    p = Path(input_dir)
+    if not p.is_dir():
+        return None
+    music_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.lower() == "music"]
+    if not music_dirs:
+        return None
+    audio_files: list[Path] = []
+    for md in music_dirs:
+        audio_files.extend(
+            f for f in md.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTENSIONS
+        )
+    if len(audio_files) == 1:
+        return audio_files[0]
+    return None
 
 
 def _camera_role(scene: SceneCut) -> str:
@@ -242,6 +279,9 @@ def _golden_scenes(
             "defects_count": len(seg.defects_removed),
             "original_scene_duration": round(orig, 4),
         }
+        for field in ("content_role", "role_confidence", "golden_window"):
+            if field in seg.metadata:
+                meta[(cut.clip_path, span_key(cut.start_time, cut.end_time))][field] = seg.metadata[field]
     return cuts, meta
 
 
@@ -622,9 +662,11 @@ class StudioBackendAdapter:
         for attr in (
             "render_path", "encoder_used", "duration", "fcpxml_path", "premiere_xml_path",
             "otio_path", "capcut_draft_path", "resolve_status", "master_codec",
+            "preflight_path",
         ):
             setattr(combined, attr, getattr(first, attr))
         combined.subtitle_paths = list(first.subtitle_paths)
+        combined.preflight_issues = list(first.preflight_issues)
         combined.success = not errors
         combined.error_message = "; ".join(errors) or None
         eff = settings or DeliverSettings.from_timeline(edit_tl, config)
@@ -791,6 +833,21 @@ class StudioBackendAdapter:
             edit_tl = retarget_timeline(edit_tl, settings)
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_audio_rate = settings.audio_rate if settings is not None else 48000
+            pf_report = preflight_timeline(edit_tl, audio_rate=target_audio_rate)
+            pf_path = output_dir / "preflight.json"
+            pf_path.write_text(
+                json.dumps(pf_report.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result.preflight_path = pf_path
+            result.preflight_issues = [
+                f"{i.severity}:{i.code}:{i.path.name}" for i in pf_report.issues
+            ]
+        except Exception as pf_err:
+            logger.warning("NLE preflight report failed: %s", pf_err)
+
         name = base_name or f"{edit_tl.name}"
         nle_formats = {f for f in formats if f != "mp4"}
         if resolve or dry_run_resolve:
@@ -1178,6 +1235,74 @@ class StudioBackendAdapter:
             )
             if golden and not cleaned_segments:
                 raise ValueError("Rough cut kept no usable takes - every scene was pruned as defective.")
+
+            if golden and cleaned_segments:
+                roles: dict[Path, ContentRole] = {}
+                confidences: dict[Path, float] = {}
+                if config.auto_classify_roles:
+                    from src.modules.media_classifier import classify_batch
+
+                    unique_clips: list[tuple[Path, Path]] = []
+                    seen_clips: set[Path] = set()
+                    for seg in cleaned_segments:
+                        if seg.clip_path not in seen_clips:
+                            seen_clips.add(seg.clip_path)
+                            orig = (
+                                Path(seg.scene.original_path)
+                                if seg.scene.original_path
+                                else seg.clip_path
+                            )
+                            unique_clips.append((seg.clip_path, orig))
+
+                    if unique_clips:
+                        _notify_progress(
+                            0.0, c_idx, f"Classifying media roles ({len(unique_clips)} clips)"
+                        )
+                        chunk_size = max(1, config.max_workers)
+                        for i in range(0, len(unique_clips), chunk_size):
+                            _check_cancel()
+                            chunk = unique_clips[i : i + chunk_size]
+                            orig_chunk = [orig for _, orig in chunk]
+                            res_list = classify_batch(
+                                orig_chunk, max_workers=config.max_workers
+                            )
+                            for (clip_path, _), res in zip(chunk, res_list):
+                                roles[clip_path] = res.role
+                                confidences[clip_path] = res.confidence
+                        _check_cancel()
+
+                if roles:
+                    new_segs = []
+                    for seg in cleaned_segments:
+                        role = roles.get(seg.clip_path)
+                        conf = confidences.get(seg.clip_path)
+                        if role is not None:
+                            meta = dict(seg.metadata)
+                            meta["content_role"] = role.value
+                            if conf is not None:
+                                meta["role_confidence"] = float(conf)
+                            new_segs.append(dataclasses.replace(seg, metadata=meta))
+                        else:
+                            new_segs.append(seg)
+                    cleaned_segments = new_segs
+
+                if config.enable_golden_windows and cleaned_segments:
+                    from src.core.analysis_cache import AnalysisCache
+                    from src.modules.golden_takes import window_cleaned_segments
+                    from src.modules.shot_windows import QualityCurve, compute_quality_curve
+
+                    analysis_cache = AnalysisCache(config)
+
+                    def _curve_fn(path: Path, s: float, e: float) -> QualityCurve | None:
+                        return compute_quality_curve(path, s, e, hz=4.0, cache=analysis_cache)
+
+                    cleaned_segments = window_cleaned_segments(
+                        cleaned_segments,
+                        roles,
+                        config.golden_window_min_sec,
+                        config.golden_window_max_sec,
+                        _curve_fn,
+                    )
 
         ranked_scenes: list[ScoredScene]
         if legacy_rough:

@@ -1,6 +1,6 @@
 # TECHNICAL HANDOFF DOSSIER: TEAMTRAU-AUTOEDIT ORCHESTRATOR
 **Confidential & Proprietary — Engineering Handoff Blueprint**  
-**Document Revision:** 2.2.0 (Post-Phase 20: real FCPXML 1.8, Resolve-verified; GUI config/cancel/curation fixes)  
+**Document Revision:** 2.4.0 (Post-Phase 24: Auto-Curation & Selects Stringout v2, Mode B Role Ingestion, Golden Windows, NLE Preflight, FastMCP Macro-Tools, CLI Curate)  
 **System Target:** Windows 11 Enterprise (x64), NVIDIA CUDA 12+, NVENC Gen 8 (RTX 3070+), DaVinci Resolve Studio 19/21, PySide6  
 **Audience:** Incoming Principal AI Software Architect & Autonomous Coding Agents
 
@@ -106,8 +106,16 @@ flowchart TD
 - **Role:** Disk cache for per-clip analysis results (repeat runs skip recomputation: analysis 33.6s -> 1.8s cached); `.tteproj` read/write helpers used by Edit/Deliver; shared FFmpeg subprocess and probe helpers.
 - **Dependencies:** `src.core.types`. Downstream: `StudioBackendAdapter`, `ProjectManager`, `NvencRenderer`.
 
+#### `src/core/timebase.py`, `media_info.py`, `deliver_check.py`
+- **Role:** `timebase.frame_rate_fraction` is the single place that maps float rates to exact rationals (29.97 -> 30000/1001; 23.976, 59.94, 119.88 included). `media_info.probe_media` is the one ffprobe description shared by every exporter and renderer (rotation-aware, cached by path/size/mtime, never raises). `deliver_check` reports whether footage will be scaled or conformed against the Deliver canvas and fps.
+- **Dependencies:** `ffprobe` subprocess, `fractions`. Downstream: all NLE exporters, `NvencRenderer`, Deliver GUI panel.
+
+#### `src/core/deliver_options.py`, `stage_options.py`
+- **Role:** `deliver_options` turns CLI flags and MCP arguments into `DeliverSettings` (preset names, `WxH`, fractional fps, variant lists), raising `ValueError` that names the bad option. `stage_options` holds the shared staged-workflow validation (`rough_cut | sequence | all`, cadence profile names, genre keys) used by CLI `run` and MCP `execute_pipeline_job`.
+- **Dependencies:** `src.core.config`, `src.core.genre_presets`, `src.core.types`. Downstream: `main.py`, `mcp_server.py`.
+
 #### `src/core/genre_presets.py`
-- **Role:** Multi-genre editorial ontology matrix covering 4 Major Genres and 23 Sub-genres.
+- **Role:** Multi-genre editorial ontology matrix covering 4 Major Genres and 23 Sub-genres. Each genre now maps to a `CadenceProfile` and bar multiple (`0ed8945`).
 - **Hardware Vector:** CPU-bound.
 - **Core Signatures:**
   * `class GenrePreset(BaseModel)`: Preset definitions containing pacing curves, motion thresholds, reframing styles, and audio drop mappings. Method `apply(config: PipelineConfig) -> None` mutates target config dynamically.
@@ -249,6 +257,14 @@ flowchart TD
     - `export_premiere_xml(...) -> Path`: Exports Adobe Premiere Pro XML.
     - `export_all(...) -> TimelineExportResult`: Exports FCPXML, Premiere XML, OTIO, and triggers CapCut draft export.
 - **Dependencies:** `opentimelineio`, `xml.etree.ElementTree`. Downstream: `StudioBackendAdapter`, `VariantSynthesizer`.
+
+#### `src/core/cadence.py` & `src/modules/shot_windows.py`
+- **Role:** Cadence engine (`0ed8945`, `9485ce6`, `179b27d`). `extract_musical_bar_grid` builds bar starts and 2/4/8-bar phrases that never cross a song section. `generate_cadence_cuts` places cuts only on bar or half-bar points, follows a per-section emotional curve, varies slot length from a seed, and snaps to the frame grid. The teaser ends at the half-bar point nearest `teaser_duration`. `shot_windows` samples a quality curve (sharpness, motion, jerk, exposure) at a few Hz for long shots only and picks the smoothest, sharpest sub-window; curves are cached under namespace `curves`.
+- **Dependencies:** `src.core.types`, `AnalysisCache`. Downstream: `StudioBackendAdapter`, `VariantSynthesizer`.
+
+#### `src/modules/premiere_xml_fix.py` & `subtitle_export.py`
+- **Role:** `premiere_xml_fix` post-processes OTIO's FCP7 XML so Premiere can link media: fills file size, sample rate and channel count from ffprobe, groups audio into Stereo/Mono tracks with `sourcetrack`, drops audio for silent sources, declares stereo 48 kHz outputs (`91b4dcd`). `subtitle_export` writes `.srt` / `.ass` sidecars and ffmpeg burn-in filter helpers for the Deliver master.
+- **Dependencies:** `ffprobe`, `src.core.media_info`. Downstream: `TimelineBuilder.export_premiere_xml`, `NvencRenderer`.
 
 #### `src/modules/edit_timeline.py`
 - **Role:** Edit-stage timeline operations on the analysed OTIO timeline: scene curation (`apply_scene_curation` replaces clips from excluded scenes, keeps beat grid and manual edits), clip move/delete used by the GUI undo stack.
@@ -412,11 +428,11 @@ sequenceDiagram
 
 ## 3. TEST BASELINE & QUALITY INVARIANTS
 
-### 3.1 Verified Test Suite Mapping (315 collected; 314 passing on last full run)
+### 3.1 Verified Test Suite Mapping (976 passed, 0 failed on last full run)
 
-Last full run (`pytest tests -q`): 314 passed, 1 failed. The failure is `tests/test_service_adapter.py::test_adapter_submit_job_async_and_cancel`, which passes when run alone. It is flaky under full-suite load and not yet root-caused. Treat as open, not as a regression that was fixed.
+Last full run (`pytest tests -q`, Phase 23): 976 passed, 54 warnings, 5m12s. The flaky `test_adapter_submit_job_async_and_cancel` seen in 2.2.0 passed in this run; it is not root-caused.
 
-Per-module mapping below. Rows added in 2.2.0 are the new GUI, FCPXML, Resolve, cache and concurrency suites:
+Per-module mapping below. Rows added in 2.2.0 and 2.3.0 cover the GUI, FCPXML, Resolve, cache, concurrency, Deliver, cadence and staged-workflow suites. The per-file counts in 2.3.0 rows are from `def test_` grep and may differ from pytest parametrized totals:
 
 | Test Suite File | Covered Module | Test Count | Key Verification Objectives |
 |:---|:---|:---:|:---|
@@ -431,6 +447,16 @@ Per-module mapping below. Rows added in 2.2.0 are the new GUI, FCPXML, Resolve, 
 | `test_edit_deliver_gui.py` | `src/ui/main_window.py`, `timeline_view.py` | 10 | Edit/Deliver split in Desktop Studio, Timeline ready state, export gating |
 | `test_export_panel.py` | `src/ui/widgets/export_panel.py` | 10 | Multi-NLE export checkboxes, NVENC bitrate/CQ overrides, render monitor |
 | `test_fcpxml_exporter.py` | `src/modules/fcpxml_exporter.py` | 9 | FCPXML 1.8 structure, exact rational times, timeMap ramps, unicode URLs, audio roles |
+| `test_fcpxml_matrix.py` | `src/modules/fcpxml_exporter.py` | 1 | Parametrized FCPXML matrix (canvas, fps, timecode, crop) |
+| `test_deliver_settings.py` | `src/core/deliver_options.py`, `deliver_check.py` | 25 | DeliverSettings validation, presets, NTSC rates, scale/conform warnings |
+| `test_deliver_cli.py` | `main.py` (deliver) | 12 | CLI deliver flags mapped to DeliverSettings |
+| `test_deliver_workflow_gui.py` | `src/ui/widgets/export_panel.py` | 21 | Deliver panel presets, custom canvas, source-mismatch warning, persistence |
+| `test_media_info.py` | `src/core/media_info.py` | 11 | ffprobe parsing, rotation, cache keys, non-media files |
+| `test_cadence_engine.py` | `src/core/cadence.py` | 30 | Bar grid, phrase boundaries, cadence cuts, frame snapping |
+| `test_extended_shots_and_cadence.py` | `src/modules/shot_windows.py`, `cadence.py` | 26 | Long-shot sub-windows, slot allocation, cadence variants |
+| `test_staged_pipeline.py` | `src/core/service.py` | 25 | `stage=rough_cut | sequence | all`, cached rough cut, schema 2.3.0 |
+| `test_gui_staged_workflow.py` | `src/ui/main_window.py` | 41 | 4-step stepper, per-stage cancel, scene badges, re-edit from stored scenes |
+| `test_subtitle_export.py` | `src/modules/subtitle_export.py` | 7 | SRT/ASS sidecars, burn-in path escaping |
 | `test_gui_config_precedence.py` | `src/ui/main_window.py` | 7 | Single `_build_config()`: Rough Cut, Apply Preset, Export honour UI state |
 | `test_keyframe_cache.py` | `src/modules/keyframe_cache.py` | 7 | Shared keyframe sweep correctness and reuse across stages |
 | `test_pipeline_concurrency.py` | `src/core/service.py` | 4 | Audio/whisper overlap, cancellation during concurrent stages |
@@ -481,7 +507,21 @@ Per-module mapping below. Rows added in 2.2.0 are the new GUI, FCPXML, Resolve, 
 
 ## 4. CRITICAL GAP ANALYSIS, TECHNICAL DEBT & LIMITATIONS
 
-### 4.0 Cleared Debt (Resolved in Phase 17-20)
+### 4.0 Cleared Debt (Resolved in Phase 17-24)
+- **Auto-Curation & Selects Stringout v2 (Phase 24):** Resolved. End-to-end non-destructive curation pipeline:
+  * Mode B Ingestion: Case-insensitive, punctuation-stripped role folders (`A-roll/`, `B-roll/`, `Music/`).
+  * Fast Content Role Classifier (`content_classifier.py`): Speech vs. B-roll classification via VAD energy ratio, audio decode timeout protection, and safe fallback if face detector is unavailable.
+  * Genre-Aware Golden Window Selection (`golden_curator.py`): Clamps window duration to genre `golden_window_max_sec` and extracts highest composite quality segment.
+  * Rough-Cut Stage Integration: A-roll speech continuity preserved (D6/D10); B-roll takes refined to golden windows.
+  * NLE Preflight Integrity Report (`nle_preflight.py`): Verifies file existence, VFR, fps mismatch, 48kHz audio layout, and RFC 3986 URI lossless round-trip.
+  * Curation Core & FastMCP Macro-Tools (`curation.py`, `mcp_server.py`): `curate_footage`, `assemble_cadence_timeline`, `export_nle_project` maintaining strict $\le 2000$ char (~500 tokens) JSON budget.
+  * CLI `main.py curate`: Autonomous curation and NLE selects export (`--export`) writing UTF-8 `curation_summary.json`.
+- **Master audio dropped the last ~0.17 s under load:** Resolved. `apad+atrim` after mix (`aca58ba`).
+- **Premiere refused stereo media ("2 audio channel(s) vs 1"):** Resolved in XML by `premiere_xml_fix` (`91b4dcd`). Not yet verified in Premiere itself.
+- **Teaser length drifted with uneven beat cuts:** Resolved. Teaser ends at nearest half-bar to `teaser_duration` (`179b27d`).
+- **Each stage re-ingested footage:** Resolved. Staged workflow reuses stored scenes; re-edit needs no re-ingest (`a219edd`, `3838675`).
+- **Master rendered with fixed fps/codec only:** Resolved. `DeliverSettings` drives canvas, exact rate, codec, colour, subtitles (`46978b3`, `7c988d1`).
+- **Probes duplicated per exporter:** Resolved. One `media_info.probe_media`, cached (`46978b3`).
 - **Resolve reconfigured the user's open project:** Resolved. `ResolveDispatcher` creates a new project, keeps NTSC rates, and falls back to `resolve_worker.py` under a compatible Python.
 - **FCP7 XML written as `.fcpxml`:** Resolved. Native FCPXML 1.8 writer `fcpxml_exporter.py`, verified in Resolve Studio 21.
 - **FCPXML retime lost/doubled in-point:** Resolved. `start = in-point/speed` with linear timeMap through origin.
@@ -526,8 +566,10 @@ The following architectural limitations, edge cases, and missing features remain
 - **DaVinci Resolve FCPXML (Variable Speed Ramping) — partly resolved in 2.2.0:**
   * FCPXML 1.8 is now written natively (`fcpxml_exporter.py`) and imports into Resolve Studio 21 with clips, audio lanes, gaps, dissolves and unicode paths intact. Speed ramps are `timeMap` segments, each linear.
   * Still open: smooth Quadratic/Bezier speed curves are approximated by linear segments; Resolve does not get the curve shape.
-- **Adobe Premiere Pro XML (9:16 Crop Window & Motion):**
-  * 9:16 pan-and-scan crop coordinates (`CropWindow`) cannot be represented in standard FCP 7 XML without proprietary `<effect><name>Basic Motion</name>` injection. Premiere Pro opens footage uncropped at full 16:9 canvas dimensions unless user manually crops in Effects Controls.
+- **Adobe Premiere Pro XML (9:16 Crop Window & Motion) — partly resolved in 2.3.0:**
+  * Premiere XML now sets sequence format from the chosen canvas, Time Remap for speed ramps, and Basic Motion scale/center for fit and 9:16 crop (`eb70ec2`). Audio channels are declared so Link Media works (`91b4dcd`).
+  * Still open: none of this is verified in real Premiere Pro. Treat as untested until someone imports the output there.
+  * CapCut draft crop/speed/ducking (`eb70ec2`) has the same status: not verified in CapCut Desktop.
 - **CapCut Desktop (`draft_content.json` Version Drift):**
   * CapCut Desktop stores internal timestamps in microseconds ($10^{-6}$s). The schema is unversioned and reverse-engineered. Any major update by ByteDance to CapCut Desktop (e.g. changing material metadata requirements or canvas structures) risks invalidating exported drafts.
 
@@ -558,7 +600,7 @@ If you are an incoming AI agent or software engineer taking over `TeamTrau-AutoE
    .venv\Scripts\python.exe -m pytest tests -v --tb=short
    .venv\Scripts\python.exe -m ruff check src tests main.py
    ```
-   All tests must pass with 0 ruff errors. Baseline is 315 collected; the flaky `test_adapter_submit_job_async_and_cancel` (section 3.1) must be fixed or re-verified before calling a run clean.
+   All tests must pass with 0 ruff errors. Baseline is 976 passing (Phase 23 full run).
 2. **Respect the Unified Service Facade:** Never implement pipeline logic directly inside Qt widgets or Click CLI commands. All business logic must be authored inside `src/modules/` or `src/dispatchers/` and orchestrated via `StudioBackendAdapter` in `src/core/service.py`.
 3. **Strict Thread Safety:** Never call Qt GUI elements (`QProgressBar`, `QTableWidget`) directly from background worker threads. Always emit through `BackendSignalBridge` (`src/ui/adapter_bridge.py`).
 4. **Immediate Next Implementation Tasks (Phase 16 Master Plan):**

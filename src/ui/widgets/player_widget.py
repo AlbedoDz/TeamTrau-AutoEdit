@@ -1,6 +1,7 @@
 """Program Monitor Viewport and Transport Controller for NLE Playback."""
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,12 +38,34 @@ def format_smpte_timecode(seconds: float, fps: float = 30.0) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
 
 
-def cv_frame_to_pixmap(frame: np.ndarray) -> QPixmap:
-    """Convert OpenCV BGR image frame to PySide6 QPixmap."""
-    h, w, ch = frame.shape
-    bytes_per_line = ch * w
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+def cv_frame_to_pixmap(frame: np.ndarray, max_dim: int = 1280) -> QPixmap:
+    """Convert OpenCV BGR image frame to PySide6 QPixmap with SIMD downsampling for real-time preview."""
+    h, w = frame.shape[:2]
+    ch = frame.shape[2] if len(frame.shape) > 2 else 1
+
+    # SIMD-accelerated downsample in OpenCV to prevent CPU bottlenecks on 4K/1080p
+    if w > max_dim or h > max_dim:
+        scale = max_dim / max(w, h)
+        nw, nh = int(round(w * scale)), int(round(h * scale))
+        nw = max(2, nw - (nw % 2))
+        nh = max(2, nh - (nh % 2))
+        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        h, w = nh, nw
+
+    if ch == 3:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fmt = QImage.Format.Format_RGB888
+        bytes_per_line = 3 * w
+    elif ch == 4:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+        fmt = QImage.Format.Format_RGBA8888
+        bytes_per_line = 4 * w
+    else:
+        rgb = frame
+        fmt = QImage.Format.Format_Grayscale8
+        bytes_per_line = w
+
+    qimg = QImage(rgb.data, w, h, bytes_per_line, fmt).copy()
     return QPixmap.fromImage(qimg)
 
 
@@ -55,6 +78,7 @@ class TimelineClipEntry:
     source_out: float
     timeline_in: float
     timeline_out: float
+    speed: float = 1.0
 
 
 class MonitorCanvas(QWidget):
@@ -69,6 +93,13 @@ class MonitorCanvas(QWidget):
         self.current_pixmap: QPixmap | None = None
         self.hud_label_text: str = "9:16 Vertical"
         self.zoom_mode: str = "fit"
+        self.is_playing: bool = False
+
+        # Scaled Pixmap Cache for 0ms paintEvent
+        self._cached_scaled: QPixmap | None = None
+        self._cached_target_rect: QRect | None = None
+        self._cached_size: tuple[int, int] | None = None
+        self._cached_zoom: str = "fit"
 
     def set_vertical_mode(self, vertical: bool) -> None:
         """Toggle 9:16 crop box guide visualization."""
@@ -78,13 +109,73 @@ class MonitorCanvas(QWidget):
     def set_frame_pixmap(self, pixmap: QPixmap | None) -> None:
         """Update active video frame preview."""
         self.current_pixmap = pixmap
+        self._update_cached_scaled()
         self.update()
 
     @Slot(str)
     def set_zoom(self, zoom_text: str) -> None:
         """Set viewport zoom mode (Fit, 50%, 100%, 200%)."""
         self.zoom_mode = zoom_text.strip().lower()
+        self._update_cached_scaled()
         self.update()
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self._update_cached_scaled()
+
+    def _update_cached_scaled(self) -> None:
+        """Pre-scale video frame pixmap once on frame arrival or canvas resize."""
+        if self.current_pixmap is None or self.current_pixmap.isNull():
+            self._cached_scaled = None
+            self._cached_target_rect = None
+            return
+
+        cw, ch = self.width(), self.height()
+        if cw <= 0 or ch <= 0:
+            cw, ch = 320, 240
+
+        orig_size = self.current_pixmap.size()
+        ow, oh = orig_size.width(), orig_size.height()
+        if ow <= 0 or oh <= 0:
+            self._cached_scaled = None
+            self._cached_target_rect = None
+            return
+
+        transform_mode = (
+            Qt.TransformationMode.FastTransformation
+            if self.is_playing
+            else Qt.TransformationMode.SmoothTransformation
+        )
+
+        if self.zoom_mode == "50%":
+            scaled = self.current_pixmap.scaled(
+                max(1, int(ow * 0.5)),
+                max(1, int(oh * 0.5)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                transform_mode,
+            )
+        elif self.zoom_mode == "100%":
+            scaled = self.current_pixmap
+        elif self.zoom_mode == "200%":
+            scaled = self.current_pixmap.scaled(
+                max(1, int(ow * 2.0)),
+                max(1, int(oh * 2.0)),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                transform_mode,
+            )
+        else:  # "fit"
+            scaled = self.current_pixmap.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                transform_mode,
+            )
+
+        self._cached_scaled = scaled
+        x_offset = (cw - scaled.width()) // 2
+        y_offset = (ch - scaled.height()) // 2
+        self._cached_target_rect = QRect(x_offset, y_offset, scaled.width(), scaled.height())
+        self._cached_size = (cw, ch)
+        self._cached_zoom = self.zoom_mode
 
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
@@ -94,35 +185,13 @@ class MonitorCanvas(QWidget):
         rect = self.rect()
         painter.fillRect(rect, QColor("#09090b"))
 
-        # 2. Render Video Frame if available, or placeholder backdrop
-        if self.current_pixmap and not self.current_pixmap.isNull():
-            orig_size = self.current_pixmap.size()
-            if self.zoom_mode == "50%":
-                scaled = self.current_pixmap.scaled(
-                    int(orig_size.width() * 0.5),
-                    int(orig_size.height() * 0.5),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            elif self.zoom_mode == "100%":
-                scaled = self.current_pixmap
-            elif self.zoom_mode == "200%":
-                scaled = self.current_pixmap.scaled(
-                    int(orig_size.width() * 2.0),
-                    int(orig_size.height() * 2.0),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            else:  # "fit"
-                scaled = self.current_pixmap.scaled(
-                    self.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-
-            x_offset = (self.width() - scaled.width()) // 2
-            y_offset = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x_offset, y_offset, scaled)
+        # 2. Render Video Frame if available (using cached pre-scaled pixmap, 0ms CPU scale)
+        if self._cached_scaled is not None and self._cached_target_rect is not None:
+            painter.drawPixmap(self._cached_target_rect.topLeft(), self._cached_scaled)
+        elif self.current_pixmap and not self.current_pixmap.isNull():
+            self._update_cached_scaled()
+            if self._cached_scaled is not None and self._cached_target_rect is not None:
+                painter.drawPixmap(self._cached_target_rect.topLeft(), self._cached_scaled)
         else:
             # Draw subtle aspect grid
             pen_grid = QPen(QColor("#27272a"), 1, Qt.PenStyle.DotLine)
@@ -233,8 +302,15 @@ class PlayerWidget(QWidget):
         self._caps_cache: dict[str, cv2.VideoCapture] = {}
         self._theater_mode: bool = False
 
+        # Precision Wall Clock & Sequential Decoding State
+        self._play_start_wall_time: float = 0.0
+        self._play_start_media_time: float = 0.0
+        self._last_decoded_src_sec: float | None = None
+        self._last_active_clip_idx: int = -1
+        self._prewarmed_clip_idx: int = -1
+
         self._timer = QTimer(self)
-        self._timer.setInterval(int(1000.0 / self.fps))
+        self._timer.setInterval(max(5, int(1000.0 / self.fps)))
         self._timer.timeout.connect(self._on_playback_tick)
 
         self._init_ui()
@@ -421,13 +497,16 @@ class PlayerWidget(QWidget):
         self.set_fps(fps)
         self.set_duration(clip_dur)
         self.current_time = 0.0
+        self._last_decoded_src_sec = None
+        self._last_active_clip_idx = -1
+        self._prewarmed_clip_idx = -1
         self.lbl_mode.setText(f"📺 Source: {p.name}")
         self.lbl_mode.setStyleSheet(
             "background: #1e1b4b; color: #a5b4fc; border: 1px solid #6366f1; "
             "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
         )
         self._update_timecode_display()
-        self._render_current_frame()
+        self._render_current_frame(is_sequential=False)
         return True
 
     def load_timeline_sequence(
@@ -457,6 +536,7 @@ class PlayerWidget(QWidget):
                     source_out=src_out,
                     timeline_in=cur_t,
                     timeline_out=cur_t + dur,
+                    speed=speed if speed and speed > 0 else 1.0,
                 )
             )
             cur_t += dur
@@ -466,6 +546,9 @@ class PlayerWidget(QWidget):
 
         self._timeline_clips = entries
         self._mode = "timeline"
+        self._last_decoded_src_sec = None
+        self._last_active_clip_idx = -1
+        self._prewarmed_clip_idx = -1
         seq_dur = total_duration if total_duration and total_duration > 0 else cur_t
         self.set_duration(seq_dur)
         self.lbl_mode.setText("🎬 Master Timeline")
@@ -474,7 +557,7 @@ class PlayerWidget(QWidget):
             "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
         )
         self._update_timecode_display()
-        self._render_current_frame()
+        self._render_current_frame(is_sequential=False)
 
     def load_edit_timeline(self, timeline: Any) -> bool:
         """Load an ``EditTimeline`` (frame-exact edit decision list) for sequence playback.
@@ -496,6 +579,7 @@ class PlayerWidget(QWidget):
                         source_out=c.source_in + dur * speed,
                         timeline_in=cur_t,
                         timeline_out=cur_t + dur,
+                        speed=speed,
                     )
                 )
             cur_t += dur
@@ -504,6 +588,9 @@ class PlayerWidget(QWidget):
         if not entries:
             return False
         self._mode = "timeline"
+        self._last_decoded_src_sec = None
+        self._last_active_clip_idx = -1
+        self._prewarmed_clip_idx = -1
         self.set_duration(cur_t)
         self.lbl_mode.setText("🎬 Master Timeline")
         self.lbl_mode.setStyleSheet(
@@ -511,48 +598,138 @@ class PlayerWidget(QWidget):
             "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
         )
         self._update_timecode_display()
-        self._render_current_frame()
+        self._render_current_frame(is_sequential=False)
         return True
 
     def switch_to_timeline_mode(self) -> bool:
         """Switch viewport preview to master timeline if clips are loaded."""
         if self._timeline_clips:
             self._mode = "timeline"
+            self._last_decoded_src_sec = None
+            self._last_active_clip_idx = -1
+            self._prewarmed_clip_idx = -1
             self.lbl_mode.setText("🎬 Master Timeline")
             self.lbl_mode.setStyleSheet(
                 "background: #022c22; color: #6ee7b7; border: 1px solid #10b981; "
                 "border-radius: 4px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
             )
-            self._render_current_frame()
+            self._render_current_frame(is_sequential=False)
             return True
         return False
 
-    def _render_current_frame(self) -> None:
+    def _find_timeline_entry(self, time_sec: float) -> tuple[int, TimelineClipEntry | None]:
+        """Find active TimelineClipEntry and its index for given timeline time."""
+        if not self._timeline_clips:
+            return -1, None
+
+        # Check current active index first for fast O(1) hit
+        if 0 <= self._last_active_clip_idx < len(self._timeline_clips):
+            entry = self._timeline_clips[self._last_active_clip_idx]
+            if entry.timeline_in <= time_sec < entry.timeline_out:
+                return self._last_active_clip_idx, entry
+
+        for idx, entry in enumerate(self._timeline_clips):
+            if entry.timeline_in <= time_sec < entry.timeline_out:
+                return idx, entry
+
+        # If at exact end of timeline
+        if time_sec >= self.duration and self._timeline_clips:
+            last_idx = len(self._timeline_clips) - 1
+            return last_idx, self._timeline_clips[last_idx]
+
+        # Return first clip if before start
+        if time_sec <= 0.0 and self._timeline_clips:
+            return 0, self._timeline_clips[0]
+
+        return -1, None
+
+    def _prewarm_next_clip(self, next_idx: int) -> None:
+        """Pre-seek the upcoming clip on master timeline before cut boundary."""
+        if self._prewarmed_clip_idx == next_idx:
+            return
+        if next_idx < 0 or next_idx >= len(self._timeline_clips):
+            return
+        next_entry = self._timeline_clips[next_idx]
+        cap = self._get_cap_for_file(next_entry.clip_path)
+        if cap is not None and cap.isOpened():
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, next_entry.source_in * 1000.0))
+            self._prewarmed_clip_idx = next_idx
+
+    def _fetch_frame_for_cap(
+        self,
+        cap: cv2.VideoCapture,
+        target_sec: float,
+        is_sequential: bool = False,
+    ) -> np.ndarray | None:
+        """Fetch frame from VideoCapture using optimal sequential or seek decoding strategy."""
+        dt = 1.0 / max(1.0, self.fps)
+        last_sec = self._last_decoded_src_sec
+
+        if is_sequential and last_sec is not None:
+            delta = target_sec - last_sec
+            # If target is within [0.0, 1.8 * dt]: exact next sequential frame
+            if 0.0 <= delta < 1.8 * dt:
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self._last_decoded_src_sec = target_sec
+                    return frame
+            # If target is slightly ahead [1.8 * dt, 4.0 * dt]: lag detected, fast-grab skip frame
+            elif 1.8 * dt <= delta < 4.0 * dt:
+                cap.grab()
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self._last_decoded_src_sec = target_sec
+                    return frame
+
+        # Otherwise (seek, jump, reverse shuttle, or large drift): perform POS_MSEC seek
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, target_sec * 1000.0))
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            self._last_decoded_src_sec = target_sec
+            return frame
+        return None
+
+    def _render_current_frame(self, is_sequential: bool = False) -> None:
         """Render frame corresponding to current_time in active mode."""
         if self._mode == "source":
             if self._source_cap is not None and self._source_cap.isOpened():
                 target_sec = self._source_in + self.current_time
-                self._source_cap.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000.0)
-                ret, frame = self._source_cap.read()
-                if ret and frame is not None:
+                frame = self._fetch_frame_for_cap(
+                    self._source_cap,
+                    target_sec,
+                    is_sequential=is_sequential,
+                )
+                if frame is not None:
                     pixmap = cv_frame_to_pixmap(frame)
                     self.canvas.set_frame_pixmap(pixmap)
                     return
         elif self._mode == "timeline":
             if self._timeline_clips:
-                active_entry: TimelineClipEntry | None = None
-                for entry in self._timeline_clips:
-                    if entry.timeline_in <= self.current_time <= entry.timeline_out:
-                        active_entry = entry
-                        break
+                clip_idx, active_entry = self._find_timeline_entry(self.current_time)
                 if active_entry is not None:
-                    offset = self.current_time - active_entry.timeline_in
-                    src_sec = active_entry.source_in + offset
+                    # Pre-roll next clip if approaching cut boundary (< 0.5s left)
+                    rem_sec = active_entry.timeline_out - self.current_time
+                    if rem_sec <= 0.5 and (clip_idx + 1) < len(self._timeline_clips):
+                        self._prewarm_next_clip(clip_idx + 1)
+
+                    speed = active_entry.speed if active_entry.speed > 0 else 1.0
+                    offset = (self.current_time - active_entry.timeline_in) * speed
+                    target_src_sec = active_entry.source_in + offset
                     cap = self._get_cap_for_file(active_entry.clip_path)
                     if cap is not None and cap.isOpened():
-                        cap.set(cv2.CAP_PROP_POS_MSEC, src_sec * 1000.0)
-                        ret, frame = cap.read()
-                        if ret and frame is not None:
+                        same_clip = (clip_idx == self._last_active_clip_idx)
+                        seq = is_sequential and same_clip
+                        # If switching clips and prewarmed at boundary start, can read directly
+                        if not same_clip and self._prewarmed_clip_idx == clip_idx and offset < (1.5 / self.fps):
+                            seq = True
+                            self._last_decoded_src_sec = active_entry.source_in
+                        frame = self._fetch_frame_for_cap(
+                            cap,
+                            target_src_sec,
+                            is_sequential=seq,
+                        )
+                        self._last_active_clip_idx = clip_idx
+                        if frame is not None:
                             pixmap = cv_frame_to_pixmap(frame)
                             self.canvas.set_frame_pixmap(pixmap)
                             return
@@ -569,7 +746,7 @@ class PlayerWidget(QWidget):
     def set_fps(self, fps: float) -> None:
         """Update monitor framerate."""
         self.fps = max(1.0, fps)
-        self._timer.setInterval(int(1000.0 / self.fps))
+        self._timer.setInterval(max(5, int(1000.0 / self.fps)))
         self._update_timecode_display()
 
     def set_time(self, time_sec: float) -> None:
@@ -577,15 +754,25 @@ class PlayerWidget(QWidget):
         clamped = max(0.0, min(self.duration, time_sec))
         if abs(clamped - self.current_time) > 1e-4:
             self.current_time = clamped
+            if self.is_playing:
+                self._play_start_wall_time = time.perf_counter()
+                self._play_start_media_time = clamped
+            self._last_decoded_src_sec = None
+            self._prewarmed_clip_idx = -1
             self._update_timecode_display()
-            self._render_current_frame()
+            self._render_current_frame(is_sequential=False)
 
     def seek_time(self, time_sec: float) -> None:
         """Seek playhead and emit time_changed signal."""
         clamped = max(0.0, min(self.duration, time_sec))
         self.current_time = clamped
+        if self.is_playing:
+            self._play_start_wall_time = time.perf_counter()
+            self._play_start_media_time = clamped
+        self._last_decoded_src_sec = None
+        self._prewarmed_clip_idx = -1
         self._update_timecode_display()
-        self._render_current_frame()
+        self._render_current_frame(is_sequential=False)
         self.time_changed.emit(self.current_time)
 
     def seek_to_start(self) -> None:
@@ -617,20 +804,32 @@ class PlayerWidget(QWidget):
             self.lbl_rate.setStyleSheet(
                 "background: #0284c7; color: #ffffff; border-radius: 4px; padding: 2px 6px; font-weight: bold;"
             )
-            if not self.is_playing:
+            if self.is_playing:
+                self._play_start_wall_time = time.perf_counter()
+                self._play_start_media_time = self.current_time
+            else:
                 self.play()
 
     def play(self) -> None:
-        """Start playback simulation."""
+        """Start real-time playback synchronization."""
+        if self.current_time >= self.duration:
+            self.current_time = 0.0
         self.is_playing = True
+        self.canvas.is_playing = True
         self.btn_play_pause.setText("⏸")
+        self._play_start_wall_time = time.perf_counter()
+        self._play_start_media_time = self.current_time
+        self._last_decoded_src_sec = None
+        self._prewarmed_clip_idx = -1
         self._timer.start()
 
     def stop(self) -> None:
         """Pause playback simulation."""
         self.is_playing = False
+        self.canvas.is_playing = False
         self.btn_play_pause.setText("▶")
         self._timer.stop()
+        self._last_decoded_src_sec = None
 
     def toggle_play_pause(self) -> None:
         """Toggle between play and pause states."""
@@ -648,18 +847,32 @@ class PlayerWidget(QWidget):
 
     @Slot()
     def _on_playback_tick(self) -> None:
-        """Advance playhead during playback according to active shuttle multiplier."""
-        delta = (1.0 / self.fps) * self.shuttle_rate
-        new_time = self.current_time + delta
-        if new_time >= self.duration:
-            new_time = self.duration
+        """Advance playhead during playback according to wall-clock time and shuttle multiplier."""
+        if not self.is_playing:
+            return
+
+        now = time.perf_counter()
+        wall_elapsed = now - self._play_start_wall_time
+        target_time = self._play_start_media_time + (wall_elapsed * self.shuttle_rate)
+
+        if target_time >= self.duration:
+            self.current_time = self.duration
             self.stop()
-        elif new_time <= 0.0:
-            new_time = 0.0
+            self._update_timecode_display()
+            self._render_current_frame(is_sequential=False)
+            self.time_changed.emit(self.current_time)
+            return
+        elif target_time <= 0.0:
+            self.current_time = 0.0
             self.stop()
-        self.current_time = new_time
+            self._update_timecode_display()
+            self._render_current_frame(is_sequential=False)
+            self.time_changed.emit(self.current_time)
+            return
+
+        self.current_time = target_time
         self._update_timecode_display()
-        self._render_current_frame()
+        self._render_current_frame(is_sequential=(abs(self.shuttle_rate - 1.0) < 0.05))
         self.time_changed.emit(self.current_time)
 
     @Slot(int)
@@ -720,4 +933,7 @@ class PlayerWidget(QWidget):
                 pass
         self._caps_cache.clear()
         self._source_cap = None
+        self._last_decoded_src_sec = None
+        self._last_active_clip_idx = -1
+        self._prewarmed_clip_idx = -1
         return super().close()

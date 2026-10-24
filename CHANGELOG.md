@@ -1,3 +1,62 @@
+## [Unreleased]
+
+### Summary of this push (2026-10-24): Studio v3 engine service + NVIDIA CUDA torch
+
+- **NVIDIA GPU acceleration:**
+  - torch and torchvision now come from the PyTorch CUDA 12.6 index on Windows and Linux. macOS keeps PyPI, which uses MPS.
+  - The MobileNetV3 aesthetic scorer runs on the RTX GPU: 64 frames in about 0.1 s once warm.
+  - faster-whisper runs on CUDA as well, using the cuBLAS 12 / cuDNN 9 libraries bundled with torch.
+  - The previous venv had a CPU-only torch, so AI scoring silently fell back to OpenCV.
+- **Engine service for TeamTrau Studio:**
+  - platform_caps: the encoder ladder per OS.
+  - Production proxy generator.
+  - FreeCut project writer and reader.
+  - Content-hashed all-intra render cache. Segments are video-only and carry per-item signatures for Studio playback substitution.
+  - Loopback job API: `main.py serve` with bearer token, SSE events, cancel and job eviction.
+- **Auto-curation v2:**
+  - Mode B role folders, the content role classifier and golden windows.
+  - NLE pre-flight, MCP macro-tools and `main.py curate`.
+  - Review polish.
+- **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
+
+- build(deps): CUDA 12.6 torch/torchvision via uv index (Windows/Linux); faster-whisper on GPU
+- fix(render-cache): strip audio only for the built-in renderer, not by sniffing test fakes
+- feat(render-cache): studio manifest item signatures, workspace cache dir, video-only segments
+- refactor(engine): phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
+- refactor(curation): review polish (batch classify, export guard, top_n clamp, docs)
+- feat(engine-api): loopback job service (auth, SSE events, cancel) + main.py serve
+- feat(render-cache): content-hashed all-intra segment cache + intra_only renderer option
+- feat(integrations): FreeCut project reader (V1 timeline, gaps, schema guard)
+- feat(integrations): production FreeCut writer (atomic, source links, proxy adoption)
+- feat(proxy): production proxy generator (heuristics, caps-driven encoder fallback, atomic output)
+- feat(platform): platform_caps (OS, encoders, hwaccels, torch, Resolve paths)
+- chore: start studio v3 phase 1 (branch, spec, plan, baseline)
+- feat(cli): main.py curate + auto-curation E2E; docs rev 2.4.0
+- feat(mcp): curate_footage / assemble_cadence_timeline / export_nle_project macro-tools
+- feat(deliver): NLE pre-flight report (media, VFR, fps, audio layout, URI round trip)
+- feat(curation): roles and golden windows in the rough-cut stage
+- feat(curation): genre-aware golden window selection
+- fix(curation): report missing face detector; timeout classifier audio decode
+- feat(curation): content role classifier (A-roll / B-roll / ambient)
+- fix(ui): media browser follows A-roll/B-roll/Music folder rules
+- feat(ingest): A-roll/B-roll/Music role folders (Mode B)
+- chore: start auto-curation v2 (branch, superseded v1 plan, task list)
+
+---
+
+## Phase 24: Auto-Curation & Selects Stringout v2 (Release 2.4.0)
+- **Mode B Ingestion** (`ontology.py`, `service.py`): Ingests footage from `A-roll/`, `B-roll/`, and `Music/` role subfolders (case-insensitive, punctuation-stripped).
+- **Media Browser** (`media_browser.py`): Adheres to Mode B role folder hierarchy and rules.
+- **Content Role Classifier** (`content_classifier.py`): Ultra-fast audio VAD energy ratio classifier (<0.3s/clip) detecting speech/talking-head vs visual B-roll; audio decode timeout protection and safe face detector fallback.
+- **Golden Window Selection** (`golden_curator.py`): Sliding-window 4Hz quality curve scoring; window size clamped to genre `golden_window_max_sec`.
+- **Rough-Cut Pipeline Integration** (`rough_cut_cleaner.py`, `service.py`): Excises defect segments (shake, whip pan, defocus, occlusion, bad exposure); preserves complete speech span for A-roll and isolates optimal golden windows for B-roll.
+- **NLE Preflight Report** (`nle_preflight.py`): Verifies file availability, CFR/VFR status, framerate consistency, audio sample rate, and RFC 3986 URI round-trip integrity.
+- **Curation Core & FastMCP Macro-Tools** (`curation.py`, `mcp_server.py`): `curate_footage`, `assemble_cadence_timeline`, and `export_nle_project` tools strictly bounded to $\le 2000$ characters JSON token budget (~500 tokens).
+- **CLI Curate** (`main.py curate`): Autonomous rough-cut curation and NLE selects export (`--export`) writing UTF-8 `curation_summary.json`.
+- **E2E Integration** (`test_auto_curation_e2e.py`): Verifies end-to-end pipeline on real ffmpeg media (A-roll talking clip, B-roll scenic clip, Music click track) through DaVinci Resolve FCPXML 1.8, Premiere XML, and CapCut Desktop draft.
+
+---
+
 ## Commits 46978b3..3838675 (Phase 22-23)
 Grouped by feature. Commit hashes in parentheses.
 

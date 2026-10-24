@@ -294,6 +294,10 @@ class PipelineConfig(BaseModel):
     extended_shot_threshold_sec: float = Field(default=12.0)
     max_scene_len_sec: float = Field(default=16.0)
     allow_multi_segment_for_long_shots: bool = Field(default=True)
+    golden_window_min_sec: float = Field(default=3.0)
+    golden_window_max_sec: float = Field(default=8.0)
+    auto_classify_roles: bool = Field(default=True)
+    enable_golden_windows: bool = Field(default=True)
 
     # Visual Scoring Constants
     sharpness_weight: float = Field(default=0.5)

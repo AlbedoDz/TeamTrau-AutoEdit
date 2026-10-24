@@ -232,4 +232,48 @@ Trên nhánh `feature/memory-harness-upgrade`, dự án đã được tích hợ
 *   Chạy kiểm thử: `uv run pytest tests/test_memory_harness.py`
 *   Xem hướng dẫn chi tiết tiếng Việt tại: [huong_dan_memory_upgrade.md](file:///C:/Users/firef/Documents/antigravity/joyful-babbage/docs/huong_dan_memory_upgrade.md)
 
+---
+
+## 🎬 9. Auto-curation (rough cut selects) / Tự Động Chọn Lọc & Sàng Lọc Thô
+
+### Summary (English)
+The Auto-Curation pipeline (v2.4.0) provides automated footage classification (A-roll speech vs. B-roll visuals vs. Music), defect excision (camera shake, whip pans, defocus, under/over-exposure), genre-aware golden window selection, NLE pre-flight integrity verification, and non-destructive selects export to DaVinci Resolve (FCPXML 1.8), Adobe Premiere Pro (XML), and CapCut Desktop draft via Click CLI (`main.py curate`), FastMCP macro-tools, or Python API.
+
+### 1. Phân loại cấu trúc thư mục (Mode B Ingestion)
+Hệ thống tự động phát hiện vai trò của cảnh quay dựa vào cấu trúc thư mục (không phân biệt chữ hoa/thường, tự động loại bỏ gạch nối, gạch dưới và khoảng trắng):
+*   **`A-roll/`** (hoặc `aroll`, `A_roll`): Chứa các video phỏng vấn, vlog nói chuyện trước ống kính (talking-head). Hệ thống tự động ưu tiên bảo toàn trường thoại liên tục, không cắt vụn câu nói.
+*   **`B-roll/`** (hoặc `broll`, `B_roll`): Chứa các cảnh quay minh họa, phong cảnh, hoạt động cận cảnh. Hệ thống áp dụng thuật toán đường cong chất lượng 4 Hz để trích xuất "cửa sổ vàng" (golden window) đẹp nhất.
+*   **`Music/`**: Chứa bài nhạc nền (.mp3, .wav, .flac). Tự động phân tích nhịp BPM, lưới phách 4/4 và các đoạn cấu trúc (Intro, Buildup, Drop, Outro).
+
+### 2. Sử dụng CLI `main.py curate`
+Lệnh CLI cho phép chạy độc lập quy trình chọn lọc và xuất file dự án:
+```powershell
+.venv\Scripts\python.exe main.py curate --input-dir "path/to/footage" --genre travel_daily_vlog --output-dir "./output" --top 12 --export
+```
+*   `--input-dir` (`-i`): Thư mục chứa footage gốc (hỗ trợ phân nhánh A-roll / B-roll / Music).
+*   `--genre` (`-g`): Preset thể loại định hình tiết tấu (ví dụ: `travel_daily_vlog`, `travel_cinematic`, `sports_extreme`, `social_tiktok_fast`).
+*   `--output-dir` (`-o`): Thư mục lưu kết quả tóm tắt và dự án xuất (mặc định: `./output`).
+*   `--top`: Số lượng take chất lượng cao nhất liệt kê trong bảng tóm tắt (mặc định: 12).
+*   `--export / --no-export`: Tự động xuất chuỗi selects sang FCPXML, Premiere XML và CapCut draft.
+*   Đầu ra tạo file `<output-dir>/curation_summary.json` được định dạng chuẩn hóa $\le 2000$ ký tự.
+
+### 3. Bộ 3 FastMCP Macro-Tools
+Dành cho tích hợp AI Agent qua giao thức MCP với ngân sách token tối ưu (<500 tokens/lần gọi):
+1.  **`curate_footage(input_dir, genre=None, top_n=12)`**: Thực hiện lọc lỗi và chấm điểm, trả về session ID và bảng tóm tắt các take phân theo vai trò (`A01`, `B01`, ...).
+2.  **`assemble_cadence_timeline(session_id, selected_shot_ids=None, soundtrack_path=None, cadence_style=None)`**: Lắp ráp sequence timeline đồng bộ nhịp nhạc từ các shot được chọn.
+3.  **`export_nle_project(session_id, output_dir, targets=None, render_preview=False)`**: Xuất file project tương thích NLE (FCPXML 1.8, Premiere XML, CapCut draft) và video preview 540p.
+
+### 4. 10 Quyết định Thiết kế Cốt lõi (Decisions D1 - D10)
+*   **D1 (Đường dẫn URI RFC 3986):** Giữ nguyên chuẩn `Path.as_uri()`, đảm bảo tính toàn vẹn 100% khi ánh xạ 2 chiều đường dẫn tiếng Việt có dấu giữa file system và NLE XML.
+*   **D2 (Tần số lấy mẫu 48 kHz):** Chuẩn hóa âm thanh NLE 48 kHz; hệ thống pre-flight sẽ cảnh báo nếu file nguồn lệch tần số mà không ghi đè phá hủy dữ liệu.
+*   **D3 (Biên tập phi phá hủy - Non-destructive):** Không cắt xén file vật lý bằng re-encode GOP; giữ nguyên file media gốc kèm mốc thời gian In/Out chính xác.
+*   **D4 (Phạm vi kiến trúc):** Tránh phụ thuộc bên ngoài chưa ổn định (FreeCut server); tập trung vào độ tin cậy tuyệt đối của timeline NLE.
+*   **D5 (Proxy độc lập):** Tách biệt xử lý proxy hiển thị GUI và pipeline chọn lọc thô để tối ưu tốc độ xử lý hàng loạt.
+*   **D6 (Nhận diện A-roll linh hoạt):** Đoạn video có thoại chiếm ưu thế luôn là A-roll kể cả khi không thấy khuôn mặt (thoại ngoài khung hình / vlog cầm tay).
+*   **D7 (MCP Tools đồng bộ):** Công cụ MCP viết dạng hàm đồng bộ trang trí bằng `@mcp_server.tool()`, đảm bảo tương thích ổn định với runtime hiện tại.
+*   **D8 (Ngân sách Token $\le 2000$ ký tự):** JSON tóm tắt curation luôn được khống chế $\le 2000$ ký tự (~500 tokens) bất kể số lượng footage nạp vào.
+*   **D9 (Kiến trúc một nguồn chân lý):** Mọi giao diện (CLI, GUI, MCP) đều đi qua lớp điều phối chung `StudioBackendAdapter` và `src.core.curation`.
+*   **D10 (Cửa sổ vàng chọn lọc):** Thuật toán golden window chỉ áp dụng cho B-roll/ambient; A-roll luôn giữ nguyên dải câu nói hoàn chỉnh sau khi trừ phần lỗi.
+
+
 

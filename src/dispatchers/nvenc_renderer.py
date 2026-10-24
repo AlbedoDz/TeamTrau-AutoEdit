@@ -324,7 +324,15 @@ def plan_units(segments: Sequence[EditClip], fps: Fraction) -> list[_Unit]:
 class NvencRenderer:
     """Builds per-segment filter graphs and renders headless video via FFmpeg NVENC."""
 
-    def __init__(self, config: PipelineConfig, settings: DeliverSettings | None = None) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        settings: DeliverSettings | None = None,
+        intra_only: bool = False,
+    ) -> None:
+        if intra_only and (settings is None or settings.master != "h264"):
+            raise ValueError("intra_only requires DeliverSettings with master='h264'")
+        self.intra_only = intra_only
         self.config = config
         self.nvenc_available = check_nvenc_available()
         self.settings = settings
@@ -473,15 +481,21 @@ class NvencRenderer:
         pix = "yuv420p10le" if (ten_bit and master == "hevc") else "yuv420p"
         if master == "h264":
             if use_nvenc:
-                return "h264_nvenc", [
+                nv_args = [
                     "-c:v", "h264_nvenc", "-preset", cfg.nvenc_preset, "-profile:v", "high",
                     "-cq", str(cfg.nvenc_cq), "-b:v", cfg.nvenc_bitrate, "-maxrate", cfg.nvenc_maxrate,
                     "-bufsize", cfg.nvenc_bufsize, "-pix_fmt", pix, *tags,
                 ]
-            return "libx264", [
+                if self.intra_only:
+                    nv_args += ["-g", "0", "-bf", "0"]
+                return "h264_nvenc", nv_args
+            cpu_args = [
                 "-c:v", "libx264", "-preset", cfg.cpu_encoder_preset, "-crf", str(cfg.nvenc_cq),
                 "-pix_fmt", pix, *tags,
             ]
+            if self.intra_only:
+                cpu_args += ["-g", "1", "-bf", "0"]
+            return "libx264", cpu_args
         # hevc
         if use_nvenc:
             return "hevc_nvenc", [
@@ -870,12 +884,16 @@ class NvencRenderer:
         return proc.returncode, stderr or ""
 
     def _derive(self, settings: DeliverSettings | None, **config_updates: Any) -> "NvencRenderer":
-        """A renderer sharing this one's NVENC probe, with ``settings`` and config overrides applied."""
+        """A renderer sharing this one's NVENC probe, with ``settings`` and config overrides applied.
+
+        If ``settings`` is None, the receiver's settings are kept.
+        """
         cfg = self.config.model_copy(update=config_updates) if config_updates else self.config
         other = NvencRenderer.__new__(NvencRenderer)
         other.config = cfg
         other.nvenc_available = self.nvenc_available
-        other.settings = settings
+        other.settings = settings if settings is not None else self.settings
+        other.intra_only = self.intra_only if (other.settings is not None and other.settings.master == "h264") else False
         other._passthrough_ten_bit = False
         other._passthrough_info = None
         return other

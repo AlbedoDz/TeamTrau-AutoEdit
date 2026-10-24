@@ -11,6 +11,7 @@ import json
 import logging
 import shutil
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ from src.core.config import (
     check_cuda_available,
     check_nvenc_available,
 )
+from src.core.curation import (
+    CurationSession,
+    assemble_sequence,
+    export_session,
+    run_curation,
+)
 from src.core.service import StudioBackendAdapter
 
 logger = logging.getLogger(__name__)
@@ -30,6 +37,9 @@ logger = logging.getLogger(__name__)
 # Initialize central MCP server and backend adapter
 mcp_server = MCPServer("teamtrau-autoedit")
 adapter = StudioBackendAdapter()
+
+MAX_SESSIONS: int = 8
+_SESSIONS: OrderedDict[str, CurationSession] = OrderedDict()
 
 
 # =============================================================================
@@ -1301,6 +1311,86 @@ def generate_mcp_config(
     if client_name in configs:
         return {"client": client_name, "config": configs[client_name]}
     return {"clients": configs}
+
+
+# =============================================================================
+# 6b. Auto-Curation Macro-Tools
+# =============================================================================
+
+
+@mcp_server.tool()
+def curate_footage(
+    input_dir: str,
+    genre: str | None = None,
+    top_n: int = 12,
+) -> dict[str, Any]:
+    """Execute non-destructive auto-curation and defect pruning on raw footage.
+
+    Runs rough-cut curation via StudioBackendAdapter and returns a compact summary
+    bounded within 2000 characters.
+    """
+    cfg = PipelineConfig()
+    output_dir = Path(cfg.cache_dir) / "curation"
+    clamped_top_n = max(1, min(20, int(top_n)))
+    session, summary = run_curation(
+        adapter=adapter,
+        input_dir=Path(input_dir),
+        genre=genre,
+        output_dir=output_dir,
+        top_n=clamped_top_n,
+    )
+    _SESSIONS[session.session_id] = session
+    while len(_SESSIONS) > MAX_SESSIONS:
+        _SESSIONS.popitem(last=False)
+    return summary
+
+
+@mcp_server.tool()
+def assemble_cadence_timeline(
+    session_id: str,
+    selected_shot_ids: list[str] | None = None,
+    soundtrack_path: str | None = None,
+    cadence_style: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a musical cadence timeline from curated shots and soundtrack.
+
+    Requires an active curation session.
+    """
+    if session_id not in _SESSIONS:
+        raise ValueError(f"Unknown session '{session_id}'")
+    session = _SESSIONS[session_id]
+    soundtrack = Path(soundtrack_path) if soundtrack_path else None
+    return assemble_sequence(
+        adapter=adapter,
+        session=session,
+        soundtrack=soundtrack,
+        selected_ids=selected_shot_ids,
+        cadence=cadence_style,
+    )
+
+
+@mcp_server.tool()
+def export_nle_project(
+    session_id: str,
+    output_dir: str,
+    targets: list[str] | None = None,
+    render_preview: bool = False,
+) -> dict[str, Any]:
+    """Export curated rough cut or assembled sequence to NLE interchange formats.
+
+    Requires an active curation session.
+    """
+    if session_id not in _SESSIONS:
+        raise ValueError(f"Unknown session '{session_id}'")
+    session = _SESSIONS[session_id]
+    target_iter = targets if targets is not None else ("fcpxml", "premiere", "capcut")
+    return export_session(
+        adapter=adapter,
+        session=session,
+        output_dir=Path(output_dir),
+        targets=target_iter,
+        render_preview=render_preview,
+    )
 
 
 # =============================================================================

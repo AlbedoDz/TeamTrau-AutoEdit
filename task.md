@@ -273,4 +273,65 @@
   - [ ] Pending: Step 3 (Premiere xmeml schema) and Step 5 (CapCut) need user reference files in references/; `watermark_in_nle` and subtitle sidecars from GUI/CLI (no stored transcripts) are not applied yet.
 - [x] Phase 23 Part A (cadence engine): bar/phrase grid + cadence cuts (frame-snapped, seeded variety), 23 genre profiles, long-shot sub-windows (4 Hz quality curves), slot sizing by scene, variants by profile, teaser kept to teaser_duration. Real 8x DJI 4K run: master shots 0.5-8 s (sd 2.79 s), no held frames, no repeated in-points, snap error 7.9 ms; cinematic up to 16 s shots.
 - [x] Phase 23 Part B (staged workflow): `submit_job(stage=rough_cut|sequence|all)`, cached rough cut (60 s clip 19.2 s -> 0.02 s), golden scenes re-scored, sequence from saved scenes without re-ingest, project 2.3.0 (pipeline_stage + real beats/bar grid), CLI/MCP --stage; GUI: 4-step stepper, 3 action buttons + pruning checkbox, Genre/Cadence/long-shot controls, auto-switch to Scene Review after rough cut, badges (Golden/Trimmed/Long Shot/Excluded), pill icons, bar/phrase ruler + downbeat-lock badge, per-stage cancel, UI state persistence. 976 tests pass; real offscreen GUI run verified (rough cut 6.4 s, sequence re-edit 1.1 s).
-  - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
+- [x] Phase 23 Part C (Real-Time Viewport Playback Engine - RTVPE):
+  - [x] SIMD-accelerated downsample in `cv_frame_to_pixmap` with `cv2.INTER_AREA` to max viewport bounds, reducing RAM churn by 90% (25MB down to ~1.5MB per frame).
+  - [x] Pre-scaled pixmap caching and bounding target rectangle caching in `MonitorCanvas._update_cached_scaled` for 0ms CPU scaling during `paintEvent`.
+  - [x] Sequential `cap.read()` playback with micro-lag `cap.grab()` recovery, eliminating 30ms-per-frame `cap.set()` seeks during 1.0x playback.
+  - [x] Master timeline clip pre-roll / pre-seek (`_prewarm_next_clip`) at cut boundaries (<0.5s before cut), ensuring 0ms cut transition stutter.
+  - [x] `time.perf_counter()` wall-clock synchronization with drift-free shuttle multiplier controls (J-K-L).
+  - [x] Optimized `TimelineCanvas.set_playhead` with dirty-rect invalidation (24px needle slice instead of full canvas repaint), dropping UI thread CPU usage during playback to <0.5%.
+  - [x] Created `tests/test_realtime_playback.py` (5/5 passing).
+  - [x] Fixed `PreferencesDialog` config precedence in `settings_dialog.py`.
+  - [x] Full regression suite verified: 981/981 tests passing (0 failures), 0 ruff errors.
+- [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
+- [x] Spike S0.4: Smooth playback across cuts
+  - [x] Baseline measurements across T1 (12 cuts @ 60fps), T2 (30 cuts @ 60fps), T3 (12 cuts @ 120fps).
+  - [x] FreeCut fix prototype (`spike/s0-cuts` in Studio): pre-mounted in-point seek, visibility/z-order flip, bounded overflow pool.
+  - [x] Vitest test suite 100% green (176 files, 1363 tests passed).
+  - [x] Engine render-preview prototype (`scripts/spike_s04_render_preview.py`): 4.17× real-time NVENC continuous intra render, 0.67% dropped frames, 0.0ms cut stall.
+  - [x] Reports and handoff: `docs/spikes/S0.4-cuts.md` (both repos), `docs/superpowers/handoffs/HANDOFF_S0.4.md`.
+- [x] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
+  - [x] Task 0: Hygiene & baseline (no production code)
+  - [x] Task 1: Role folders (Mode B ingestion)
+  - [x] Task 1b: Media Browser follows Mode B folder rules
+  - [x] Task 2: Content role classifier
+  - [x] Task 2-fix: face detector availability + audio timeout
+  - [x] Task 3: Golden window selection
+  - [x] Task 4: Wire roles and golden windows into the rough-cut stage
+  - [x] Task 5: NLE pre-flight report
+  - [x] Task 6: Curation core & MCP tools
+  - [x] Task 7: CLI, E2E verification & release
+  - [x] Task 8: review polish
+- [ ] Milestone B: Post-v2 Auto-Curation Enhancements
+  - [ ] B1: NVENC playback proxies (short-GOP, cache key path+size+mtime, CPU fallback)
+  - [ ] B2: "Export selects" with `-c copy`, keyframe-snapped in/out
+  - [ ] B3: GOP smart-cut (re-encode head/tail only)
+  - [ ] B4: HFR (>= 100 fps) conform: B-roll slow-mo, A-roll real time (voice-safety guard)
+  - [ ] B5: A-roll sentence snapping (use `TranscriptionEngine` sentences)
+  - [ ] B6: GUI: role colours in the selects canvas + one-click role override
+  - [ ] B7: Multi-channel camera audio (cleanest-SNR channel for A-roll, all channels in NLE XML)
+  - [ ] B8: Corrupted media guard (hard probe/decode timeout + quarantine list)
+  - [ ] B9: Cache size cap / LRU
+  - [ ] B10: Real face / subject presence for the classifier (YOLO person detector or YuNet)
+- [x] Phase 25: TeamTrau Studio v3 — Phase 1 engine (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase1.md`)
+  - [x] P1.0: Hygiene & baseline (no production code)
+  - [x] P1.1: Platform capabilities (`src/core/platform_caps.py`)
+  - [x] P1.2: Production proxy generator (`src/modules/proxy_generator.py`)
+  - [x] P1.3: Production FreeCut writer (`src/integrations/freecut_writer.py`)
+  - [x] P1.4: FreeCut reader (`src/integrations/freecut_reader.py`)
+  - [x] P1.5: Render cache (`src/modules/render_cache.py`) + intra-only renderer option
+  - [x] P1.6: Engine API service (`src/engine_api/`) + `main.py serve`
+  - [x] P1.7: Phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
+- [/] Phase 26: TeamTrau Studio v3 — Phase 2 Studio Shell & Phase 4 Render-Cache Playback (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase2-4.md`)
+  - [x] P2.0: Studio hygiene (`NOTICE`, electron scripts, baseline metrics)
+  - [x] P2.1: Static server with engine proxy (`electron/static-server.cjs`)
+  - [x] P2.2: Engine sidecar lifecycle (`electron/engine-sidecar.cjs`)
+  - [x] P2.3: Shell integration: workspace bridge, preload, engine client (`electron/workspace-registry.cjs`, `electron/preload.cjs`, `src/features/teamtrau/engine/*`)
+  - [x] P2.4: Offline-safe shell assets and product name
+  - [x] P2.5: Vietnamese locale (`src/i18n/locales/vi.json`)
+  - [x] P4.0: Render cache for Studio (`src/modules/render_cache.py`, `src/engine_api/runners.py`)
+  - [x] P4.1: Playback substitution pure function (`src/features/teamtrau/render-cache/substitute.ts`)
+  - [ ] P4.2: Composition model segment substitution
+  - [ ] P4.3: Playback meter & benchmark
+
+
