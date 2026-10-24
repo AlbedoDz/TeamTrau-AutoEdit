@@ -23,7 +23,21 @@ dependencies = [
     "openai>=1.0.0",
     "mcp>=2.0.0",
     "pyside6>=6.7.0",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
 ]
+
+# NVIDIA GPUs: take torch/torchvision CUDA 12.6 builds on Windows and Linux (PyPI ships
+# CPU-only Windows wheels). cu126 bundles cuBLAS 12 / cuDNN 9, which faster-whisper's
+# ctranslate2 also loads once torch is imported. macOS keeps the PyPI build (MPS).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
 
 [build-system]
 requires = ["setuptools>=61.0"]

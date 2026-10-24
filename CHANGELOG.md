@@ -1,4 +1,26 @@
 ## [Unreleased]
+
+### Summary of this push (2026-10-24): Studio v3 engine service + NVIDIA CUDA torch
+
+- **NVIDIA GPU acceleration:**
+  - torch and torchvision now come from the PyTorch CUDA 12.6 index on Windows and Linux. macOS keeps PyPI, which uses MPS.
+  - The MobileNetV3 aesthetic scorer runs on the RTX GPU: 64 frames in about 0.1 s once warm.
+  - faster-whisper runs on CUDA as well, using the cuBLAS 12 / cuDNN 9 libraries bundled with torch.
+  - The previous venv had a CPU-only torch, so AI scoring silently fell back to OpenCV.
+- **Engine service for TeamTrau Studio:**
+  - platform_caps: the encoder ladder per OS.
+  - Production proxy generator.
+  - FreeCut project writer and reader.
+  - Content-hashed all-intra render cache. Segments are video-only and carry per-item signatures for Studio playback substitution.
+  - Loopback job API: `main.py serve` with bearer token, SSE events, cancel and job eviction.
+- **Auto-curation v2:**
+  - Mode B role folders, the content role classifier and golden windows.
+  - NLE pre-flight, MCP macro-tools and `main.py curate`.
+  - Review polish.
+- **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
+
+- build(deps): CUDA 12.6 torch/torchvision via uv index (Windows/Linux); faster-whisper on GPU
+- fix(render-cache): strip audio only for the built-in renderer, not by sniffing test fakes
 - feat(render-cache): studio manifest item signatures, workspace cache dir, video-only segments
 - refactor(engine): phase 1 review polish (probe guards, reader errors, token checks, job eviction, torch device)
 - refactor(curation): review polish (batch classify, export guard, top_n clamp, docs)
