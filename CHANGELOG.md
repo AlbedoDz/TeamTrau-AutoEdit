@@ -1,4 +1,5 @@
 ## [Unreleased]
+- chore: start studio v3 phase 1 (branch, spec, plan, baseline)
 - feat(cli): main.py curate + auto-curation E2E; docs rev 2.4.0
 - feat(mcp): curate_footage / assemble_cadence_timeline / export_nle_project macro-tools
 - feat(deliver): NLE pre-flight report (media, VFR, fps, audio layout, URI round trip)

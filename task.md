@@ -284,6 +284,12 @@
   - [x] Fixed `PreferencesDialog` config precedence in `settings_dialog.py`.
   - [x] Full regression suite verified: 981/981 tests passing (0 failures), 0 ruff errors.
 - [ ] Known: old projects load with pruning checkbox off / genre Auto; Trimmed badge only unit-tested (no real defects in synthetic footage); Step 3 (Premiere) and 5 (CapCut) still need reference files.
+- [x] Spike S0.4: Smooth playback across cuts
+  - [x] Baseline measurements across T1 (12 cuts @ 60fps), T2 (30 cuts @ 60fps), T3 (12 cuts @ 120fps).
+  - [x] FreeCut fix prototype (`spike/s0-cuts` in Studio): pre-mounted in-point seek, visibility/z-order flip, bounded overflow pool.
+  - [x] Vitest test suite 100% green (176 files, 1363 tests passed).
+  - [x] Engine render-preview prototype (`scripts/spike_s04_render_preview.py`): 4.17× real-time NVENC continuous intra render, 0.67% dropped frames, 0.0ms cut stall.
+  - [x] Reports and handoff: `docs/spikes/S0.4-cuts.md` (both repos), `docs/superpowers/handoffs/HANDOFF_S0.4.md`.
 - [x] Phase 24: Auto-Curation & Selects Stringout v2 (`docs/superpowers/plans/2026-10-23-auto-curation-v2.md`)
   - [x] Task 0: Hygiene & baseline (no production code)
   - [x] Task 1: Role folders (Mode B ingestion)
@@ -306,3 +312,12 @@
   - [ ] B8: Corrupted media guard (hard probe/decode timeout + quarantine list)
   - [ ] B9: Cache size cap / LRU
   - [ ] B10: Real face / subject presence for the classifier (YOLO person detector or YuNet)
+- [ ] Phase 25: TeamTrau Studio v3 — Phase 1 engine (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase1.md`)
+  - [x] P1.0: Hygiene & baseline (no production code)
+  - [ ] P1.1: Platform capabilities (`src/core/platform_caps.py`)
+  - [ ] P1.2: Production proxy generator (`src/modules/proxy_generator.py`)
+  - [ ] P1.3: Production FreeCut writer (`src/integrations/freecut_writer.py`)
+  - [ ] P1.4: FreeCut reader (`src/integrations/freecut_reader.py`)
+  - [ ] P1.5: Render cache (`src/modules/render_cache.py`) + intra-only renderer option
+  - [ ] P1.6: Engine API service (`src/engine_api/`) + `main.py serve`
+
