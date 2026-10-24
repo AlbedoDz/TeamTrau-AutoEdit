@@ -315,7 +315,7 @@
 - [ ] Phase 25: TeamTrau Studio v3 — Phase 1 engine (`docs/superpowers/plans/2026-10-24-teamtrau-studio-v3-phase1.md`)
   - [x] P1.0: Hygiene & baseline (no production code)
   - [x] P1.1: Platform capabilities (`src/core/platform_caps.py`)
-  - [ ] P1.2: Production proxy generator (`src/modules/proxy_generator.py`)
+  - [x] P1.2: Production proxy generator (`src/modules/proxy_generator.py`)
   - [ ] P1.3: Production FreeCut writer (`src/integrations/freecut_writer.py`)
   - [ ] P1.4: FreeCut reader (`src/integrations/freecut_reader.py`)
   - [ ] P1.5: Render cache (`src/modules/render_cache.py`) + intra-only renderer option

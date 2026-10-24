@@ -1,208 +1,137 @@
-"""Unit tests for proxy generator module.
+"""Production proxy generator: heuristics, cache key, commands, encoder fallback."""
 
-Validates cache key calculation, FFmpeg command construction, NVENC GOP mapping,
-and encoder ladder fallback logic without executing real encoding operations.
-"""
-
-from __future__ import annotations
-
-import hashlib
+from fractions import Fraction
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.modules.proxy_generator import (
-    ProxyGenerationError,
-    build_proxy_ffmpeg_cmd,
-    compute_proxy_key,
-    make_proxy,
+from src.core.media_info import MediaInfo
+from src.modules import proxy_generator as pg
+
+
+class _R:
+    def __init__(self, returncode: int, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = stderr
+
+
+def info(**kw) -> MediaInfo:
+    base = dict(path=Path("x.mp4"), has_video=True, width=1920, height=1080, fps=Fraction(30),
+                codec="h264", pix_fmt="yuv420p", bit_depth=8)
+    base.update(kw)
+    return MediaInfo(**base)
+
+
+def _has(cmd: list[str], pair: list[str]) -> bool:
+    return any(cmd[i:i + len(pair)] == pair for i in range(len(cmd)))
+
+
+def test_light_1080p_h264_needs_no_proxy():
+    assert pg.needs_proxy(info()) == []
+
+
+@pytest.mark.parametrize(
+    "kw, reason",
+    [
+        (dict(width=3840, height=2160), "resolution"),
+        (dict(width=2160, height=3840), "resolution"),
+        (dict(codec="hevc"), "codec:hevc"),
+        (dict(codec="prores"), "codec:prores"),
+        (dict(bit_depth=10, pix_fmt="yuv420p10le"), "bit_depth"),
+        (dict(bit_depth=10, pix_fmt="yuv422p10le"), "chroma"),
+        (dict(fps=Fraction(120000, 1001)), "high_fps"),
+        (dict(is_vfr=True), "vfr"),
+        (dict(is_log=True), "log"),
+    ],
 )
+def test_heavy_media_reasons(kw, reason):
+    assert reason in pg.needs_proxy(info(**kw))
 
 
-def test_compute_proxy_key_deterministic_and_length() -> None:
-    """Validate 16-character hex SHA-1 format and determinism."""
-    key1 = compute_proxy_key(
-        src=Path("/virtual/media/clip1.mp4"),
-        height=1080,
-        fps=60.0,
-        gop=1,
-        size=100_000_000,
-        mtime=1700000000.0,
-    )
-    key2 = compute_proxy_key(
-        src=Path("/virtual/media/clip1.mp4"),
-        height=1080,
-        fps=60.0,
-        gop=1,
-        size=100_000_000,
-        mtime=1700000000.0,
-    )
-    assert len(key1) == 16
-    assert key1 == key2
-    # Verify exact sha1 computation
-    payload = f"{Path('/virtual/media/clip1.mp4').resolve()}|100000000|1700000000.0|1080|60.0|1"
-    expected = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-    assert key1 == expected
+def test_reason_order():
+    heavy = info(width=3840, height=2160, codec="hevc", bit_depth=10, pix_fmt="yuv422p10le")
+    assert pg.needs_proxy(heavy) == ["resolution", "codec:hevc", "bit_depth", "chroma"]
 
 
-def test_compute_proxy_key_sensitivity() -> None:
-    """Validate cache key changes when any parameter is varied."""
-    base_args = {
-        "src": Path("/virtual/media/clip1.mp4"),
-        "height": 1080,
-        "fps": 60.0,
-        "gop": 1,
-        "size": 100_000_000,
-        "mtime": 1700000000.0,
-    }
-    base_key = compute_proxy_key(**base_args)
-
-    # Different height
-    assert compute_proxy_key(**{**base_args, "height": 720}) != base_key
-    # Different fps
-    assert compute_proxy_key(**{**base_args, "fps": 30.0}) != base_key
-    # Different gop
-    assert compute_proxy_key(**{**base_args, "gop": 6}) != base_key
-    # Different size
-    assert compute_proxy_key(**{**base_args, "size": 100_000_001}) != base_key
-    # Different mtime
-    assert compute_proxy_key(**{**base_args, "mtime": 1700000001.0}) != base_key
+def test_key_is_stable_and_parameter_sensitive(tmp_path: Path):
+    f = tmp_path / "a.mp4"
+    f.write_bytes(b"x")
+    k = pg.compute_proxy_key(f)
+    assert len(k) == 16 and int(k, 16) >= 0
+    assert pg.compute_proxy_key(f) == k
+    assert pg.compute_proxy_key(f, pg.ProxySpec(height=720)) != k
+    assert pg.compute_proxy_key(f, pg.ProxySpec(gop=6)) != k
+    assert pg.compute_proxy_key(f, pg.ProxySpec(fps=60.0)) != k
+    assert pg.compute_proxy_key(f, size=999) != k
+    assert pg.compute_proxy_key(f, mtime_ns=1) != k
 
 
-def test_build_proxy_ffmpeg_cmd_nvenc_allintra() -> None:
-    """Verify NVENC command with gop=1 maps to -g 0 (all-intra) and -bf 0."""
-    cmd = build_proxy_ffmpeg_cmd(
-        src=Path("input.mov"),
-        dst=Path("output.mp4"),
-        encoder="h264_nvenc",
-        height=1080,
-        fps=60.0,
-        gop=1,
-    )
-
-    assert "ffmpeg" == cmd[0]
-    assert "-vf" in cmd
-    vf_idx = cmd.index("-vf")
-    assert cmd[vf_idx + 1] == "scale=-2:1080"
-    assert "-r" in cmd
-    r_idx = cmd.index("-r")
-    assert cmd[r_idx + 1] == "60.0"
-    assert "-fps_mode" in cmd and cmd[cmd.index("-fps_mode") + 1] == "cfr"
-    assert "-pix_fmt" in cmd and cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
-    assert "-bf" in cmd and cmd[cmd.index("-bf") + 1] == "0"
-    assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "h264_nvenc"
-    # Crucial poka-yoke check: NVENC with gop=1 must map to -g 0 to prevent SDK invalid param error
-    assert "-g" in cmd and cmd[cmd.index("-g") + 1] == "0"
-    assert "-map" in cmd and cmd[cmd.index("-map") + 1] == "0:v:0"
-    assert "-map" in cmd and cmd[cmd.index("-map") + 3] == "0:a?"
-    assert "-c:a" in cmd and cmd[cmd.index("-c:a") + 1] == "aac"
-    assert "-ar" in cmd and cmd[cmd.index("-ar") + 1] == "48000"
-    assert "-ac" in cmd and cmd[cmd.index("-ac") + 1] == "2"
+def test_nvenc_intra_command(tmp_path: Path):
+    cmd = pg.build_proxy_cmd(tmp_path / "in.mov", tmp_path / "out.mp4.part", "h264_nvenc",
+                             pg.ProxySpec(fps=60.0))
+    assert cmd[0] == "ffmpeg"
+    assert "scale=-2:1080" in cmd
+    for pair in (["-c:v", "h264_nvenc"], ["-g", "0"], ["-bf", "0"], ["-pix_fmt", "yuv420p"],
+                 ["-fps_mode", "cfr"], ["-r", "60"], ["-c:a", "aac"], ["-ar", "48000"],
+                 ["-ac", "2"], ["-f", "mp4"]):
+        assert _has(cmd, pair), pair
+    assert cmd[-1].endswith("out.mp4.part")
 
 
-def test_build_proxy_ffmpeg_cmd_nvenc_gop6() -> None:
-    """Verify NVENC command with gop=6 preserves -g 6."""
-    cmd = build_proxy_ffmpeg_cmd(
-        src=Path("input.mov"),
-        dst=Path("output.mp4"),
-        encoder="h264_nvenc",
-        height=720,
-        fps=None,
-        gop=6,
-    )
-    assert "-r" not in cmd  # No -r when fps is None
-    assert "-g" in cmd and cmd[cmd.index("-g") + 1] == "6"
-    assert cmd[cmd.index("-vf") + 1] == "scale=-2:720"
+def test_libx264_and_gop_variants(tmp_path: Path):
+    cpu = pg.build_proxy_cmd(tmp_path / "in.mov", tmp_path / "o.part", "libx264", pg.ProxySpec())
+    assert _has(cpu, ["-c:v", "libx264"]) and _has(cpu, ["-g", "1"]) and _has(cpu, ["-bf", "0"])
+    assert _has(cpu, ["-preset", "veryfast"])
+    assert "-r" not in cpu and _has(cpu, ["-fps_mode", "cfr"])
+    gop6 = pg.build_proxy_cmd(tmp_path / "in.mov", tmp_path / "o.part", "h264_nvenc",
+                              pg.ProxySpec(height=720, gop=6))
+    assert _has(gop6, ["-g", "6"]) and "scale=-2:720" in gop6
 
 
-def test_build_proxy_ffmpeg_cmd_libx264() -> None:
-    """Verify libx264 command includes preset veryfast and verbatim gop."""
-    cmd_intra = build_proxy_ffmpeg_cmd(
-        src=Path("input.mov"),
-        dst=Path("output.mp4"),
-        encoder="libx264",
-        height=1080,
-        fps=30.0,
-        gop=1,
-    )
-    assert "-c:v" in cmd_intra and cmd_intra[cmd_intra.index("-c:v") + 1] == "libx264"
-    assert "-preset" in cmd_intra and cmd_intra[cmd_intra.index("-preset") + 1] == "veryfast"
-    assert "-g" in cmd_intra and cmd_intra[cmd_intra.index("-g") + 1] == "1"
+def test_make_proxy_falls_back_and_renames(tmp_path: Path):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"v")
+    tried: list[str] = []
 
-    cmd_gop6 = build_proxy_ffmpeg_cmd(
-        src=Path("input.mov"),
-        dst=Path("output.mp4"),
-        encoder="libx264",
-        height=1080,
-        fps=30.0,
-        gop=6,
-    )
-    assert "-g" in cmd_gop6 and cmd_gop6[cmd_gop6.index("-g") + 1] == "6"
-
-
-def test_make_proxy_file_not_found(tmp_path: Path) -> None:
-    """Verify FileNotFoundError is raised for non-existent source."""
-    with pytest.raises(FileNotFoundError, match="Source media not found"):
-        make_proxy(src=tmp_path / "non_existent.mp4", out_dir=tmp_path)
-
-
-def test_make_proxy_cache_hit(tmp_path: Path) -> None:
-    """Verify cache hit returns existing file without invoking subprocess."""
-    src_file = tmp_path / "sample.mp4"
-    src_file.write_bytes(b"dummy source bytes")
-
-    cache_key = compute_proxy_key(src_file, height=1080, fps=None, gop=1)
-    proxy_cached = tmp_path / "proxies" / f"{cache_key}.mp4"
-    proxy_cached.parent.mkdir(parents=True, exist_ok=True)
-    proxy_cached.write_bytes(b"cached proxy bytes")
-
-    with patch("subprocess.run") as mock_run:
-        result = make_proxy(src_file, out_dir=tmp_path / "proxies", height=1080, gop=1)
-        assert result == proxy_cached
-        mock_run.assert_not_called()
-
-
-def test_make_proxy_ladder_fallback(tmp_path: Path) -> None:
-    """Verify ladder falls back to libx264 when h264_nvenc fails."""
-    src_file = tmp_path / "sample.mp4"
-    src_file.write_bytes(b"dummy source bytes")
-    out_dir = tmp_path / "proxies"
-
-    cache_key = compute_proxy_key(src_file, height=1080, fps=None, gop=1)
-    expected_dst = out_dir / f"{cache_key}.mp4"
-
-    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> MagicMock:
-        mock_res = MagicMock()
+    def fake_run(cmd, timeout=None):
+        assert timeout is not None
+        tried.append(cmd[cmd.index("-c:v") + 1])
         if "h264_nvenc" in cmd:
-            mock_res.returncode = 1
-            mock_res.stderr = "CUDA out of memory"
-        elif "libx264" in cmd:
-            mock_res.returncode = 0
-            # Create the file as if ffmpeg wrote it
-            expected_dst.write_bytes(b"simulated proxy content")
-        return mock_res
+            return _R(1, "nvenc not available")
+        Path(cmd[-1]).write_bytes(b"proxy")
+        return _R(0)
 
-    with patch("subprocess.run", side_effect=fake_subprocess_run) as mock_run:
-        result = make_proxy(src_file, out_dir=out_dir, height=1080, gop=1)
-        assert result == expected_dst
-        assert mock_run.call_count == 2
-        first_call_cmd = mock_run.call_args_list[0][0][0]
-        second_call_cmd = mock_run.call_args_list[1][0][0]
-        assert "h264_nvenc" in first_call_cmd
-        assert "libx264" in second_call_cmd
+    out = pg.make_proxy(src, tmp_path / "px", encoders=("h264_nvenc", "libx264"), run=fake_run)
+    assert tried == ["h264_nvenc", "libx264"]
+    assert out == tmp_path / "px" / f"{pg.compute_proxy_key(src)}.mp4"
+    assert out.read_bytes() == b"proxy"
+    assert not list((tmp_path / "px").glob("*.part"))
 
 
-def test_make_proxy_ladder_exhausted(tmp_path: Path) -> None:
-    """Verify ProxyGenerationError raised when both encoders fail."""
-    src_file = tmp_path / "sample.mp4"
-    src_file.write_bytes(b"dummy source bytes")
-    out_dir = tmp_path / "proxies"
+def test_make_proxy_reuses_existing(tmp_path: Path):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"v")
+    out_dir = tmp_path / "px"
+    out_dir.mkdir()
+    existing = out_dir / f"{pg.compute_proxy_key(src)}.mp4"
+    existing.write_bytes(b"old")
 
-    fail_mock = MagicMock()
-    fail_mock.returncode = 1
-    fail_mock.stderr = "Fatal error"
+    def boom(cmd, timeout=None):
+        raise AssertionError("must not encode again")
 
-    with patch("subprocess.run", return_value=fail_mock):
-        with pytest.raises(ProxyGenerationError, match="Failed to generate proxy"):
-            make_proxy(src_file, out_dir=out_dir, height=1080, gop=1)
+    assert pg.make_proxy(src, out_dir, encoders=("libx264",), run=boom) == existing
+
+
+def test_make_proxy_all_encoders_fail(tmp_path: Path):
+    src = tmp_path / "clip.mov"
+    src.write_bytes(b"v")
+
+    def failing(cmd, timeout=None):
+        Path(cmd[-1]).write_bytes(b"half")
+        return _R(1, "Error while encoding")
+
+    with pytest.raises(pg.ProxyGenerationError) as exc:
+        pg.make_proxy(src, tmp_path / "px", encoders=("h264_nvenc", "libx264"), run=failing)
+    assert "h264_nvenc" in str(exc.value) and "libx264" in str(exc.value)
+    assert not list((tmp_path / "px").glob("*.part"))
