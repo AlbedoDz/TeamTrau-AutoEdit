@@ -710,18 +710,20 @@ describe('offline shell assets', () => {
 **Contract test — `src/i18n/vi-locale.test.ts`:**
 ```ts
 // @vitest-environment node
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import { SUPPORTED_LANGUAGE_CODES } from './languages'
 
-const bases = import.meta.glob('./locales/*.json', { eager: true, import: 'default' }) as Record<
-  string,
-  unknown
->
-const partials = import.meta.glob('./locales/partials/*/*.json', {
-  eager: true,
-  import: 'default',
-}) as Record<string, unknown>
+// Read the JSON from disk: the i18n bootstrap merges partial modules in place, so the
+// imported module objects are not a faithful copy of the files.
+const LOCALES = resolve(process.cwd(), 'src', 'i18n', 'locales')
+
+function readJson(path: string): unknown {
+  return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
+}
 
 function leaves(obj: unknown, prefix = '', out = new Map<string, string>()): Map<string, string> {
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
@@ -738,11 +740,20 @@ function placeholders(s: string): string[] {
 
 function pairs(): [string, Map<string, string>, Map<string, string>][] {
   const out: [string, Map<string, string>, Map<string, string>][] = [
-    ['en.json', leaves(bases['./locales/en.json']), leaves(bases['./locales/vi.json'] ?? {})],
+    [
+      'en.json',
+      leaves(readJson(resolve(LOCALES, 'en.json'))),
+      leaves(readJson(resolve(LOCALES, 'vi.json'))),
+    ],
   ]
-  for (const path of Object.keys(partials).filter((p) => p.startsWith('./locales/partials/en/'))) {
-    const vi = partials[path.replace('/partials/en/', '/partials/vi/')]
-    out.push([path, leaves(partials[path]), leaves(vi ?? {})])
+  for (const file of readdirSync(resolve(LOCALES, 'partials', 'en')).filter((f) =>
+    f.endsWith('.json'),
+  )) {
+    out.push([
+      file,
+      leaves(readJson(resolve(LOCALES, 'partials', 'en', file))),
+      leaves(readJson(resolve(LOCALES, 'partials', 'vi', file))),
+    ])
   }
   return out
 }
