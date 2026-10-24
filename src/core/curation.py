@@ -34,12 +34,8 @@ class CurationSession:
 
 
 def _scene_duration(sc: ScoredScene) -> float:
-    """Extract duration in seconds from a ScoredScene or its underlying SceneCut."""
-    if hasattr(sc, "duration"):
-        return float(sc.duration)
-    if hasattr(sc, "scene") and hasattr(sc.scene, "duration"):
-        return float(sc.scene.duration)
-    return 0.0
+    """Extract duration in seconds from a ScoredScene's underlying SceneCut."""
+    return float(sc.scene.duration)
 
 
 def summarize_curation(
@@ -268,6 +264,9 @@ def export_session(
         and "rough_cut" in session.result.edit_timelines
     ):
         tl = session.result.edit_timelines["rough_cut"]
+
+    if tl is None:
+        raise ValueError("Nothing to export: run curate_footage first")
 
     handle1 = adapter.submit_deliver_job(
         edit_timeline=tl,

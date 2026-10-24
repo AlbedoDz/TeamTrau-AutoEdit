@@ -31,7 +31,7 @@ def window_cleaned_segments(
             out.append(seg)
             continue
 
-        role_val = role.value if hasattr(role, "value") else str(role)
+        role_val = role.value
 
         if role == ContentRole.A_ROLL or role_val == "a_roll":
             meta = dict(seg.metadata)

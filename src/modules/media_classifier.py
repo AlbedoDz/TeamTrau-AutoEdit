@@ -7,7 +7,6 @@ and Ambient B-roll (mixed or low-SNR sound) for automated curation and selects s
 import logging
 import math
 import shutil
-import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -332,10 +331,7 @@ def classify_clip(
         signals = extractor(p)
         decision = decide_role(signals)
         reasons = list(decision.reasons)
-        detector_fn = getattr(
-            sys.modules[__name__], "face_detector_available", face_detector_available
-        )
-        if not detector_fn():
+        if not face_detector_available():
             reasons.append("face_detector_unavailable")
         return ClassificationResult(
             path=p,

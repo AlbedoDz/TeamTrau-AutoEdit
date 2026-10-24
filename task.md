@@ -301,6 +301,7 @@
   - [x] Task 5: NLE pre-flight report
   - [x] Task 6: Curation core & MCP tools
   - [x] Task 7: CLI, E2E verification & release
+  - [x] Task 8: review polish
 - [ ] Milestone B: Post-v2 Auto-Curation Enhancements
   - [ ] B1: NVENC playback proxies (short-GOP, cache key path+size+mtime, CPU fallback)
   - [ ] B2: "Export selects" with `-c copy`, keyframe-snapped in/out

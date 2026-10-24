@@ -248,7 +248,7 @@ def gui_cmd(dry_run: bool) -> None:
 @click.option(
     "--genre",
     default=None,
-    help="Genre preset key (see the genre presets, e.g. travel_cinematic, sports_extreme); drives pacing.",
+    help="Genre preset key (e.g. travel_daily_vlog, travel_cinematic, sports_extreme, social_tiktok_fast); drives pacing.",
 )
 @click.option(
     "--output-dir",
@@ -767,7 +767,7 @@ def _print_deliver_summary(res, label: str, settings, preview: bool) -> None:
     "--genre",
     "-g",
     default=None,
-    help="Genre preset key (e.g. travel_daily_vlog, cinematic_travel, sports_extreme) driving pacing.",
+    help="Genre preset key (e.g. travel_daily_vlog, travel_cinematic, sports_extreme, social_tiktok_fast) driving pacing.",
 )
 @click.option(
     "--output-dir",

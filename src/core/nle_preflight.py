@@ -131,17 +131,6 @@ def preflight_timeline(
             )
             continue
 
-        if info is None:
-            issues.append(
-                PreflightIssue(
-                    code="MEDIA_UNREADABLE",
-                    severity="error",
-                    path=path,
-                    detail="Media probe returned empty result",
-                )
-            )
-            continue
-
         is_clip = path in clip_paths
         is_soundtrack = soundtrack_path is not None and path == soundtrack_path
 
@@ -202,7 +191,7 @@ def preflight_timeline(
                         detail="Mono audio channel layout",
                     )
                 )
-            elif info.audio_channels is not None and info.audio_channels > 2:
+            elif info.audio_channels > 2:
                 issues.append(
                     PreflightIssue(
                         code="AUDIO_MULTICHANNEL",

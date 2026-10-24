@@ -1331,12 +1331,13 @@ def curate_footage(
     """
     cfg = PipelineConfig()
     output_dir = Path(cfg.cache_dir) / "curation"
+    clamped_top_n = max(1, min(20, int(top_n)))
     session, summary = run_curation(
         adapter=adapter,
         input_dir=Path(input_dir),
         genre=genre,
         output_dir=output_dir,
-        top_n=top_n,
+        top_n=clamped_top_n,
     )
     _SESSIONS[session.session_id] = session
     while len(_SESSIONS) > MAX_SESSIONS:

@@ -1258,12 +1258,17 @@ class StudioBackendAdapter:
                         _notify_progress(
                             0.0, c_idx, f"Classifying media roles ({len(unique_clips)} clips)"
                         )
-                        for clip_path, orig_path in unique_clips:
+                        chunk_size = max(1, config.max_workers)
+                        for i in range(0, len(unique_clips), chunk_size):
                             _check_cancel()
-                            res_list = classify_batch([orig_path])
-                            if res_list:
-                                roles[clip_path] = res_list[0].role
-                                confidences[clip_path] = res_list[0].confidence
+                            chunk = unique_clips[i : i + chunk_size]
+                            orig_chunk = [orig for _, orig in chunk]
+                            res_list = classify_batch(
+                                orig_chunk, max_workers=config.max_workers
+                            )
+                            for (clip_path, _), res in zip(chunk, res_list):
+                                roles[clip_path] = res.role
+                                confidences[clip_path] = res.confidence
                         _check_cancel()
 
                 if roles:
@@ -1273,9 +1278,7 @@ class StudioBackendAdapter:
                         conf = confidences.get(seg.clip_path)
                         if role is not None:
                             meta = dict(seg.metadata)
-                            meta["content_role"] = (
-                                role.value if hasattr(role, "value") else str(role)
-                            )
+                            meta["content_role"] = role.value
                             if conf is not None:
                                 meta["role_confidence"] = float(conf)
                             new_segs.append(dataclasses.replace(seg, metadata=meta))
