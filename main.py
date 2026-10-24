@@ -2,10 +2,12 @@
 
 import json
 import logging
+import secrets
 import sys
 from pathlib import Path
 
 import click
+import uvicorn
 
 from src.core import curation
 from src.core.config import (
@@ -17,6 +19,7 @@ from src.core.config import (
 )
 from src.core.service import StudioBackendAdapter
 from src.core.stage_options import CADENCE_NAMES, apply_staged_options
+from src.engine_api.app import build_server_config, create_app
 from src.modules.ingest_detector import IngestDetector
 
 logging.basicConfig(
@@ -833,6 +836,37 @@ def curate_cmd(
                         click.echo(f"  * {label:<16}: {val}")
     except (ValueError, FileNotFoundError) as exc:
         raise click.BadParameter(str(exc)) from exc
+
+
+@cli.command("serve")
+@click.option("--port", default=8765, type=int, help="Port to listen on (default: 8765).")
+@click.option(
+    "--token-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to token file (default: <cache_dir>/engine_token).",
+)
+def serve_cmd(port: int, token_file: Path | None) -> None:
+    """Run the TeamTrau Engine API loopback service."""
+    if token_file is not None:
+        token_path = Path(token_file)
+        if not token_path.is_file():
+            raise click.BadParameter(f"Token file not found: {token_path}")
+        token = token_path.read_text(encoding="utf-8").strip()
+    else:
+        cfg = PipelineConfig()
+        token_path = cfg.cache_dir / "engine_token"
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_urlsafe(24)
+        token_path.write_text(token, encoding="utf-8")
+
+    click.echo(f"Engine token file: {token_path}")
+    click.echo(f"Starting TeamTrau Engine API on http://127.0.0.1:{port}...")
+
+    app = create_app(token=token)
+    server_cfg = build_server_config(app, port=port)
+    server = uvicorn.Server(server_cfg)
+    server.run()
 
 
 if __name__ == "__main__":

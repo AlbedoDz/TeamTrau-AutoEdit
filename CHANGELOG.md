@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(engine-api): loopback job service (auth, SSE events, cancel) + main.py serve
 - feat(render-cache): content-hashed all-intra segment cache + intra_only renderer option
 - feat(integrations): FreeCut project reader (V1 timeline, gaps, schema guard)
 - feat(integrations): production FreeCut writer (atomic, source links, proxy adoption)
