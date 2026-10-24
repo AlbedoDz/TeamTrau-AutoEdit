@@ -1,7 +1,7 @@
 ## HANDOFF S0.1
 STATUS: DONE
 STUDIO COMMIT: spike/s0-boot 93e7d39d38a3f2e9adcf3b22e11ed6bf0364d2c0
-ENGINE COMMIT: spike/s0 PENDING_COMMIT
+ENGINE COMMIT: spike/s0 0ace411891ffb236a701bba9b539d45008519dff
 KEY NUMBERS:
 - Studio Build & Tests: npm ci 36.2s, build 24.3s, 5094/5094 tests passing (698 files, 100% pass) in 223.2s
 - 4K60 H.264 (Full): Chrome & Electron 0.00% dropped frames (0/1791), seek latency 188-200ms (D3D11VideoDecoder hardware)
