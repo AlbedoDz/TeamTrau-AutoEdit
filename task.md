@@ -337,6 +337,7 @@
   - [x] P4.5: Fix player pooled-element resume & verification
 - [/] Phase 27: TeamTrau Studio v3 — Phase 3 Panels in Studio (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase3.md`)
   - [x] P3.0a: Curation sessions over the engine API (SessionStore, /v1/presets, /v1/sessions/{id}, curate progress & cancel)
+  - [x] P3.0b: Panel job runners: classify, analyze_soundtrack, preflight, assemble (from session + include/exclude)
 
 
 

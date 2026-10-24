@@ -1,18 +1,27 @@
-"""Default job runners for TeamTrau Engine API (proxies, render_cache, curate)."""
+"""Default job runners for TeamTrau Engine API (proxies, render_cache, curate, classify, soundtrack, preflight, assemble)."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 from pathlib import Path
 from typing import Any, Callable
 
 from src.core import curation
-from src.core.service import JobCallbacks, StudioBackendAdapter
+from src.core.nle_preflight import preflight_timeline
+from src.core.project_io import audio_state_to_dict
+from src.core.service import (
+    JobCallbacks,
+    StudioBackendAdapter,
+    collect_video_files,
+    find_soundtrack,
+)
 from src.engine_api.jobs import JobRunner
 from src.engine_api.sessions import SessionStore, session_to_dict
 from src.integrations.freecut_reader import read_freecut_project
 from src.integrations.freecut_writer import write_freecut_project
+from src.modules.media_classifier import ClassificationResult, classify_batch
 from src.modules.proxy_generator import ProxySpec, make_proxy
 from src.modules.render_cache import render_missing, write_manifest
 
@@ -182,6 +191,173 @@ def run_curate(
     return runner(params, emit, cancel_event)
 
 
+def make_classify_runner(
+    classify_fn: Callable[..., list[ClassificationResult]] | None = None,
+    chunk_size: int = 4,
+) -> JobRunner:
+    """Create a classify job runner that scans input_dir and categorizes media clips."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        input_dir = Path(params["input_dir"])
+        if not input_dir.is_dir():
+            raise FileNotFoundError(
+                f"Input directory does not exist or is not a directory: {input_dir}"
+            )
+
+        collected, skipped = collect_video_files(input_dir)
+        collected = sorted(collected)
+
+        fn = classify_fn if classify_fn is not None else classify_batch
+
+        results: list[ClassificationResult] = []
+        total = len(collected)
+        done = 0
+
+        for i in range(0, total, chunk_size):
+            if cancel_event.is_set():
+                raise InterruptedError("Classification cancelled.")
+            chunk = collected[i : i + chunk_size]
+            res = fn(chunk, max_workers=chunk_size)
+            results.extend(res)
+            done += len(chunk)
+            pct = 100.0 if total == 0 else (100.0 * done / total)
+            emit({"type": "progress", "pct": pct})
+
+        files_list: list[dict[str, Any]] = []
+        for r in results:
+            files_list.append(
+                {
+                    "path": str(r.path),
+                    "role": r.role.value if hasattr(r.role, "value") else str(r.role),
+                    "confidence": float(r.confidence),
+                    "has_speech": bool(r.has_speech),
+                    "reasons": list(r.reasons),
+                    "error": str(r.error) if r.error is not None else None,
+                    "signals": dataclasses.asdict(r.signals) if r.signals is not None else None,
+                }
+            )
+
+        st = find_soundtrack(input_dir)
+
+        return {
+            "files": files_list,
+            "skipped": [str(p) for p in skipped],
+            "soundtrack": str(st) if st is not None else None,
+        }
+
+    return runner
+
+
+def make_soundtrack_runner(
+    analyze_fn: Callable[[Path], Any] | None = None,
+) -> JobRunner:
+    """Create a soundtrack analysis job runner."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        p = Path(params["path"])
+        if not p.is_file():
+            raise FileNotFoundError(f"Soundtrack file does not exist: {p}")
+        if cancel_event.is_set():
+            raise InterruptedError("Soundtrack analysis cancelled.")
+        fn = analyze_fn if analyze_fn is not None else StudioBackendAdapter().quick_analyze_audio
+        analysis = fn(p)
+        return {"path": str(p), **audio_state_to_dict(analysis)}
+
+    return runner
+
+
+def make_preflight_runner() -> JobRunner:
+    """Create a preflight job runner that checks timeline media references."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        workspace = Path(params["workspace"])
+        project_id = str(params["project_id"])
+        if cancel_event.is_set():
+            raise InterruptedError("Preflight cancelled.")
+        freecut_proj = read_freecut_project(workspace, project_id)
+        report = preflight_timeline(freecut_proj.timeline)
+        return report.to_dict()
+
+    return runner
+
+
+def make_assemble_runner(
+    sessions: SessionStore,
+    adapter_factory: Callable[[], Any] = StudioBackendAdapter,
+) -> JobRunner:
+    """Create an assemble job runner that generates a timeline sequence from session shots."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        session_id = str(params["session_id"])
+        session = sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Curation session not found: {session_id}")
+
+        workspace = Path(params["workspace"])
+        soundtrack = Path(params["soundtrack"]) if params.get("soundtrack") else None
+        cadence = params.get("cadence")
+        selected_ids = params.get("selected_ids")
+        project_name = str(params.get("project_name", "Assembled Sequence"))
+
+        def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
+            emit({"type": "progress", "pct": total_pct, "msg": msg})
+
+        callbacks = JobCallbacks(on_progress=_on_progress)
+        adapter = adapter_factory()
+
+        assemble_res = curation.assemble_sequence(
+            adapter=adapter,
+            session=session,
+            soundtrack=soundtrack,
+            selected_ids=selected_ids,
+            cadence=cadence,
+            callbacks=callbacks,
+            cancel_event=cancel_event,
+        )
+
+        timeline_id = assemble_res["timeline_id"]
+        tl_key = timeline_id.split(":", 1)[1] if ":" in timeline_id else timeline_id
+
+        if (
+            session.sequence is None
+            or not session.sequence.edit_timelines
+            or tl_key not in session.sequence.edit_timelines
+        ):
+            raise RuntimeError(f"Assembled timeline '{tl_key}' not found in sequence result.")
+
+        tl = session.sequence.edit_timelines[tl_key]
+        project_id = write_freecut_project(
+            timeline=tl,
+            workspace=workspace,
+            project_name=project_name,
+        )
+
+        return {
+            "project_id": project_id,
+            "timeline_id": timeline_id,
+            "total_cuts": assemble_res["total_cuts"],
+            "duration_sec": assemble_res["duration_sec"],
+        }
+
+    return runner
+
+
 def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner]:
     """Return dictionary of default engine job runners."""
     store = sessions if sessions is not None else SessionStore()
@@ -189,4 +365,8 @@ def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner
         "proxies": run_proxies,
         "render_cache": run_render_cache,
         "curate": make_curate_runner(store),
+        "classify": make_classify_runner(),
+        "analyze_soundtrack": make_soundtrack_runner(),
+        "preflight": make_preflight_runner(),
+        "assemble": make_assemble_runner(store),
     }
