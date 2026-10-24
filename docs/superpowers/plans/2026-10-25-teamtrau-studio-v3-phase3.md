@@ -57,7 +57,8 @@
 | Task | Repo | What | Detailed |
 |---|---|---|---|
 | **P3.0a** | Engine | Server-side curation sessions; `GET /v1/presets`; `GET/PATCH /v1/sessions/{id}`; curate keeps the session, returns per-shot JSON, forwards progress and cancel | **yes (below)** |
-| P3.0b | Engine | Runners: `classify`, `analyze_soundtrack`, `assemble` (from session + include/exclude), `preflight`, `deliver` (DeliverSettings), `agent` (with thought/tool events) | next |
+| P3.0b | Engine | Runners: `classify`, `analyze_soundtrack`, `preflight`, `assemble` (from session + include/exclude) | **yes (below)** |
+| P3.0d | Engine | Runners: `deliver` (DeliverSettings), `agent` (thought/tool events) | later |
 | P3.0c | Engine | FreeCut writer carries real take data: per file `data.takes[{shot_id, window, composite, sharpness, aesthetic, content_role, role_confidence, defects, included}]`; remove the placeholder fields | later |
 | P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | later |
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
