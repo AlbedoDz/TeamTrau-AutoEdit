@@ -19,6 +19,7 @@
   - Review polish.
 - **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
 
+- feat(integrations): FreeCut writer carries curated take data (no placeholder sidecar values)
 - feat(engine-api): classify, soundtrack, preflight and assemble job runners
 - feat(engine-api): curation sessions, presets endpoint, curate progress and cancel
 - build(deps): CUDA 12.6 torch/torchvision via uv index (Windows/Linux); faster-whisper on GPU

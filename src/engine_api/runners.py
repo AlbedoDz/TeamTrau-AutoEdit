@@ -166,6 +166,7 @@ def make_curate_runner(
             timeline=rough_tl,
             workspace=workspace,
             project_name=project_name,
+            shots=session.shots,
         )
 
         sessions.put(session)
@@ -346,6 +347,7 @@ def make_assemble_runner(
             timeline=tl,
             workspace=workspace,
             project_name=project_name,
+            shots=session.shots,
         )
 
         return {
