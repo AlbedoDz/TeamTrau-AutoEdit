@@ -332,6 +332,9 @@
   - [x] P4.0: Render cache for Studio (`src/modules/render_cache.py`, `src/engine_api/runners.py`)
   - [x] P4.1: Playback substitution pure function (`src/features/teamtrau/render-cache/substitute.ts`)
   - [x] P4.2: Composition model segment substitution (`src/features/teamtrau/render-cache/*`, `src/features/preview/*`)
-  - [ ] P4.3: Playback meter & benchmark
+  - [x] P4.3: Playback meter & benchmark
+  - [x] P4.4: RTX GPU preference in Electron & diagnosis
+  - [x] P4.5: Fix player pooled-element resume & verification
+
 
 
