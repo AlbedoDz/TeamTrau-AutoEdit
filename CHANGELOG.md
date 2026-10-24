@@ -1,4 +1,5 @@
 ## [Unreleased]
+- feat(integrations): production FreeCut writer (atomic, source links, proxy adoption)
 - feat(proxy): production proxy generator (heuristics, caps-driven encoder fallback, atomic output)
 - feat(platform): platform_caps (OS, encoders, hwaccels, torch, Resolve paths)
 - chore: start studio v3 phase 1 (branch, spec, plan, baseline)

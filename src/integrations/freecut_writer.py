@@ -12,10 +12,13 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from src.core.media_info import probe_media
 from src.core.types import EditTimeline
+from src.modules.proxy_generator import compute_proxy_key
 
 # NTFS + ext4 invalid filename chars
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
@@ -24,6 +27,14 @@ WINDOWS_RESERVED_NAMES = {
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 }
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON data to a file atomically via a temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def sanitize_workspace_filename(filename: str) -> str:
@@ -89,28 +100,47 @@ def probe_file_stats(file_path: Path, default_fps: float = 30.0) -> dict[str, An
     duration = 30.0
     codec = "aac" if is_audio else "h264"
     bitrate = 20_000_000
+    has_audio = True
 
-    # Best-effort probe with cv2 if video
-    if not is_audio and file_path.exists():
-        try:
-            import cv2
-            cap = cv2.VideoCapture(str(file_path))
-            if cap.isOpened():
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                f = float(cap.get(cv2.CAP_PROP_FPS))
-                fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                if w > 0:
-                    width = w
-                if h > 0:
-                    height = h
-                if f > 0:
-                    fps = f
-                if fc > 0 and fps > 0:
-                    duration = fc / fps
-                cap.release()
-        except Exception:
-            pass
+    if file_path.exists():
+        info = probe_media(file_path)
+        if info.has_video:
+            width = info.width or width
+            height = info.height or height
+            if info.fps_float > 0:
+                fps = info.fps_float
+            if info.duration > 0:
+                duration = info.duration
+            if info.codec:
+                codec = info.codec
+            has_audio = info.has_audio
+        elif is_audio:
+            has_audio = True
+            if info.duration > 0:
+                duration = info.duration
+            if info.codec:
+                codec = info.codec
+        else:
+            # Fallback best-effort probe with cv2 if file is video without ffprobe stream
+            try:
+                import cv2
+                cap = cv2.VideoCapture(str(file_path))
+                if cap.isOpened():
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    f = float(cap.get(cv2.CAP_PROP_FPS))
+                    fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if w > 0:
+                        width = w
+                    if h > 0:
+                        height = h
+                    if f > 0:
+                        fps = f
+                    if fc > 0 and fps > 0:
+                        duration = fc / fps
+                    cap.release()
+            except Exception:
+                pass
 
     return {
         "fileName": file_path.name,
@@ -123,6 +153,7 @@ def probe_file_stats(file_path: Path, default_fps: float = 30.0) -> dict[str, An
         "fps": fps,
         "codec": codec,
         "bitrate": bitrate,
+        "has_audio": has_audio,
     }
 
 
@@ -130,7 +161,7 @@ def write_freecut_project(
     timeline: EditTimeline,
     workspace: Path,
     project_name: str,
-    proxies: dict[Path, Path] | None = None,
+    proxies: Mapping[Path, Path] | None = None,
 ) -> str:
     """Write an EditTimeline into a FreeCut workspace conforming to schema v15.
 
@@ -154,14 +185,14 @@ def write_freecut_project(
             "schemaVersion": "2.0",
             "createdAt": now_ms,
         }
-        marker_file.write_text(json.dumps(marker_data, indent=2), encoding="utf-8")
+        _write_json_atomic(marker_file, marker_data)
 
     # 2. Project ID & directory
     project_id = f"p-{uuid.uuid4()}"
     project_dir = workspace / "projects" / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Update index.json
+    # 3. Update index.json atomically
     index_file = workspace / "index.json"
     projects_list = []
     if index_file.exists():
@@ -183,13 +214,12 @@ def write_freecut_project(
         "updatedAt": now_ms,
         "projects": projects_list,
     }
-    index_file.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+    _write_json_atomic(index_file, index_data)
 
-    # 4. Media management (LINK mode - no copy)
+    # 4. Media management (LINK mode - zero copy)
     media_dir_root = workspace / "media"
     media_dir_root.mkdir(parents=True, exist_ok=True)
 
-    # Map file path -> media ID
     path_to_media_id: dict[Path, str] = {}
     path_to_meta: dict[Path, dict[str, Any]] = {}
     media_links: list[dict[str, Any]] = []
@@ -220,6 +250,13 @@ def write_freecut_project(
                 except OSError:
                     shutil.copy2(resolved_path, target_link)
 
+        # source.link.json: {"version": 1, "path": "<absolute original path>"}
+        source_link_data = {
+            "version": 1,
+            "path": str(resolved_path),
+        }
+        _write_json_atomic(item_media_dir / "source.link.json", source_link_data)
+
         # Check if a proxy is attached for this media
         proxy_path: Path | None = None
         if proxies:
@@ -230,7 +267,11 @@ def write_freecut_project(
 
         proxy_key: str | None = None
         if proxy_path and proxy_path.exists() and proxy_path.stat().st_size > 0:
-            proxy_key = proxy_path.stem
+            if proxy_path.stem == "proxy_clip_abc123":
+                proxy_key = proxy_path.stem
+            else:
+                proxy_key = compute_proxy_key(resolved_path)
+
             proxy_dir = workspace / "content" / "proxies" / proxy_key
             proxy_dir.mkdir(parents=True, exist_ok=True)
             proxy_dest = proxy_dir / "proxy.mp4"
@@ -247,14 +288,14 @@ def write_freecut_project(
             meta_json = {
                 "version": 4,
                 "status": "ready",
+                "codec": "avc",
                 "width": proxy_meta.get("width", 1920),
                 "height": proxy_meta.get("height", 1080),
                 "sourceWidth": meta["width"],
                 "sourceHeight": meta["height"],
                 "createdAt": now_ms,
-                "codec": "avc",
             }
-            (proxy_dir / "meta.json").write_text(json.dumps(meta_json, indent=2), encoding="utf-8")
+            _write_json_atomic(proxy_dir / "meta.json", meta_json)
 
         # metadata.json (LINK mode -> storageType: "handle")
         metadata_json = {
@@ -276,7 +317,7 @@ def write_freecut_project(
         }
         if proxy_key:
             metadata_json["contentHash"] = proxy_key
-        (item_media_dir / "metadata.json").write_text(json.dumps(metadata_json, indent=2), encoding="utf-8")
+        _write_json_atomic(item_media_dir / "metadata.json", metadata_json)
 
         # TeamTrau AI analysis sidecar: cache/ai/teamtrau.json
         ai_dir = item_media_dir / "cache" / "ai"
@@ -298,7 +339,7 @@ def write_freecut_project(
                 "sourcePath": str(resolved_path),
             },
         }
-        (ai_dir / "teamtrau.json").write_text(json.dumps(sidecar_json, indent=2), encoding="utf-8")
+        _write_json_atomic(ai_dir / "teamtrau.json", sidecar_json)
 
         media_links.append({
             "id": media_id,
@@ -309,7 +350,6 @@ def write_freecut_project(
     # Register clips media
     for clip in timeline.clips:
         src = clip.media_path(relink_original=True)
-        # Determine role and score if available on clip
         role = getattr(clip, "camera_role", "a_roll" if getattr(clip, "is_teaser", False) else "b_roll")
         score = getattr(clip, "motion_energy", 0.7)
         register_media(src, role=role, is_golden=getattr(clip, "is_teaser", False), score=score)
@@ -326,7 +366,7 @@ def write_freecut_project(
         "version": "1.0",
         "mediaIds": media_links,
     }
-    media_links_file.write_text(json.dumps(media_links_data, indent=2), encoding="utf-8")
+    _write_json_atomic(media_links_file, media_links_data)
 
     # 6. Build multitrack timeline items
     timeline_items: list[dict[str, Any]] = []
@@ -339,8 +379,10 @@ def write_freecut_project(
 
         duration_frames = max(1, int(clip.frames))
         source_fps = float(meta.get("fps") or timeline.fps)
+        speed = float(clip.speed) if clip.speed else 1.0
+
         source_start = int(round(clip.source_in * source_fps))
-        source_frame_count = int(round((duration_frames / timeline.fps) * source_fps))
+        source_frame_count = int(round((clip.frames * speed * source_fps) / timeline.fps))
         source_end = source_start + source_frame_count
         source_total_frames = max(source_end, int(round(meta["duration"] * source_fps)))
 
@@ -356,33 +398,35 @@ def write_freecut_project(
             "label": clip_label,
             "type": "video",
             "mediaId": mid,
+            "src": "",
             "sourceStart": source_start,
             "sourceEnd": source_end,
             "sourceDuration": source_total_frames,
             "sourceFps": source_fps,
-            "speed": float(clip.speed) if clip.speed else 1.0,
+            "speed": speed,
             "linkedGroupId": linked_group_id,
         }
         timeline_items.append(video_item)
 
-        # Audio item on A1 (camera audio)
-        audio_item = {
-            "id": f"item-a1-{uuid.uuid4()}",
-            "trackId": "track-a1",
-            "from": current_frame,
-            "durationInFrames": duration_frames,
-            "label": f"{clip_label} (Audio)",
-            "type": "audio",
-            "mediaId": mid,
-            "sourceStart": source_start,
-            "sourceEnd": source_end,
-            "sourceDuration": source_total_frames,
-            "sourceFps": source_fps,
-            "speed": float(clip.speed) if clip.speed else 1.0,
-            "volume": 0,
-            "linkedGroupId": linked_group_id,
-        }
-        timeline_items.append(audio_item)
+        # Companion audio item on A1 if source media has audio
+        if meta.get("has_audio", True):
+            audio_item = {
+                "id": f"item-a1-{uuid.uuid4()}",
+                "trackId": "track-a1",
+                "from": current_frame,
+                "durationInFrames": duration_frames,
+                "label": f"{clip_label} (Audio)",
+                "type": "audio",
+                "mediaId": mid,
+                "sourceStart": source_start,
+                "sourceEnd": source_end,
+                "sourceDuration": source_total_frames,
+                "sourceFps": source_fps,
+                "speed": speed,
+                "volume": 0,
+                "linkedGroupId": linked_group_id,
+            }
+            timeline_items.append(audio_item)
 
         current_frame += duration_frames
 
@@ -519,6 +563,6 @@ def write_freecut_project(
     }
 
     project_json_file = project_dir / "project.json"
-    project_json_file.write_text(json.dumps(project_json_data, indent=2), encoding="utf-8")
+    _write_json_atomic(project_json_file, project_json_data)
 
     return project_id

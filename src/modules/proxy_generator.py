@@ -81,21 +81,11 @@ def compute_proxy_key(
     *,
     size: int | None = None,
     mtime_ns: int | None = None,
-    **kwargs: Any,
 ) -> str:
     """Compute 16-character hex SHA-1 cache key for proxy parameters.
 
     Formula: sha1(f"{resolved path}|{size}|{mtime_ns}|{height}|{fps}|{gop}")[:16]
     """
-    if kwargs:
-        height = kwargs.get("height", spec.height)
-        fps = kwargs.get("fps", spec.fps)
-        gop = kwargs.get("gop", spec.gop)
-        spec = ProxySpec(height=height, fps=fps, gop=gop)
-        if mtime_ns is None and "mtime" in kwargs:
-            mtime_val = kwargs["mtime"]
-            mtime_ns = int(mtime_val * 1_000_000_000) if isinstance(mtime_val, float) else int(mtime_val)
-
     path_obj = Path(src).resolve()
 
     resolved_size = size
