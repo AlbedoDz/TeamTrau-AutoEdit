@@ -331,7 +331,7 @@
   - [x] P2.5: Vietnamese locale (`src/i18n/locales/vi.json`)
   - [x] P4.0: Render cache for Studio (`src/modules/render_cache.py`, `src/engine_api/runners.py`)
   - [x] P4.1: Playback substitution pure function (`src/features/teamtrau/render-cache/substitute.ts`)
-  - [ ] P4.2: Composition model segment substitution
+  - [x] P4.2: Composition model segment substitution (`src/features/teamtrau/render-cache/*`, `src/features/preview/*`)
   - [ ] P4.3: Playback meter & benchmark
 
 
