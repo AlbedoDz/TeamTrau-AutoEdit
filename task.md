@@ -339,6 +339,7 @@
   - [x] P3.0a: Curation sessions over the engine API (SessionStore, /v1/presets, /v1/sessions/{id}, curate progress & cancel)
   - [x] P3.0b: Panel job runners: classify, analyze_soundtrack, preflight, assemble (from session + include/exclude)
   - [x] P3.0c: FreeCut writer carries curated take data (no placeholder sidecar values)
+  - [x] P3.0d: Deliver and agent job runners (Engine repo, branch feature/studio-engine)
 
 
 

@@ -1,4 +1,4 @@
-"""Default job runners for TeamTrau Engine API (proxies, render_cache, curate, classify, soundtrack, preflight, assemble)."""
+"""Default job runners for TeamTrau Engine API (proxies, render_cache, curate, classify, soundtrack, preflight, assemble, deliver, agent)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.core import curation
+from src.core.config import PipelineConfig
+from src.core.deliver_options import build_deliver_settings
 from src.core.nle_preflight import preflight_timeline
 from src.core.project_io import audio_state_to_dict
 from src.core.service import (
@@ -17,10 +19,12 @@ from src.core.service import (
     collect_video_files,
     find_soundtrack,
 )
+from src.core.types import ALL_DELIVER_FORMATS, DeliverSettings
 from src.engine_api.jobs import JobRunner
 from src.engine_api.sessions import SessionStore, session_to_dict
 from src.integrations.freecut_reader import read_freecut_project
 from src.integrations.freecut_writer import write_freecut_project
+from src.modules.agent_controller import AgentCallbacks
 from src.modules.media_classifier import ClassificationResult, classify_batch
 from src.modules.proxy_generator import ProxySpec, make_proxy
 from src.modules.render_cache import render_missing, write_manifest
@@ -360,6 +364,197 @@ def make_assemble_runner(
     return runner
 
 
+def make_deliver_runner(
+    adapter_factory: Callable[[], Any] = StudioBackendAdapter,
+) -> JobRunner:
+    """Create a deliver job runner that exports/renders a FreeCut timeline."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        formats_raw = params.get("formats")
+        if formats_raw is not None:
+            bad_formats = [f for f in formats_raw if f not in ALL_DELIVER_FORMATS]
+            if bad_formats:
+                raise ValueError(
+                    f"Invalid deliver format(s): {bad_formats}; allowed: {ALL_DELIVER_FORMATS}"
+                )
+            formats: set[Any] | None = set(formats_raw)
+        else:
+            formats = None
+
+        allowed_settings_keys = {
+            "preset",
+            "canvas",
+            "fps",
+            "fit",
+            "color",
+            "master",
+            "subtitles",
+            "audio_rate",
+            "audio_channels",
+            "variants",
+            "relink",
+            "watermark_in_nle",
+        }
+        settings_raw = params.get("settings")
+        if settings_raw is not None:
+            if not isinstance(settings_raw, dict):
+                raise ValueError("settings must be a dictionary")
+            bad_settings = set(settings_raw.keys()) - allowed_settings_keys
+            if bad_settings:
+                raise ValueError(
+                    f"Invalid setting(s): {bad_settings}; allowed: {allowed_settings_keys}"
+                )
+            settings_dict = settings_raw
+        else:
+            settings_dict = {}
+
+        workspace = Path(params["workspace"])
+        project_id = str(params["project_id"])
+        output_dir = Path(params["output_dir"])
+        preview = bool(params.get("preview", False))
+        force_cpu = bool(params.get("force_cpu", False))
+
+        freecut_tl = read_freecut_project(workspace, project_id)
+        base_settings = DeliverSettings.from_timeline(freecut_tl.timeline)
+        deliver_settings = build_deliver_settings(base_settings, **settings_dict)
+
+        def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
+            emit({"type": "progress", "pct": total_pct, "msg": msg})
+
+        callbacks = JobCallbacks(on_progress=_on_progress)
+        adapter = adapter_factory()
+
+        handle = adapter.submit_deliver_job(
+            edit_timeline=freecut_tl.timeline,
+            output_dir=output_dir,
+            config=PipelineConfig(),
+            formats=formats,
+            callbacks=callbacks,
+            run_async=True,
+            preview=preview,
+            force_cpu=force_cpu,
+            settings=deliver_settings,
+        )
+
+        while True:
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Deliver cancelled")
+            if handle.wait(0.05):
+                break
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Deliver cancelled")
+
+        result = handle.result
+        if getattr(result, "cancelled", False):
+            raise InterruptedError("Deliver cancelled")
+        if not getattr(result, "success", False):
+            err_msg = getattr(result, "error_message", None) or "Deliver failed"
+            raise RuntimeError(err_msg)
+
+        return {
+            "success": bool(result.success),
+            "output_dir": str(result.output_dir) if result.output_dir is not None else None,
+            "render_path": str(result.render_path) if result.render_path is not None else None,
+            "encoder_used": result.encoder_used,
+            "fcpxml_path": str(result.fcpxml_path) if result.fcpxml_path is not None else None,
+            "premiere_xml_path": (
+                str(result.premiere_xml_path) if result.premiere_xml_path is not None else None
+            ),
+            "otio_path": str(result.otio_path) if result.otio_path is not None else None,
+            "capcut_draft_path": (
+                str(result.capcut_draft_path) if result.capcut_draft_path is not None else None
+            ),
+            "manifest_path": (
+                str(result.manifest_path) if result.manifest_path is not None else None
+            ),
+            "preflight_path": (
+                str(result.preflight_path) if result.preflight_path is not None else None
+            ),
+            "preflight_issues": list(result.preflight_issues or []),
+        }
+
+    return runner
+
+
+def make_agent_runner(
+    controller_factory: Callable[[], Any] | None = None,
+) -> JobRunner:
+    """Create an agent job runner that executes an autonomous reasoning/tool-calling loop."""
+
+    def runner(
+        params: dict[str, Any],
+        emit: Callable[[dict[str, Any]], None],
+        cancel_event: threading.Event,
+    ) -> dict[str, Any]:
+        prompt = params.get("prompt")
+        if prompt is None or not str(prompt).strip():
+            raise ValueError("prompt must be a non-empty string")
+        prompt = str(prompt)
+        system_prompt = params.get("system_prompt")
+
+        def _on_thought(text: str) -> None:
+            emit({"type": "thought", "text": text})
+
+        def _on_tool_call(name: str, args: dict[str, Any]) -> None:
+            emit({"type": "tool_call", "name": name, "args": args})
+
+        def _on_tool_result(name: str, result: Any) -> None:
+            emit({"type": "tool_result", "name": name, "result": str(result)[:2000]})
+
+        def _on_agent_response(text: str) -> None:
+            emit({"type": "response", "text": text})
+
+        def _on_error(message: str) -> None:
+            emit({"type": "error", "message": message})
+
+        callbacks = AgentCallbacks(
+            on_thought=_on_thought,
+            on_tool_call=_on_tool_call,
+            on_tool_result=_on_tool_result,
+            on_agent_response=_on_agent_response,
+            on_error=_on_error,
+        )
+
+        if controller_factory is not None:
+            controller = controller_factory()
+        else:
+            from src.modules.agent_controller import AutoEditAgentController
+
+            controller = AutoEditAgentController()
+
+        result = controller.run(
+            prompt,
+            callbacks=callbacks,
+            cancel_event=cancel_event,
+            system_prompt=system_prompt,
+        )
+
+        steps_count = (
+            len(result.steps)
+            if hasattr(result, "steps") and isinstance(result.steps, list)
+            else int(getattr(result, "steps", 0))
+        )
+
+        error = getattr(result, "error_message", None) or getattr(result, "error", None)
+
+        return {
+            "success": bool(getattr(result, "success", False)),
+            "response": getattr(result, "response", ""),
+            "provider": getattr(result, "provider_used", None),
+            "model": getattr(result, "model_used", None),
+            "steps": steps_count,
+            "error": error,
+        }
+
+    return runner
+
+
 def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner]:
     """Return dictionary of default engine job runners."""
     store = sessions if sessions is not None else SessionStore()
@@ -371,4 +566,6 @@ def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner
         "analyze_soundtrack": make_soundtrack_runner(),
         "preflight": make_preflight_runner(),
         "assemble": make_assemble_runner(store),
+        "deliver": make_deliver_runner(),
+        "agent": make_agent_runner(),
     }
