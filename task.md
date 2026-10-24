@@ -340,6 +340,8 @@
   - [x] P3.0b: Panel job runners: classify, analyze_soundtrack, preflight, assemble (from session + include/exclude)
   - [x] P3.0c: FreeCut writer carries curated take data (no placeholder sidecar values)
   - [x] P3.0d: Deliver and agent job runners (Engine repo, branch feature/studio-engine)
+  - [x] P3.1: TeamTrau sidebar tab with engine status and job progress
+  - [x] P3.2: Ingest panel (footage folder, role analysis, curate)
 
 
 
