@@ -62,7 +62,8 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 1.4 `src/engine_api/` starlette app: endpoints of spec §3, token auth, loopback, body/connection caps, SSE job events wrapping `JobCallbacks`; CLI `main.py serve --port --token`.
 - 1.5 Render-preview cache: NVENC segment renders named by content hash (FilmCraft idea) for the Studio render bar.
 
-## Phase 2 — Studio shell  *(detailed after G0)*
+## Phase 2 — Studio shell
+**Detailed plan with locked tests: `2026-10-24-teamtrau-studio-v3-phase2-4.md` (P2.0–P2.5).**
 - 2.1 Electron main process: COOP/COEP, workspace path instead of `showDirectoryPicker`, no service worker, single-instance, engine sidecar start/stop/health, token handshake.
 - 2.2 Offline assets: bundle fonts and the CDN-loaded model workers (or disable them in favour of engine services).
 - 2.3 Rebrand display strings, logo, theme tokens (`src/index.css`), landing page; keep internal ids.
@@ -77,7 +78,8 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 3.6 Agent console (MCP agent) inside Studio.
 - **Gate G3:** feature parity checklist signed → PySide6 GUI frozen (S7).
 
-## Phase 4 — Playback excellence  *(detailed after G0)*
+## Phase 4 — Playback excellence
+**P4.0–P4.2 (render-cache playback) are detailed in `2026-10-24-teamtrau-studio-v3-phase2-4.md`; the rest after gate G4.**
 - 4.1 Auto-proxy on import (heavy-media heuristics: > 1080p, HEVC, 10-bit, 4:2:2, > 60 fps, VFR, log).
 - 4.2 Perf meter (shown / repeated / dropped, worst wait) + wire adaptive preview quality to real render scale; Full/½/¼ playback resolution.
 - 4.3 Meet spec §5 targets; benchmark script in CI-able form.
