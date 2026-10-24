@@ -60,7 +60,7 @@
 | P3.0b | Engine | Runners: `classify`, `analyze_soundtrack`, `preflight`, `assemble` (from session + include/exclude) | **yes (below)** |
 | P3.0d | Engine | Runners: `deliver` (DeliverSettings), `agent` (thought/tool events) | **yes (below)** |
 | P3.0c | Engine | FreeCut writer carries real take data: per file `data.takes[{shot_id, window, composite, sharpness, aesthetic, content_role, role_confidence, defects, included}]`; remove the placeholder fields | **yes (below)** |
-| P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | later |
+| P3.1 | Studio | TeamTrau sidebar tab skeleton, engine connection status, job list with SSE/poll progress and cancel, i18n en + vi | **yes (below)** |
 | P4.3 | Studio + Engine | Auto-proxy on import (preload `webUtils.getPathForFile` → engine `proxies` job → adopt into `content/proxies`), heavy-media heuristics from `needs_proxy` | later |
 | P3.2 | Studio | Ingest & roles panel: folder picker (A-roll / B-roll / Music), classify job, role table with override (PATCH) | later |
 | P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | later |
@@ -1015,3 +1015,207 @@ def test_agent_runner_rejects_empty_prompt():
 **Expected red:** `ImportError: cannot import name 'make_agent_runner' (or make_deliver_runner) from 'src.engine_api.runners'`.
 
 **Commit:** `feat(engine-api): deliver and agent job runners`.
+
+
+---
+
+## P3.1 — TeamTrau sidebar tab: engine status and jobs (Studio repo, branch `teamtrau/main`)
+
+**API**
+```ts
+// src/features/teamtrau/engine/engine-client.ts (extend)
+getEvents(id: string): Promise<{ events: Record<string, unknown>[] }>   // GET {base}/v1/jobs/{id}/events?format=json
+
+// src/features/teamtrau/jobs/jobs-store.ts (new, zustand/vanilla — already a dependency)
+export interface EngineJobsClient { submitJob; getJob; getEvents; cancel }   // structural subset of the engine client
+export type JobStatus = 'running' | 'done' | 'failed' | 'cancelled'
+export interface EngineJobView { id; kind; status; pct; message; result; error; startedAt }
+export function createJobsStore(client: EngineJobsClient, opts?: { pollMs?: number; now?: () => number })
+// state: { jobs: Record<string, EngineJobView>; order: string[] (newest first); lastError: string | null;
+//          start(kind, params): Promise<string>; refresh(id): Promise<void>; cancel(id): Promise<void>; dispose(): void }
+```
+
+**Rules**
+- **`start`**
+  - Calls `client.submitJob`.
+  - On failure: sets `lastError` to the error message, rethrows, and adds no job.
+  - On success: adds a view with `{status 'running', pct 0, message '', result null, error null, startedAt: now()}` at the front of `order`.
+  - When `pollMs > 0` (default 500), it schedules polling: `refresh` every `pollMs` until the status is not `running`. `dispose` clears every timer.
+- **`refresh(id)`**
+  - Fetches the job and its events.
+  - `pct` comes from the last `progress` event, or stays the same when there is none. It is `100` when the status is `done`.
+  - `message` comes from the last progress `msg`.
+  - Copies `status`, `result` and `error`.
+- **`cancel(id)`:** calls `client.cancel(id)`, then `refresh(id)`.
+
+**Panel**
+- New file `src/features/teamtrau/components/teamtrau-panel.tsx`.
+- **Engine section:**
+  - Health dot; shows `capabilities.h264_encoders[0]` (the best encoder) and `torch_device`.
+  - A Retry button.
+  - Outside Electron (`window.teamtrauHost?.isElectron` false), it shows a "requires the desktop app" note.
+- **Jobs section:** newest first. Each row shows the kind, status badge, a progress bar (`src/components/ui/progress`), the message, the error in red, and a Cancel button while running.
+- Use one module-level store, created with the default engine client.
+- Sub-tab shell for the later panels (Ingest, Curation, Sequence, Deliver, Agent):
+  - Render only the tabs that exist.
+  - P3.1 ships **Engine & Jobs**.
+- Use `src/components/ui/*` and lucide icons. No new dependencies.
+
+**Sidebar hook** (the FreeCut edits allowed for this task)
+- `src/config/editor-workspaces.ts`: add `'teamtrau'` to `EditorSidebarTab` and to `SIDEBAR_TABS`.
+- `src/features/editor/components/media-sidebar.tsx`:
+  - Add a lazy panel and a category with icon `Clapperboard` and label `t('teamtrau.tabLabel')`.
+  - Add the activate-once block, following the AI tab exactly.
+- New `src/features/editor/deps/teamtrau-contract.ts`, which exports `importTeamTrauPanel = () => import('@/features/teamtrau/components/teamtrau-panel')`, plus `deps/teamtrau.ts` (`export * from './teamtrau-contract'`).
+- Edge budgets must still pass.
+
+**i18n**
+- `src/i18n/locales/partials/<lang>/teamtrau.json` for **every** language directory. The lazy-locale test needs the same partial files for all languages.
+- Translate `en` and `vi` properly. Other languages may reuse the English strings.
+- The Vietnamese locked test still holds: same keys, same placeholders, and at least 85% of strings translated overall.
+
+**Tests**
+- The LOCKED store test below.
+- Your own component test, using the mocked-store style of `media-card.test.tsx`: it renders the jobs list, the Cancel button calls `cancel`, and the engine-down state shows the error.
+
+**Manual acceptance (paste in the HANDOFF):**
+- In `npm run electron:dev`, the TeamTrau tab shows the engine connected, with the GPU encoder and `torch_device=cuda`.
+- Start a classify job on `E:\antigravity\perf-samples` from the devtools console (`teamtrau` store API) or a temporary debug button. A temporary button must be removed before commit.
+- Progress and the done state appear in the list.
+- Save a screenshot under the engine repo at `docs/superpowers/handoffs/p31_teamtrau_tab.png`.
+
+**Ladder**
+- the Studio ladder
+- `check:deps-contracts`
+- `check:deps-wrapper-health`
+- `check:edge-budgets`
+- `check-fallow-changed-health`
+- `vp build`
+- push WITH the hook
+
+**Files:**
+- `src/features/teamtrau/engine/engine-client.ts`
+- `src/features/teamtrau/jobs/*`
+- `src/features/teamtrau/components/teamtrau-panel.tsx` (+ test)
+- `src/features/editor/deps/teamtrau*.ts`
+- `src/config/editor-workspaces.ts`
+- `src/features/editor/components/media-sidebar.tsx`
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/jobs/__tests__/jobs-store.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/jobs/__tests__/jobs-store.test.ts`:**
+```ts
+import { describe, expect, it, vi } from 'vitest'
+
+import { createJobsStore, type EngineJobsClient } from '../jobs-store'
+
+type Job = { job_id: string; status: string; result: unknown; error: string | null }
+
+function fakeClient() {
+  const jobs = new Map<string, Job>()
+  const events = new Map<string, Record<string, unknown>[]>()
+  let next = 0
+  const client: EngineJobsClient = {
+    submitJob: vi.fn(async (kind: string) => {
+      if (kind === 'down') throw new Error('engine not running')
+      const id = `j${++next}`
+      jobs.set(id, { job_id: id, status: 'running', result: null, error: null })
+      events.set(id, [])
+      return id
+    }),
+    getJob: vi.fn(async (id: string) => jobs.get(id)! as never),
+    getEvents: vi.fn(async (id: string) => ({ events: events.get(id) ?? [] })),
+    cancel: vi.fn(async (id: string) => {
+      jobs.get(id)!.status = 'cancelled'
+      return { cancelled: true }
+    }),
+  }
+  return { client, jobs, events }
+}
+
+describe('engine jobs store', () => {
+  it('starts a job, newest first', async () => {
+    const { client } = fakeClient()
+    const store = createJobsStore(client, { pollMs: 0, now: () => 1000 })
+    const a = await store.getState().start('classify', { input_dir: 'D:/f' })
+    const b = await store.getState().start('curate', { input_dir: 'D:/f' })
+    expect(client.submitJob).toHaveBeenCalledWith('classify', { input_dir: 'D:/f' })
+    expect(store.getState().order).toEqual([b, a])
+    expect(store.getState().jobs[a]).toMatchObject({
+      id: a,
+      kind: 'classify',
+      status: 'running',
+      pct: 0,
+      message: '',
+      result: null,
+      error: null,
+      startedAt: 1000,
+    })
+  })
+
+  it('applies progress events and the final result on refresh', async () => {
+    const { client, jobs, events } = fakeClient()
+    const store = createJobsStore(client, { pollMs: 0 })
+    const id = await store.getState().start('curate', {})
+    events.get(id)!.push({ type: 'progress', pct: 40, msg: 'scoring' })
+    await store.getState().refresh(id)
+    expect(store.getState().jobs[id]).toMatchObject({ status: 'running', pct: 40, message: 'scoring' })
+
+    jobs.get(id)!.status = 'done'
+    jobs.get(id)!.result = { session_id: 's1' }
+    events.get(id)!.push({ type: 'done', result: { session_id: 's1' } })
+    await store.getState().refresh(id)
+    expect(store.getState().jobs[id]).toMatchObject({
+      status: 'done',
+      pct: 100,
+      result: { session_id: 's1' },
+    })
+  })
+
+  it('records failures and cancellation', async () => {
+    const { client, jobs } = fakeClient()
+    const store = createJobsStore(client, { pollMs: 0 })
+    const bad = await store.getState().start('deliver', {})
+    jobs.get(bad)!.status = 'failed'
+    jobs.get(bad)!.error = 'NVENC exploded'
+    await store.getState().refresh(bad)
+    expect(store.getState().jobs[bad]).toMatchObject({ status: 'failed', error: 'NVENC exploded' })
+
+    const c = await store.getState().start('assemble', {})
+    await store.getState().cancel(c)
+    expect(client.cancel).toHaveBeenCalledWith(c)
+    expect(store.getState().jobs[c]?.status).toBe('cancelled')
+  })
+
+  it('does not add a job when the engine is unreachable', async () => {
+    const { client } = fakeClient()
+    const store = createJobsStore(client, { pollMs: 0 })
+    await expect(store.getState().start('down', {})).rejects.toThrow('engine not running')
+    expect(store.getState().order).toEqual([])
+    expect(store.getState().lastError).toBe('engine not running')
+  })
+
+  it('polls running jobs until they finish when pollMs > 0', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, jobs } = fakeClient()
+      const store = createJobsStore(client, { pollMs: 100 })
+      const id = await store.getState().start('classify', {})
+      await vi.advanceTimersByTimeAsync(250)
+      expect((client.getJob as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2)
+      jobs.get(id)!.status = 'done'
+      await vi.advanceTimersByTimeAsync(150)
+      const calls = (client.getJob as ReturnType<typeof vi.fn>).mock.calls.length
+      await vi.advanceTimersByTimeAsync(500)
+      expect((client.getJob as ReturnType<typeof vi.fn>).mock.calls.length).toBe(calls)
+      expect(store.getState().jobs[id]?.status).toBe('done')
+      store.getState().dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../jobs-store"`.
+
+**Commit:** `feat(teamtrau): TeamTrau sidebar tab with engine status and job progress`.
