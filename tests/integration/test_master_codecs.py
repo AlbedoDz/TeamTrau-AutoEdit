@@ -19,6 +19,10 @@ from src.modules.subtitle_export import burn_filter
 from tests.integration.conftest import FFMPEG, stream_durations, stream_info
 
 FPS_NTSC = 30000 / 1001
+# Homebrew ffmpeg 9 ships without libass, so the subtitles filter is missing on macOS CI.
+_NEEDS_LIBASS = pytest.mark.skipif(
+    "subtitles" not in available_filters(), reason="ffmpeg built without libass (subtitles filter)"
+)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -311,6 +315,7 @@ def _bottom_diff(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.abs(a[h // 2:].astype(int) - b[h // 2:].astype(int)).mean())
 
 
+@_NEEDS_LIBASS
 def test_burn_in_vietnamese_subtitles_renders_and_writes_srt(tmp_path):
     clip = _grey_clip(tmp_path)
     st = _settings(w=640, h=360, fps=30.0, master="h264", subtitles="burn")
@@ -330,6 +335,7 @@ def test_burn_in_vietnamese_subtitles_renders_and_writes_srt(tmp_path):
     assert not plain.output_path.with_suffix(".srt").exists()
 
 
+@_NEEDS_LIBASS
 def test_burn_in_follows_timeline_time_across_clips(tmp_path):
     """A cue at 1.2-1.8 s lives in the second segment: its time must be offset by the first clip."""
     clip = _grey_clip(tmp_path, duration=4.0)
@@ -362,6 +368,7 @@ def test_ass_mode_writes_sidecars_without_burning(tmp_path):
     assert _bottom_diff(_frame(res.output_path, 30), _frame(plain.output_path, 30)) < 0.5
 
 
+@_NEEDS_LIBASS
 @pytest.mark.parametrize("folder", ["plain dir", "it's a dir", "thư mục tiếng Việt", "semi;colon [x], y"])
 def test_burn_filter_escaping_opens_awkward_paths(tmp_path, folder):
     """The generated filter string must let libass open files in Windows/Unicode/quoted folders."""
@@ -380,6 +387,7 @@ def test_burn_filter_escaping_opens_awkward_paths(tmp_path, folder):
     assert with_sub.returncode == 0, with_sub.stderr[-400:]
 
 
+@_NEEDS_LIBASS
 def test_burn_filter_renders_text_pixels(tmp_path):
     from src.modules.subtitle_export import write_srt
 

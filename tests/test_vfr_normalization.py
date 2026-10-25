@@ -109,7 +109,7 @@ def test_normalize_to_cfr_command_arguments(tmp_path: Path, sample_config: Pipel
         assert result_path == output_video
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
-        assert "-vsync" in cmd
+        assert "-fps_mode" in cmd and "-vsync" not in cmd
         assert "cfr" in cmd
         assert "-r" in cmd
         assert "30.0" in cmd

@@ -270,7 +270,10 @@ def snap_to_frame(t: float, fps: float | Fraction) -> float:
 
 def grid_points(bar_grid: MusicalBarGrid, duration: float) -> list[float]:
     """Allowed cut points: every bar start and half-bar midpoint strictly inside the track."""
-    bars = [b for b in bar_grid.bar_times if b >= 0.0]
+    eps = 1e-6
+    # A least-squares lattice can put the first downbeat a few ULPs below zero (it does on
+    # macOS arm64); that bar still starts the track and must not shift every slot by a bar.
+    bars = [max(b, 0.0) for b in bar_grid.bar_times if b >= -eps]
     if not bars:
         return []
     lens = np.diff(bars)
@@ -279,7 +282,6 @@ def grid_points(bar_grid: MusicalBarGrid, duration: float) -> list[float]:
         bar_len = 60.0 * bar_grid.beats_per_bar / bar_grid.tempo_bpm if bar_grid.tempo_bpm > 0 else 0.0
     if bar_len <= 0:
         return []
-    eps = 1e-6
     pts: list[float] = []
     for i, b in enumerate(bars):
         nxt = bars[i + 1] if i + 1 < len(bars) else b + bar_len

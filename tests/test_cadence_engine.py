@@ -489,3 +489,15 @@ def test_old_project_dicts_load_unchanged() -> None:
     assert "scene_start" in edit_clip_to_dict(c)
     tl = edit_timeline_from_dict({"name": "x", "fps": 24.0, "clips": [old_clip]})
     assert tl.bar_grid is None and tl.cut_snap_error_max_sec is None and len(tl.clips) == 1
+
+
+def test_first_bar_a_few_ulps_below_zero_still_starts_the_grid() -> None:
+    """macOS arm64 regression: a lattice downbeat at -1e-14 s shifted every slot by one bar."""
+    import dataclasses
+
+    secs = four_sections(2.0, (16, 16, 24, 8))
+    grid = grid_for(120, 64 * 2.0, secs)
+    shifted = dataclasses.replace(grid, bar_times=[-1e-14, *grid.bar_times[1:]])
+    cuts = generate_cadence_cuts(shifted, secs, "viral_burst", [4.0], 64 * 2.0, 30, 7)
+    assert cuts is not None
+    assert set(np.round(np.diff(cuts) / 2.0, 1)) == {4.0}
