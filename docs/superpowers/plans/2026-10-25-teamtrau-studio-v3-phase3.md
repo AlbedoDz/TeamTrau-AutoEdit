@@ -66,7 +66,7 @@
 | P3.3 | Studio | Curation panel: golden-takes grid (thumbnail, score, defects, role), include/exclude with P/X/F hotkeys, "Send to timeline" as ONE undo step | **yes (below)** |
 | P3.4 | Studio + timeline hook | Sequence panel: genre/cadence presets, soundtrack analysis, beat/bar/section ruler overlay, assemble job → timeline | **yes (below)** |
 | P3.5 | Studio | Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder | **yes (below)** |
-| P3.6 | Studio | Agent console: prompt box, streamed thoughts and tool calls, cancel | later |
+| P3.6 | Studio | Agent console: prompt box, streamed thoughts and tool calls, cancel | **yes (below)** |
 | G3 | Owner | Feature-parity checklist against the PySide6 GUI (scene grid badges, inspector settings, export panel, agent console) → freeze PySide6 (spec S7) | — |
 
 Global rules: R1–R15 from Phase 1/2, the Studio verification ladder, and isolation rules S3/S8. Studio pushes must pass the pre-push hook; `--no-verify` is never allowed.
@@ -1887,3 +1887,128 @@ describe('summarizePreflight', () => {
 **Expected red:** `Failed to resolve import "../deliver-form"`.
 
 **Commit:** `feat(teamtrau): deliver panel with pre-flight, NLE export and NVENC master`.
+
+
+---
+
+## P3.6 — Agent console (Studio repo)
+
+**API**
+```ts
+// src/features/teamtrau/agent/agent-transcript.ts (new, pure)
+export type TranscriptEntry =
+  | { kind: 'thought' | 'response' | 'error'; text: string }
+  | { kind: 'tool'; name: string; args: unknown; result: string | null; status: 'running' | 'done' }
+export function buildAgentTranscript(events: Record<string, unknown>[]):
+  { entries: TranscriptEntry[]; finalResponse: string | null; runningTools: number }
+```
+
+**Pure rules**
+- Events are the engine `agent` job events (P3.0d): `thought{text}`, `tool_call{name, args}`, `tool_result{name, result}`, `response{text}` and `error{message}`.
+- A `tool_result` completes the **most recent still-running** call of the same tool. When there is none, it becomes an orphan entry with `args: null` and status `done`.
+- Any other event type (`progress`, `done`, unknown) is ignored.
+- `finalResponse` is the last response text, or `null`.
+- `runningTools` counts the tool entries that are still running.
+
+**Panel**: an Agent sub-tab of the TeamTrau panel.
+- **Prompt:** a textarea. Ctrl+Enter or a "Run" button submits it; a blank prompt is rejected inline.
+- **Starting a run:** start the `agent` job through the jobs store.
+  - Extend `EngineJobView` with `events: Record<string, unknown>[]`, filled on every `refresh`.
+  - The locked P3.1 test uses `toMatchObject`, so an extra field is allowed. Do not edit that test.
+- **Transcript:** render it live from `buildAgentTranscript(view.events)`.
+  - Thoughts are muted italic, and responses render as markdown text.
+  - A tool entry is a collapsible card showing its name, a spinner while running, the args as JSON, and the result truncated with "show more".
+  - Errors are shown in red.
+- **Cancel:** a Cancel button while the run is in progress.
+- **History:** the session's earlier runs are listed (prompt, status); clicking one shows its transcript.
+- **No LLM configured:** the engine falls back to its local heuristic and reports `provider: "heuristic"` (P3.0d result). Show that as a badge, not as an error.
+- **i18n:** `en` and `vi` translated, and every language file present.
+
+**Tests**
+- The LOCKED `agent-transcript` test.
+- Your own component test with mocked stores: submitting creates a job; the transcript renders a running tool card that becomes done after a refresh; Cancel calls `cancel`.
+
+**Manual acceptance (paste in the HANDOFF; same real-workspace rule as P3.5):**
+- In Electron, prompt in Vietnamese: "Phân tích thư mục E:/antigravity/demo-footage và cho biết có bao nhiêu take tốt".
+- Show the streamed transcript (thoughts and tool calls) and the final response, together with the provider badge.
+- Screenshot to `docs/superpowers/handoffs/p36_agent.png` (engine repo).
+
+**Ladder:** as in P3.5, plus push WITH the hook.
+
+**Files:**
+- `src/features/teamtrau/agent/*`
+- `src/features/teamtrau/jobs/jobs-store.ts` (the `events` field)
+- `src/features/teamtrau/components/*`
+- `src/i18n/locales/partials/*/teamtrau.json`
+- `src/features/teamtrau/agent/__tests__/agent-transcript.test.ts` (LOCKED)
+
+**Contract test — `src/features/teamtrau/agent/__tests__/agent-transcript.test.ts`:**
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { buildAgentTranscript } from '../agent-transcript'
+
+describe('buildAgentTranscript', () => {
+  it('turns engine agent events into an ordered transcript, pairing tool calls with results', () => {
+    const t = buildAgentTranscript([
+      { type: 'thought', text: 'Plan the edit' },
+      { type: 'tool_call', name: 'curate_footage', args: { input_dir: 'D:/f' } },
+      { type: 'progress', pct: 40, msg: 'ignored' },
+      { type: 'tool_call', name: 'analyze_soundtrack', args: { path: 'D:/m.wav' } },
+      { type: 'tool_result', name: 'curate_footage', result: '{"takes": 3}' },
+      { type: 'response', text: 'Done: 3 takes.' },
+    ])
+    expect(t.entries).toEqual([
+      { kind: 'thought', text: 'Plan the edit' },
+      {
+        kind: 'tool',
+        name: 'curate_footage',
+        args: { input_dir: 'D:/f' },
+        result: '{"takes": 3}',
+        status: 'done',
+      },
+      { kind: 'tool', name: 'analyze_soundtrack', args: { path: 'D:/m.wav' }, result: null, status: 'running' },
+      { kind: 'response', text: 'Done: 3 takes.' },
+    ])
+    expect(t.finalResponse).toBe('Done: 3 takes.')
+    expect(t.runningTools).toBe(1)
+  })
+
+  it('pairs results with the most recent unfinished call of the same tool', () => {
+    const t = buildAgentTranscript([
+      { type: 'tool_call', name: 'probe', args: { i: 1 } },
+      { type: 'tool_call', name: 'probe', args: { i: 2 } },
+      { type: 'tool_result', name: 'probe', result: 'r2' },
+      { type: 'tool_result', name: 'probe', result: 'r1' },
+    ])
+    expect(t.entries.map((e) => (e.kind === 'tool' ? [e.args, e.result] : null))).toEqual([
+      [{ i: 1 }, 'r1'],
+      [{ i: 2 }, 'r2'],
+    ])
+    expect(t.runningTools).toBe(0)
+  })
+
+  it('keeps orphan results and errors, and ignores unknown event types', () => {
+    const t = buildAgentTranscript([
+      { type: 'tool_result', name: 'lost', result: 'x' },
+      { type: 'error', message: 'LLM unreachable' },
+      { type: 'done', result: {} },
+      { type: 'mystery' },
+    ])
+    expect(t.entries).toEqual([
+      { kind: 'tool', name: 'lost', args: null, result: 'x', status: 'done' },
+      { kind: 'error', text: 'LLM unreachable' },
+    ])
+    expect(t.finalResponse).toBeNull()
+  })
+})
+```
+**Expected red:** `Failed to resolve import "../agent-transcript"`.
+
+**Commit:** `feat(teamtrau): agent console with streamed thoughts and tool calls`.
+
+---
+
+## Gate G3 (owner): feature parity checklist
+
+The architect prepares `docs/teamtrau/G3-parity.md` from the PySide6 inventory (scene grid, inspector, export panel, agent console, media browser). It marks each feature as Done (with the Studio panel), Partial or Missing, with screenshots. The owner signs off before the PySide6 GUI is frozen (spec S7).
