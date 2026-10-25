@@ -261,3 +261,56 @@ def test_freecut_writer_attaches_proxies(tmp_path: Path):
     media_id = links["mediaIds"][0]["id"]
     media_meta = json.loads((workspace / "media" / media_id / "metadata.json").read_text(encoding="utf-8"))
     assert media_meta.get("contentHash") == proxy_key
+
+
+def test_freecut_writer_reuses_existing_workspace_media(tmp_path: Path):
+    workspace = tmp_path / "studio_ws"
+    media_file_1 = tmp_path / "shot_01.mp4"
+    media_file_1.write_bytes(b"dummy video data 1")
+
+    clip1 = EditClip(
+        source_path=media_file_1,
+        source_in=0.0,
+        frames=60,
+        available=10.0,
+        label="Shot 1",
+    )
+    timeline1 = EditTimeline(
+        name="Timeline 1",
+        fps=30.0,
+        canvas_width=1920,
+        canvas_height=1080,
+        clips=[clip1],
+    )
+
+    # First write creates media folder
+    p1 = write_freecut_project(timeline1, workspace, "Project 1")
+    media_folders_p1 = list((workspace / "media").glob("m-*"))
+    assert len(media_folders_p1) == 1
+    media_id_1 = media_folders_p1[0].name
+
+    p1_links = json.loads((workspace / "projects" / p1 / "media-links.json").read_text(encoding="utf-8"))
+    assert p1_links["mediaIds"][0]["id"] == media_id_1
+
+    # Second write for another project in same workspace referencing the same media
+    timeline2 = EditTimeline(
+        name="Timeline 2",
+        fps=30.0,
+        canvas_width=1920,
+        canvas_height=1080,
+        clips=[clip1],
+    )
+    p2 = write_freecut_project(timeline2, workspace, "Project 2")
+
+    # MUST reuse existing media ID, NOT create a second m-* folder
+    media_folders_p2 = list((workspace / "media").glob("m-*"))
+    assert len(media_folders_p2) == 1
+
+    p2_links = json.loads((workspace / "projects" / p2 / "media-links.json").read_text(encoding="utf-8"))
+    assert len(p2_links["mediaIds"]) == 1
+    assert p2_links["mediaIds"][0]["id"] == media_id_1
+
+    p2_project = json.loads((workspace / "projects" / p2 / "project.json").read_text(encoding="utf-8"))
+    video_item = [i for i in p2_project["timeline"]["items"] if i["type"] == "video"][0]
+    assert video_item["mediaId"] == media_id_1
+

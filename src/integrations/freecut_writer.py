@@ -203,6 +203,31 @@ def write_freecut_project(
     path_to_meta: dict[Path, dict[str, Any]] = {}
     media_links: list[dict[str, Any]] = []
 
+    # Pre-populate from existing workspace media so multiple projects share stable media IDs
+    if media_dir_root.is_dir():
+        for existing_dir in sorted(media_dir_root.iterdir()):
+            if not existing_dir.is_dir() or not existing_dir.name.startswith("m-"):
+                continue
+            link_file = existing_dir / "source.link.json"
+            if link_file.exists():
+                try:
+                    link_info = json.loads(link_file.read_text(encoding="utf-8"))
+                    link_path_str = link_info.get("path")
+                    if link_path_str:
+                        src_p = Path(link_path_str).resolve()
+                        if src_p not in path_to_media_id:
+                            path_to_media_id[src_p] = existing_dir.name
+                            meta_file = existing_dir / "metadata.json"
+                            if meta_file.exists():
+                                try:
+                                    path_to_meta[src_p] = json.loads(
+                                        meta_file.read_text(encoding="utf-8")
+                                    )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
     shots_by_source: dict[Path, list[dict[str, Any]]] = {}
     if shots:
         for shot_id, sc in shots.items():
@@ -249,7 +274,53 @@ def write_freecut_project(
     def register_media(file_path: Path, is_soundtrack: bool = False) -> str:
         resolved_path = Path(file_path).resolve()
         if resolved_path in path_to_media_id:
-            return path_to_media_id[resolved_path]
+            existing_mid = path_to_media_id[resolved_path]
+            if not any(link["id"] == existing_mid for link in media_links):
+                media_links.append({
+                    "id": existing_mid,
+                    "addedAt": now_ms,
+                })
+            if resolved_path not in path_to_meta:
+                path_to_meta[resolved_path] = probe_file_stats(
+                    resolved_path, default_fps=timeline.fps
+                )
+
+            # Update sidecar teamtrau.json if shots are present
+            if shots and not is_soundtrack:
+                item_media_dir = media_dir_root / existing_mid
+                ai_dir = item_media_dir / "cache" / "ai"
+                ai_dir.mkdir(parents=True, exist_ok=True)
+                takes = shots_by_source.get(resolved_path, [])
+                if takes:
+                    best_take = max(takes, key=lambda t: t["composite"])
+                    role = best_take["content_role"]
+                    score = best_take["composite"]
+                    is_golden = any(t["golden"] is not None for t in takes)
+                else:
+                    role = None
+                    score = None
+                    is_golden = False
+                    takes = []
+                sidecar_json = {
+                    "schemaVersion": 1,
+                    "kind": "teamtrau",
+                    "mediaId": existing_mid,
+                    "service": "teamtrau-curate",
+                    "model": "teamtrau-v3",
+                    "params": {},
+                    "createdAt": now_ms,
+                    "updatedAt": now_ms,
+                    "data": {
+                        "sourcePath": str(resolved_path),
+                        "role": role,
+                        "score": score,
+                        "is_golden": is_golden,
+                        "takes": takes,
+                    },
+                }
+                _write_json_atomic(ai_dir / "teamtrau.json", sidecar_json)
+
+            return existing_mid
 
         media_id = f"m-{uuid.uuid4()}"
         path_to_media_id[resolved_path] = media_id

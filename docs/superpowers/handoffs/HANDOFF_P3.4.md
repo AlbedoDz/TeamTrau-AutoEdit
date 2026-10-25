@@ -2,6 +2,7 @@
 STATUS: DONE
 BRANCH / COMMIT: teamtrau/main da247c3b feat(teamtrau): sequence panel with soundtrack analysis, beat-grid ruler overlay and cadence assemble
 STUDIO COMMIT: da247c3b999120ba7eef095efab3bc3e34b9e116
+ENGINE COMMIT: fix(teamtrau): engine-written projects open with their media
 FILES CHANGED:
 - docs/teamtrau/CHANGELOG.md
 - electron/main.cjs
@@ -80,11 +81,12 @@ Observed live in Electron (verified with Playwright automation):
    - Executed atomic timeline command `TEAMTRAU_BAR_MARKERS` in exactly one undo step
    - Success notification displayed: `16 bar markers added` (`[data-testid="marker-message"]`)
 8. Cadence dropdown defaulted to `balanced_narrative` (populated from engine presets: `fast_syncopated`, `balanced_narrative`, `lingering_cinematic`, `viral_burst`).
-9. Clicked "Assemble sequence" (`[data-testid="assemble-button"]`): job `assemble` completed, producing sequence project `p-dee6e9e4-267a-4f3b-82ec-881faaa59930`.
+9. Clicked "Assemble sequence" (`[data-testid="assemble-button"]`): job `assemble` completed, producing sequence project `p-5345cb0d-b694-4f3c-8849-795b16578767`.
 10. Clicked "Open sequence project" (`[data-testid="open-sequence-project"]`):
-    - Editor navigated to `http://127.0.0.1:3436/editor/p-dee6e9e4-267a-4f3b-82ec-881faaa59930`
+    - Editor navigated to `http://127.0.0.1:20787/editor/p-5345cb0d-b694-4f3c-8849-795b16578767`
     - Timeline loaded 29 assembled clips (Track V1: 14 video clips, Track A1: 14 linked audio clips, Track A2: 1 music soundtrack clip)
     - Beat grid ruler overlay is visible above the assembled timeline clips
-11. Screenshot captured to `docs/superpowers/handoffs/p34_sequence.png`.
+    - Zero orphaned clips, no missing media dialog ({ "hasDialog": false, "hasMissingMedia": false })
+11. Screenshot captured to `docs/superpowers/handoffs/p34_sequence.png` and `docs/superpowers/handoffs/p34_sequence_fixed.png`.
 DEVIATIONS FROM PLAN: none
 OPEN QUESTIONS / BLOCKERS: none
