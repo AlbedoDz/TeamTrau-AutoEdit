@@ -48,8 +48,8 @@
 | **P5.0** | Engine | Portability core: OS data dir + `serve --data-dir/--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, fusionscript name, no Qt on import, declared deps, portable test fix | **yes (below)** |
 | P5.1 | Engine | CI (`.github/workflows/engine-ci.yml`, contract `tests/test_engine_ci_p51.py`): Linux on every push, Windows + macOS on PRs to main and manual runs (owner choice: Actions minutes); CPU torch at the locked version; ffmpeg per OS; Qt offscreen (GUI tests run, no marker). Written by the architect; failures found by the first runs become P5.1b | done (architect) |
 | **P5.2** | Studio | (done, `3231dea7`) Shell portability: fixed `app://teamtrau` origin (persistence bug confirmed), packaged-engine launch branch, engine-missing warning, macOS activate, GPU auto off Windows; CI: push on `teamtrau/main` plus an `electron-shell` OS matrix | **yes (below)** |
-| **P5.3** | Engine | PyInstaller **onedir** "lite" sidecar (spike: 487 MB, healthy in 2 s) + pinned ffmpeg with SHA-256 + numba cache in the data dir + smoke test | **yes (below)** |
-| P5.4 | Studio | electron-builder config (NSIS / dmg+zip / AppImage+deb), `extraResources` engine, exclude source maps, tag-triggered packaging workflow, unsigned artifacts | later |
+| **P5.3** | Engine | (done, `f83cc58`; shared ffmpeg `c4c65fd`) PyInstaller **onedir** "lite" sidecar (spike: 487 MB, healthy in 2 s) + pinned ffmpeg with SHA-256 + numba cache in the data dir + smoke test | **yes (below)** |
+| **P5.4** | Studio | Local Windows NSIS installer (electron-builder, sidecar as `extraResources`, no source maps). Owner: CI packaging (dmg/AppImage, cross-repo token) later | **yes (below)** |
 | P5.5 | Engine | Renderer encoder ladder from `platform_caps` (VideoToolbox / QSV / AMF / VAAPI) with tests | later |
 | G5 | Owner | Signing credentials (Authenticode, Apple Developer ID + notarisation) and the release channel | — |
 
@@ -854,4 +854,143 @@ def test_spec_uses_the_shared_exclusions_and_ships_the_resolve_worker_source():
     assert "EXCLUDED_MODULES" in spec
     assert "resolve_worker.py" in spec
     assert "teamtrau_engine.py" in spec
+```
+
+---
+
+## P5.4 — Local Windows installer (Studio repo, branch `teamtrau/main`)
+
+**Owner decision (2026-10-25):**
+- Build the Windows NSIS installer locally first, with the lite sidecar taken from the engine dist and the shared ffmpeg build.
+- Cross-repo CI packaging comes later. It needs a read token for the private engine repo, stored as a Studio repo secret.
+
+**Architect spike (scratch, electron-builder 26.18.0, Electron 42.11.15, engine `c4c65fd` sidecar)**
+- **Build:** electron-builder with `electronDist` pointed at the installed `node_modules/electron/dist` (no Electron download) builds `TeamTrau-Studio-Setup-0.1.0.exe` in about 2.5 minutes.
+  - The installer is 345 MB and `win-unpacked` is 1.2 GB.
+  - `app.asar` contains no `.map` files and no `__tests__`.
+- **Packaged shell:** the shell only needs Node built-ins plus its own `electron/*.cjs` modules, so the packaged app needs no `node_modules`.
+- **`win-unpacked` launched through CDP:**
+  - `location.origin` is `app://teamtrau` and `crossOriginIsolated` is `true`.
+  - `/engine/v1/health` returns 200 from the **bundled sidecar** (packaged mode of `engine-launch.cjs`).
+  - `/v1/capabilities.ffmpeg` points to `resources\engine\tools\ffmpeg.EXE`.
+  - The `[gpu]` log shows the RTX 3070.
+  - After the app is killed, no `teamtrau-engine.exe` process is left.
+- **Engine side (done by the architect, `c4c65fd`):** the Windows sidecar bundles the shared ffmpeg build, which shrinks `tools/` from 314 MB to 192 MB.
+
+**API (`electron/builder-config.cjs`, new)**
+```js
+function defaultEngineDist(studioRoot, env) // TEAMTRAU_ENGINE_DIST, else <studioRoot>/../TeamTrau-AutoEdit/dist/teamtrau-engine
+function builderConfig({ studioRoot, engineDist, platform = process.platform, exists = fs.existsSync }) // electron-builder config object
+```
+
+**Rules**
+- **`builderConfig`:**
+  - Returns exactly what the locked test expects. Use `win.icon` = `public/icons/icon-512.png`.
+  - On `win32` it throws when `<engineDist>/teamtrau-engine.exe` or `<engineDist>/tools/ffmpeg.exe` is missing. The message names the missing path and the command `python -m release.sidecar build`.
+  - It never throws for other platforms (CI packaging is later).
+- **`electron-builder.config.cjs`** (new, repo root): `module.exports = builderConfig({ studioRoot: __dirname, engineDist: defaultEngineDist(__dirname, process.env) })`.
+- **`package.json`:**
+  - Add the devDependency `"electron-builder": "26.18.0"` (exact) with `npm install -D electron-builder@26.18.0`, and commit the `package-lock.json` change.
+  - Add the script `"dist:win": "vp build && electron-builder --win --config electron-builder.config.cjs"`.
+  - Do **not** rename the package: keep `name: "freecut"`, the FreeCut internal ids. The packaged identity comes from `productName`/`extraMetadata`, so the installed app keeps its data in `%APPDATA%\TeamTrau Studio`, separate from the development profile.
+- **Output:** `out/installer/`, which is already ignored through `out`; check this.
+- **Documentation:** `docs/teamtrau/packaging.md` (new, short), covering:
+  - The prerequisites, and how to build the sidecar in the engine repo.
+  - `npm run dist:win`.
+  - `TEAMTRAU_ENGINE_DIST`.
+  - Where the installer lands.
+  - That the build is unsigned, so Windows SmartScreen will warn until gate G5 signing.
+  - The ffmpeg GPL notice: `tools/FFMPEG-LICENSE.txt` ships with the app.
+
+**Files**
+- `electron/builder-config.cjs` (new) and `electron-builder.config.cjs` (new)
+- `package.json`, `package-lock.json`
+- `docs/teamtrau/packaging.md` (new), `docs/teamtrau/CHANGELOG.md`
+- `electron/__tests__/builder-config.test.cjs` (LOCKED, new)
+
+**Validation:** the locked test passes (6 tests) against a reference implementation. The reference config, wrapped exactly as the root config above, built a working installer in the spike.
+**Expected red:** `Cannot find module '../builder-config.cjs'`.
+
+**Acceptance (Windows, this machine; paste raw output and screenshots in the HANDOFF)**
+1. In the engine repo, `dist/teamtrau-engine` already exists from `c4c65fd`. Rebuild it only if it is missing, with `python -m release.sidecar build`.
+2. Run `npm run dist:win` in the Studio repo. Paste the tail of the log, the installer file name and size, the `win-unpacked` size, and the `.map` count inside `app.asar` (must be 0; `npx asar list`).
+3. Install silently into a scratch folder: `TeamTrau-Studio-Setup-<v>.exe /S /D=<scratch>\TeamTrauStudio` (the `/D` argument must be last and unquoted).
+4. Launch the installed exe with `--remote-debugging-port=9333`. Report `location.origin`, `crossOriginIsolated`, `/engine/v1/health` and the `ffmpeg` field of `/engine/v1/capabilities` (it must be under the install folder).
+5. In the installed app, pick the same real workspace folder used in P3/P4/P5.2 (native handle, no OPFS) and open one project.
+   - Run Sequence → Analyze soundtrack, and play 5 s of the timeline.
+   - Screenshot both, as `p54_installed_editor.png` and `p54_installed_job.png`.
+6. Quit the app, then show that no `teamtrau-engine.exe` process remains (`tasklist`).
+7. Uninstall silently with the uninstaller in the install folder (`/S`). Show that the install folder is gone and that `%APPDATA%\TeamTrau Studio` is still there.
+8. The `npm run test:electron` output, plus the Studio verification ladder: `vp check`, `vp test run` for the TeamTrau suites, and `vp build`.
+
+**Commit:** `feat(teamtrau): local Windows installer with the bundled engine sidecar (electron-builder NSIS)`.
+
+**Contract test — `electron/__tests__/builder-config.test.cjs`:**
+```js
+// P5.4 electron-builder config: Windows NSIS installer with the PyInstaller engine sidecar as extraResources.
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const path = require('node:path')
+
+const { builderConfig, defaultEngineDist } = require('../builder-config.cjs')
+
+const STUDIO = path.resolve('/src/teamtrau-studio')
+const ENGINE = path.resolve('/src/TeamTrau-AutoEdit/dist/teamtrau-engine')
+
+function config(over = {}) {
+  return builderConfig({ studioRoot: STUDIO, engineDist: ENGINE, platform: 'win32', exists: () => true, ...over })
+}
+
+test('identity: TeamTrau Studio app id, product name and packaged metadata', () => {
+  const c = config()
+  assert.equal(c.appId, 'com.teamtrau.studio')
+  assert.equal(c.productName, 'TeamTrau Studio')
+  assert.equal(c.extraMetadata.productName, 'TeamTrau Studio')
+  assert.equal(c.extraMetadata.main, 'electron/main.cjs')
+})
+
+test('packs the built renderer and the Electron shell only, without source maps or tests', () => {
+  const c = config()
+  assert.equal(c.asar, true)
+  for (const pattern of ['electron/**/*.cjs', '!electron/__tests__/**', 'dist/**/*', '!dist/**/*.map', 'package.json']) {
+    assert.ok(c.files.includes(pattern), pattern)
+  }
+  assert.ok(!c.files.some((f) => f === '**/*' || f.startsWith('src/') || f.startsWith('node_modules')), c.files.join(','))
+  assert.deepEqual(c.directories, { output: 'out/installer' })
+})
+
+test('reuses the installed Electron and ships the engine sidecar outside the asar', () => {
+  const c = config()
+  assert.equal(c.electronDist, path.join(STUDIO, 'node_modules', 'electron', 'dist'))
+  assert.deepEqual(c.extraResources, [{ from: ENGINE, to: 'engine', filter: ['**/*'] }])
+})
+
+test('Windows target is a per-user NSIS x64 installer with a chosen directory', () => {
+  const c = config()
+  assert.deepEqual(c.win.target, [{ target: 'nsis', arch: ['x64'] }])
+  assert.equal(c.nsis.oneClick, false)
+  assert.equal(c.nsis.perMachine, false)
+  assert.equal(c.nsis.allowToChangeInstallationDirectory, true)
+  assert.match(c.nsis.artifactName, /\$\{version\}/)
+  assert.equal(c.nsis.deleteAppDataOnUninstall, false)
+})
+
+test('refuses to build without the engine sidecar and says how to make it', () => {
+  const exe = path.join(ENGINE, 'teamtrau-engine.exe')
+  assert.throws(() => config({ exists: (p) => p !== exe }), (err) => {
+    assert.ok(err.message.includes(exe), err.message)
+    assert.ok(err.message.includes('python -m release.sidecar build'), err.message)
+    return true
+  })
+  const tools = path.join(ENGINE, 'tools', 'ffmpeg.exe')
+  assert.throws(() => config({ exists: (p) => p !== tools }), /ffmpeg/)
+  const linux = config({ platform: 'linux', exists: (p) => p !== exe })
+  assert.equal(linux.extraResources[0].from, ENGINE)
+})
+
+test('engine dist defaults to the sibling engine checkout and honours TEAMTRAU_ENGINE_DIST', () => {
+  assert.equal(defaultEngineDist(STUDIO, {}), path.resolve(STUDIO, '..', 'TeamTrau-AutoEdit', 'dist', 'teamtrau-engine'))
+  const custom = path.resolve('/x/engine')
+  assert.equal(defaultEngineDist(STUDIO, { TEAMTRAU_ENGINE_DIST: custom }), custom)
+})
 ```
