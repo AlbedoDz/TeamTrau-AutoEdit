@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- fix(engine): face detection uses OpenCV's YuNet `FaceDetectorYN` with the bundled `face_detection_yunet_2023mar.onnx` (opencv_zoo, MIT); OpenCV 5 removed the Haar `CascadeClassifier`, so every clip reported `face_detector_unavailable` and A-roll detection relied on speech alone. The sidecar bundles the model and its smoke test fails without it
 - fix(engine): Deliver names output files through `sanitize_workspace_filename` (a project name with `:` or `/` made the master render and the FCPXML fail with WinError 87); generated project names use `23h58` instead of `23:58`
 - fix(engine): cadence allocation borrows unused footage from other scenes once a section's motion pool is used up, instead of alternating two shots and repeating them (a 24 s buildup with two mid-motion takes)
 - feat(engine-api): curation sessions are saved to `{workspace}/.teamtrau/sessions/{id}.json` when curated, edited or assembled, and read back by a restarted engine (`?workspace=` on GET/PATCH `/v1/sessions/{id}`, assemble jobs); take edits also update the media `cache/ai/teamtrau.json` sidecars; generated projects are named `<footage folder> – Rough cut|Sequence (<cadence>) – <date time>` instead of `Curated Rough Cut` / `Assembled Sequence`
