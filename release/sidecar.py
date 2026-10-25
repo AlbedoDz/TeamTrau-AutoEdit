@@ -18,6 +18,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -56,6 +57,7 @@ class FfmpegAsset:
     url: str
     sha256: str
     members: dict[str, str]  # archive basename -> file name in tools/
+    libraries: str = ""  # fnmatch pattern of shared libraries copied next to the tools, names kept
 
 
 _BTBN_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-24-13-02"
@@ -63,13 +65,16 @@ _BTBN_BASE = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-
 _FFMPEG_ASSETS: dict[OsName, list[FfmpegAsset]] = {
     "windows": [
         FfmpegAsset(
-            url=f"{_BTBN_BASE}/ffmpeg-n8.1.3-24-g92611900bb-win64-gpl-8.1.zip",
-            sha256="0b1a903367bfbe906125aad78069e3b9dfecac74ea76db05ada2e667c80ac2c9",
+            # Shared build: the exes load avcodec/avformat/... DLLs from their own folder, which
+            # saves ~115 MB against the static build (each static exe embeds every library).
+            url=f"{_BTBN_BASE}/ffmpeg-n8.1.3-24-g92611900bb-win64-gpl-shared-8.1.zip",
+            sha256="d51f8d562fe3dddd0b65f98871c715a2f5471d3589f004ed2c018f18b6b23e3f",
             members={
                 "ffmpeg.exe": "ffmpeg.exe",
                 "ffprobe.exe": "ffprobe.exe",
                 "LICENSE.txt": "FFMPEG-LICENSE.txt",
             },
+            libraries="*.dll",
         ),
     ],
     "linux": [
@@ -143,10 +148,20 @@ def verify_sha256(path: Path, expected: str) -> None:
         raise ValueError(f"SHA-256 mismatch for {path.name}: expected {expected}, got {actual}")
 
 
+def _target(asset: FfmpegAsset, base: str) -> str | None:
+    """File name in tools/ for an archive basename, or None when it is not wanted."""
+    if base in asset.members:
+        return asset.members[base]
+    if asset.libraries and fnmatch(base, asset.libraries):
+        return base
+    return None
+
+
 def extract_tools(archive: Path, asset: FfmpegAsset, tools_dir: Path) -> list[Path]:
-    """Extract mapped members from a .zip or .tar.xz archive into tools_dir."""
+    """Extract mapped members (and matching shared libraries) from a .zip or .tar.xz archive."""
     tools_dir.mkdir(parents=True, exist_ok=True)
     found: set[str] = set()
+    libraries: list[Path] = []
 
     if archive.name.lower().endswith(".zip"):
         with zipfile.ZipFile(archive, "r") as zf:
@@ -154,35 +169,41 @@ def extract_tools(archive: Path, asset: FfmpegAsset, tools_dir: Path) -> list[Pa
                 if info.is_dir():
                     continue
                 base = PurePosixPath(info.filename.replace("\\", "/")).name
-                if base in asset.members:
-                    dest = tools_dir / asset.members[base]
+                target = _target(asset, base)
+                if target is not None:
+                    dest = tools_dir / target
                     with zf.open(info, "r") as src, dest.open("wb") as dst:
                         shutil.copyfileobj(src, dst)
                     if os.name != "nt":
                         dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                     found.add(base)
+                    if base not in asset.members:
+                        libraries.append(dest)
     else:
         with tarfile.open(archive, "r:*") as tf:
             for member in tf.getmembers():
                 if not member.isfile():
                     continue
                 base = PurePosixPath(member.name.replace("\\", "/")).name
-                if base in asset.members:
+                target = _target(asset, base)
+                if target is not None:
                     src_f = tf.extractfile(member)
                     if src_f is None:
                         continue
-                    dest = tools_dir / asset.members[base]
+                    dest = tools_dir / target
                     with src_f, dest.open("wb") as dst:
                         shutil.copyfileobj(src_f, dst)
                     if os.name != "nt":
                         dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                     found.add(base)
+                    if base not in asset.members:
+                        libraries.append(dest)
 
     missing = sorted(set(asset.members.keys()) - found)
     if missing:
         raise ValueError(f"Archive {archive.name} is missing required member(s): {', '.join(missing)}")
 
-    return [tools_dir / asset.members[k] for k in asset.members]
+    return [tools_dir / asset.members[k] for k in asset.members] + libraries
 
 
 def _download_asset(asset: FfmpegAsset, downloads_dir: Path, timeout_sec: float = 300.0) -> Path:

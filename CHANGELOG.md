@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- build(engine): Windows sidecar bundles the shared ffmpeg build (tools 314 MB -> 192 MB); FfmpegAsset.libraries copies matching DLLs
 - feat(engine): PyInstaller lite sidecar build with pinned ffmpeg and smoke test
 - test(engine): HDR tone-map test measures luma with the ffmpeg CLI (opencv-python decodes 10-bit PQ differently per OS)
 - fix(engine): NVENC availability is confirmed with a one-frame test encode (distro ffmpeg lists NVENC without a GPU); CI uses ffmpeg 8.1 on Linux; platform_caps test is host-independent
