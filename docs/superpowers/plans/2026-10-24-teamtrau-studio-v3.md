@@ -85,7 +85,8 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 4.2 Perf meter (shown / repeated / dropped, worst wait) + wire adaptive preview quality to real render scale; Full/½/¼ playback resolution.
 - 4.3 Meet spec §5 targets; benchmark script in CI-able form.
 
-## Phase 5 — Cross-platform release  *(detailed after G0)*
+## Phase 5 — Cross-platform release
+**Rolling-wave plan: `2026-10-25-teamtrau-studio-v3-phase5.md` (P5.0 detailed).**
 - 5.1 CI matrix windows/macos/ubuntu: pytest (CPU), Studio vitest, packaged smoke start.
 - 5.2 Packaging: electron-builder (NSIS/MSI, DMG signed+notarized, AppImage/deb) + PyInstaller engine sidecar + ffmpeg per OS.
 
