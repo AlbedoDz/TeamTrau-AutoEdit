@@ -13,7 +13,7 @@
 |---|---|---|
 | Rough Cut stage (ingest + defect pruning) | Ingest → Curate (job `curate`) | Done |
 | Sequence stage (cadence assemble) | Sequence → Assemble (job `assemble`) | Done |
-| "Run All" one-click | — | Missing (two clicks today) |
+| "Run All" one-click | Ingest → Run All (Analyze → Curate → Assemble, with cancel) — P3.7b | Done |
 | Stop / cancel a running job | Engine & Jobs → Cancel (every job kind) | Done |
 | Stage availability gating | Buttons are disabled until their inputs exist (folder, session) | Done |
 | Progress per stage | Jobs list with progress and message | Done |
@@ -37,9 +37,9 @@
 | Include / exclude a take | Toggle plus P / X hotkeys, PATCH to the engine session | Done |
 | Role override | Role select, PATCH `content_role` | Done (new: PySide6 had no ContentRole override) |
 | Min-score filter, role filter, sort | Yes | Done |
-| Include all / exclude all / exclude dead air | — | Missing |
-| Badges: trimmed, long shot, dead air, deflicker | Only golden window and defect chips | Partial |
-| Inspector: sharpness, aesthetic, motion, crop window, VLM fields | Composite score only | Partial |
+| Include all / exclude all / exclude dead air / exclude below score | Bulk toolbar, one PATCH each — P3.7b | Done |
+| Badges: trimmed, long shot, dead air, deflicker | Badge chips from `?detail=1` — P3.7b | Done |
+| Inspector: sharpness, aesthetic, motion, crop window, VLM fields | Take inspector (raw metrics, golden window, trimmed, defects, VLM); crop window not shown — P3.7b | Done |
 | VLM tagging | — | Missing |
 | Send takes to timeline | One undo step (new; PySide6 re-ran the sequence) | Done |
 
@@ -49,8 +49,8 @@
 |---|---|---|
 | Genre preset | Ingest genre select (`/v1/presets`) | Done |
 | Cadence profile | Sequence cadence select | Done |
-| Long-shot and max-scene limits, defect-pruning toggles, minimum take length | — | Missing |
-| Duration mode, AI toggles, reframing, subtitles, Ken Burns, speed ramping, watermark, teaser | — (subtitles exist in Deliver only) | Missing |
+| Long-shot and max-scene limits, defect-pruning toggles, minimum take length | Ingest → Advanced (curate options) — P3.7b | Done |
+| Duration mode, reframing, Ken Burns, speed ramping, watermark, teaser | Sequence → Advanced (assemble options) — P3.7b; subtitles in Deliver | Done |
 
 ## Timeline
 
@@ -78,12 +78,20 @@
 | PySide6 feature | Studio | Status |
 |---|---|---|
 | Agent console | Agent tab with streamed thoughts and tool cards, cancel, history | Done |
-| AI endpoint settings (API key, ping) | — (the agent runs in heuristic mode without a key) | Missing |
+| AI endpoint settings (provider, model, API key) | Engine & Jobs → AI settings; key never returned — P3.7a/b | Done (no ping button) |
 | Vietnamese UI | Full `vi` locale | Done (new) |
 | Offline use | Electron offline, local fonts | Done (new) |
 | Cross-platform | Electron + Python engine (Windows verified) | Done on Windows; macOS/Linux in Phase 5 |
 
-## Summary
+## Update after P3.7 (2026-10-25)
+P3.7a (engine) and P3.7b (Studio) closed the in-scope gaps; see the rows marked P3.7. The architect also fixed the
+inspector showing raw scores as percentages (Studio `e24fd70b`).
+Still open (owner: deferred to Phase 6): multi-variant timelines and their deliver list, VLM tagging UI, genre
+recommender, camera role, snap-error badge, probe columns in the Ingest table, card thumbnails.
+
+**G3: signed by the owner on 2026-10-25 → PySide6 GUI frozen (spec S7).**
+
+## Summary (before P3.7)
 - **Done:** 27.
 - **Partial:** 3 — probe info in Ingest, scene badges, the inspector detail fields.
 - **Missing:** 12. Grouped:

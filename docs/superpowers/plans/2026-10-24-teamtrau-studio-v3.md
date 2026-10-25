@@ -91,6 +91,7 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 
 ## Phase 6 — Cherry-pick backlog (spec §4 list, in order)
 R128 meters + auto-ducking keyframes · command registry + UI automation for the agent · LUT + log→709 proxies · shortcut presets (Premiere/CapCut/Avid) · templates · OTIO/EDL export.
+Deferred from G3 (2026-10-25): multi-variant timelines + variant deliver list · VLM tagging UI · genre recommender banner · camera role · snap-error badge · probe columns in Ingest · curation card thumbnails · AI endpoint ping · auto-proxy on import (P4.3).
 Out of scope (owner, 2026-10-24): AI background removal / cutout, TTS voice cloning.
 
 ---

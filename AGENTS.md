@@ -148,6 +148,11 @@ If you are active on the `feature/memory-harness-upgrade` branch, the 5 advanced
 
 ---
 
+## 🧊 6b. PySide6 GUI is FROZEN (gate G3, 2026-10-25)
+The desktop UI in `src/ui/**` is frozen (spec S7): no new features, only critical fixes. New user-facing work goes into
+TeamTrau Studio (`E:ntigravity	eamtrau-studio`, branch `teamtrau/main`) on top of the engine API (`src/engine_api/`).
+The CLI (`main.py`) and the MCP server stay supported.
+
 ## 🎬 7. TeamTrau-AutoEdit Project Specifications & Architecture
 
 This project is an **Automated 4K/1080p Non-Destructive Video Editing Toolkit Orchestrator** on Windows 11 leveraging NVIDIA GPU acceleration (CUDA, NVENC).
