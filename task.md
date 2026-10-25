@@ -348,6 +348,7 @@
   - [x] P3.5: Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder
   - [x] P3.6: Agent console: prompt input, streamed thoughts, collapsible tool cards, heuristic badge, cancel, history
   - [x] P3.7a: Shot details, advanced options, AI settings (Engine repo)
+  - [x] P3.7b: Studio: bulk curation, badges and inspector, Advanced options, AI settings, Run All (Studio repo)
 
 
 
