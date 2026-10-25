@@ -47,8 +47,8 @@
 |---|---|---|---|
 | **P5.0** | Engine | Portability core: OS data dir + `serve --data-dir/--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, fusionscript name, no Qt on import, declared deps, portable test fix | **yes (below)** |
 | P5.1 | Engine | CI (`.github/workflows/engine-ci.yml`, contract `tests/test_engine_ci_p51.py`): Linux on every push, Windows + macOS on PRs to main and manual runs (owner choice: Actions minutes); CPU torch at the locked version; ffmpeg per OS; Qt offscreen (GUI tests run, no marker). Written by the architect; failures found by the first runs become P5.1b | done (architect) |
-| **P5.2** | Studio | Shell portability: fixed `app://teamtrau` origin (persistence bug confirmed), packaged-engine launch branch, engine-missing warning, macOS activate, GPU auto off Windows; CI: push on `teamtrau/main` plus an `electron-shell` OS matrix | **yes (below)** |
-| P5.3 | Engine | PyInstaller **onedir** "lite" sidecar per OS + bundled ffmpeg (licence-checked) + smoke test (start binary → `/v1/health` → a proxy job) | later |
+| **P5.2** | Studio | (done, `3231dea7`) Shell portability: fixed `app://teamtrau` origin (persistence bug confirmed), packaged-engine launch branch, engine-missing warning, macOS activate, GPU auto off Windows; CI: push on `teamtrau/main` plus an `electron-shell` OS matrix | **yes (below)** |
+| **P5.3** | Engine | PyInstaller **onedir** "lite" sidecar (spike: 487 MB, healthy in 2 s) + pinned ffmpeg with SHA-256 + numba cache in the data dir + smoke test | **yes (below)** |
 | P5.4 | Studio | electron-builder config (NSIS / dmg+zip / AppImage+deb), `extraResources` engine, exclude source maps, tag-triggered packaging workflow, unsigned artifacts | later |
 | P5.5 | Engine | Renderer encoder ladder from `platform_caps` (VideoToolbox / QSV / AMF / VAAPI) with tests | later |
 | G5 | Owner | Signing credentials (Authenticode, Apple Developer ID + notarisation) and the release channel | — |
@@ -589,4 +589,269 @@ test('maps preferences to Chromium switches', () => {
   assert.equal(gpuSwitchFor('power-saving'), 'force_low_power_gpu')
   assert.equal(gpuSwitchFor('auto'), null)
 })
+```
+
+---
+
+## P5.3 — PyInstaller "lite" engine sidecar (Engine repo, branch `feature/studio-engine`)
+
+**Architect spike (2026-10-25, Windows, scratch copy of HEAD `8844833`)**
+- **Lite environment:** `uv sync --locked --no-dev --python 3.11` while skipping torch, torchvision, ultralytics, faster-whisper, ctranslate2 and every PySide6/shiboken6 package.
+  - `import main` then loads 935 modules, with no torch, no PySide6 and no polars.
+  - `serve` answers `/v1/health`, and `analyze_soundtrack` and `proxies` complete on the demo footage.
+  - Without `--python 3.11`, uv picked Python 3.14. The repo has no `.python-version`, and OTIO then failed to import.
+- **PyInstaller 6.22.3 onedir:** builds in about 2–3 minutes. The frozen `teamtrau-engine.exe serve` is healthy after 2.0 s, and both jobs complete.
+- **Size:** 670 MB at first. Excluding `polars` (pulled in by `narwhals`) and `matplotlib` (pulled in by `librosa.display`) brings it to **487 MB**. Keep `sklearn`, which `librosa.segment` needs. The largest remaining parts are llvmlite 115 MB, cv2 112 MB, av.libs 63 MB and scipy 50 MB.
+- **numba:** JIT compiles on the first `analyze_soundtrack` of every launch (41 s frozen), unless the cache persists; with a cache the second launch takes 7 s. In the spike numba wrote its cache inside `_internal/librosa/__pycache__`, which is read-only in an installed app, so the engine must point `NUMBA_CACHE_DIR` at its data dir.
+- **Resolve worker:** `resolve_worker.py` runs in a system Python (fusionscript needs a matching version). Its imports are stdlib-only (`src.core.platform_caps`, `platform_paths`, `ffmpeg_utils`), so the frozen app ships those `.py` files as data. When frozen, `sys.executable` is the sidecar itself and must not be tried as the worker interpreter.
+- **ffmpeg:** pinned builds with SHA-256:
+  - Windows/Linux: BtbN `autobuild-2026-10-24-13-02`, n8.1.3, GPL. This is the same 8.1 line as development and engine CI.
+  - macOS arm64: martin-riedl.de release 9.0.2 (static, the only release line it publishes).
+  - BtbN removes old autobuilds after a while. When a pinned URL returns 404, update the pin in one place (URL plus SHA-256).
+
+**API (`release/sidecar.py`, new; `release/__init__.py` empty)**
+```python
+HEAVY_PACKAGES: tuple[str, ...]   # torch, torchvision, ultralytics, ultralytics-thop, faster-whisper, ctranslate2
+EXCLUDED_MODULES: tuple[str, ...] # torch, torchvision, ultralytics, faster_whisper, ctranslate2, PySide6, shiboken6,
+                                  # polars, matplotlib, tkinter, src.ui
+@dataclass(frozen=True)
+class FfmpegAsset: url: str; sha256: str; members: dict[str, str]   # archive basename -> file name in tools/
+def lite_excluded_packages(lock: dict) -> list[str]   # HEAVY_PACKAGES present in the lock + every pyside6*/shiboken6* package, sorted
+def sync_command(lock: dict) -> list[str]             # uv sync --locked --no-dev --group sidecar --python 3.11 + --no-install-package <each>
+def ffmpeg_assets(os_name: OsName) -> list[FfmpegAsset]
+def tool_names(os_name: OsName) -> tuple[str, str]    # ("ffmpeg.exe", "ffprobe.exe") on windows
+def verify_sha256(path: Path, expected: str) -> None  # ValueError on mismatch
+def extract_tools(archive: Path, asset: FfmpegAsset, tools_dir: Path) -> list[Path]  # zip or tar.xz; ValueError if a member is missing
+def main(argv: list[str] | None = None) -> int        # python -m release.sidecar build [--skip-sync] [--skip-smoke]
+```
+Pinned assets (exact values):
+| OS | URL | SHA-256 | members |
+|---|---|---|---|
+| windows | `https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-24-13-02/ffmpeg-n8.1.3-24-g92611900bb-win64-gpl-8.1.zip` | `0b1a903367bfbe906125aad78069e3b9dfecac74ea76db05ada2e667c80ac2c9` | ffmpeg.exe, ffprobe.exe, LICENSE.txt → FFMPEG-LICENSE.txt |
+| linux | `.../autobuild-2026-10-24-13-02/ffmpeg-n8.1.3-24-g92611900bb-linux64-gpl-8.1.tar.xz` | `3c2d43d951c1d7936240ec77dbc274d6214fc64973e9993f63e16f03ac908ff1` | ffmpeg, ffprobe, LICENSE.txt → FFMPEG-LICENSE.txt |
+| macos | `https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip` | `c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924` | ffmpeg |
+| macos | `https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffprobe.zip` | `fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6` | ffprobe |
+
+**Rules**
+- **`build` steps:** each step is a small function, in this order:
+  1. **sync:** run `sync_command(lock)` with `UV_PROJECT_ENVIRONMENT=.venv-sidecar`.
+  2. **freeze:** `<.venv-sidecar>/(Scripts|bin)/pyinstaller --noconfirm --distpath dist --workpath build/pyinstaller release/teamtrau-engine.spec`.
+  3. **tools:** download each asset into `build/downloads/` (reuse a file whose SHA-256 already matches), `verify_sha256`, then `extract_tools` into `dist/teamtrau-engine/tools/`.
+  4. **info:** write `dist/teamtrau-engine/BUILD_INFO.json` with the engine git commit, the build date and the ffmpeg asset URLs.
+  5. **smoke:** run `release/smoke_sidecar.py dist/teamtrau-engine/teamtrau-engine(.exe)`.
+
+  Every subprocess and download has a timeout. Failures exit non-zero with a one-line reason.
+- **`release/teamtrau_engine.py`:** entry point; it only calls `main.cli()`.
+- **`release/teamtrau-engine.spec`:**
+  - onedir, console, name `teamtrau-engine`, `pathex` set to the repo root.
+  - `excludes=list(EXCLUDED_MODULES)` (import it from `release.sidecar`).
+  - `hiddenimports=collect_submodules("src", filter=lambda n: not n.startswith("src.ui"))`.
+  - `datas`: `collect_data_files("librosa")`, plus the Resolve worker sources at their package-relative paths: `src/dispatchers/resolve_worker.py`, `src/core/platform_caps.py`, `src/core/platform_paths.py`, `src/core/ffmpeg_utils.py`, `src/core/__init__.py`.
+- **`release/smoke_sidecar.py <exe>`:**
+  - Generates its own media with the bundled `tools/ffmpeg`: a 10 s sine WAV and a 3 s `testsrc2` MP4.
+  - Starts `<exe> serve --port <free> --data-dir <tmp> --tools-dir <exe dir>/tools`, with stdout/stderr going to a log file (never an unread PIPE: a full pipe blocks the engine).
+  - Waits for `/v1/health` (60 s max), runs `analyze_soundtrack` and `proxies` through the HTTP API with the token from `<tmp>/engine_token`, and checks that the proxy file exists.
+  - Checks that `<tmp>/numba-cache` is not empty, prints each step's time, and terminates the engine in `finally`.
+- **`main.py serve`:**
+  - After the data dir is resolved: `NUMBA_CACHE_DIR = os.environ.setdefault("NUMBA_CACHE_DIR", str(<data>/"numba-cache"))`, and create that directory.
+  - This must happen before anything imports librosa or numba. Check this: `serve` imports must not pull numba in earlier.
+- **`ResolveDispatcher._worker_interpreters`:** append `[sys.executable]` only when `not getattr(sys, "frozen", False)`.
+- **`pyproject.toml`:** add `[dependency-groups] sidecar = ["pyinstaller>=6.22.3"]`, then run `uv lock`. No other version may change: show the `uv.lock` diff summary.
+- **`.gitignore`:** `build/` and `dist/` are already ignored; add `.venv-sidecar/`.
+- **Do not** change engine behaviour for the full (non-lite) install. Torch, whisper and YOLO stay optional and keep failing soft.
+
+**Files**
+- `release/__init__.py`, `release/sidecar.py`, `release/teamtrau_engine.py`, `release/teamtrau-engine.spec`, `release/smoke_sidecar.py` (all new)
+- `main.py`, `src/dispatchers/resolve_dispatcher.py`, `pyproject.toml` + `uv.lock`, `.gitignore`
+- `tests/test_sidecar_p53.py` (LOCKED)
+
+**Related suites:** `tests/test_portability_p50.py`, `tests/test_resolve_dispatcher.py`, `tests/test_engine_api.py`, `tests/test_engine_ci_p51.py`, the full suite, and ruff.
+
+**Validation:** the locked test passes (14 tests) against a reference implementation in a scratch copy, and the spike built and ran the frozen sidecar as described above.
+**Expected red:** `ModuleNotFoundError: No module named 'release'`.
+
+**Acceptance (paste raw output in the HANDOFF)**
+1. Run `python -m release.sidecar build` on this Windows machine and paste its full step log, including the smoke output with timings.
+2. Report the `du -sh dist/teamtrau-engine` size (target ≤ 520 MB) and the top 10 entries of `_internal`.
+3. Run the smoke a **second** time and paste it. `analyze_soundtrack` must be at least 3× faster than in the first run (numba cache), and `_internal` must contain no `*.nbi` files.
+4. Run `dist/teamtrau-engine/teamtrau-engine.exe serve --port 8799 --data-dir <tmp>` with `PATH` reduced to `C:\Windows\System32` (no system ffmpeg, no venv) and `--tools-dir dist/teamtrau-engine/tools`. Show that the `ffmpeg` field of `/v1/capabilities` points into `dist/teamtrau-engine/tools`, and that one proxy job completes.
+5. Run `git status` to show that `build/`, `dist/` and `.venv-sidecar/` are ignored.
+
+**Commit:** `feat(engine): PyInstaller lite sidecar build with pinned ffmpeg and smoke test`.
+
+**Contract test — `tests/test_sidecar_p53.py`:**
+```python
+"""P5.3: PyInstaller "lite" engine sidecar (lite env, pinned ffmpeg, tool extraction, frozen runtime)."""
+
+import hashlib
+import io
+import os
+import stat
+import sys
+import tarfile
+import tomllib
+import zipfile
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from release.sidecar import (
+    EXCLUDED_MODULES,
+    extract_tools,
+    ffmpeg_assets,
+    lite_excluded_packages,
+    sync_command,
+    tool_names,
+    verify_sha256,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+LOCK = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+
+
+def test_lite_env_drops_gpu_ml_and_qt_but_keeps_the_engine_core():
+    excluded = lite_excluded_packages(LOCK)
+    for name in ("torch", "torchvision", "ultralytics", "faster-whisper", "ctranslate2",
+                 "pyside6", "pyside6-essentials", "pyside6-addons", "shiboken6"):
+        assert name in excluded, name
+    for name in ("librosa", "numba", "opencv-python", "scipy", "uvicorn", "starlette", "mcp",
+                 "opentimelineio", "click"):
+        assert name not in excluded, name
+    lock_names = {p["name"] for p in LOCK["package"]}
+    assert set(excluded) <= lock_names
+    assert excluded == sorted(excluded)
+
+
+def test_sync_command_installs_the_locked_lite_env_on_python_311():
+    cmd = sync_command(LOCK)
+    assert cmd[:8] == ["uv", "sync", "--locked", "--no-dev", "--group", "sidecar", "--python", "3.11"]
+    rest = cmd[8:]
+    assert rest[0::2] == ["--no-install-package"] * (len(rest) // 2)
+    assert rest[1::2] == lite_excluded_packages(LOCK)
+
+
+def test_pyinstaller_excludes_heavy_modules_only():
+    for mod in ("torch", "torchvision", "ultralytics", "faster_whisper", "ctranslate2", "PySide6",
+                "polars", "matplotlib", "tkinter", "src.ui"):
+        assert mod in EXCLUDED_MODULES, mod
+    for mod in ("librosa", "sklearn", "numba", "cv2", "scipy", "src.core", "src.engine_api"):
+        assert mod not in EXCLUDED_MODULES, mod
+
+
+def test_sidecar_group_declares_pyinstaller():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    group = pyproject["dependency-groups"]["sidecar"]
+    assert any(req.replace(" ", "").lower().startswith("pyinstaller>=") for req in group)
+
+
+@pytest.mark.parametrize("os_name", ["windows", "linux", "macos"])
+def test_ffmpeg_assets_are_pinned_with_sha256(os_name):
+    assets = ffmpeg_assets(os_name)
+    assert assets
+    dests = set()
+    for asset in assets:
+        assert asset.url.startswith("https://") and "latest" not in asset.url, asset.url
+        assert len(asset.sha256) == 64 and int(asset.sha256, 16) >= 0
+        dests |= set(asset.members.values())
+    assert set(tool_names(os_name)) <= dests
+
+
+def test_tool_names_per_os():
+    assert tool_names("windows") == ("ffmpeg.exe", "ffprobe.exe")
+    assert tool_names("linux") == ("ffmpeg", "ffprobe")
+    assert tool_names("macos") == ("ffmpeg", "ffprobe")
+
+
+def _zip(path: Path, entries: dict[str, bytes]) -> Path:
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return path
+
+
+def _tar_xz(path: Path, entries: dict[str, bytes]) -> Path:
+    with tarfile.open(path, "w:xz") as tf:
+        for name, data in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+    return path
+
+
+def test_extract_tools_from_zip_and_tar(tmp_path: Path):
+    win = ffmpeg_assets("windows")[0]
+    archive = _zip(tmp_path / "w.zip", {
+        "pkg/bin/ffmpeg.exe": b"MZ-ffmpeg", "pkg/bin/ffprobe.exe": b"MZ-ffprobe",
+        "pkg/bin/ffplay.exe": b"MZ-ffplay", "pkg/LICENSE.txt": b"GPL", "pkg/doc/x.html": b"",
+    })
+    out = extract_tools(archive, win, tmp_path / "tools-win")
+    names = sorted(p.name for p in (tmp_path / "tools-win").iterdir())
+    assert names == sorted(win.members.values())
+    assert sorted(p.name for p in out) == names
+    assert (tmp_path / "tools-win" / "ffmpeg.exe").read_bytes() == b"MZ-ffmpeg"
+
+    lin = ffmpeg_assets("linux")[0]
+    archive = _tar_xz(tmp_path / "l.tar.xz", {
+        "pkg/bin/ffmpeg": b"ELF-ffmpeg", "pkg/bin/ffprobe": b"ELF-ffprobe",
+        "pkg/bin/ffplay": b"ELF-ffplay", "pkg/LICENSE.txt": b"GPL",
+    })
+    extract_tools(archive, lin, tmp_path / "tools-linux")
+    ffmpeg = tmp_path / "tools-linux" / "ffmpeg"
+    assert ffmpeg.read_bytes() == b"ELF-ffmpeg"
+    if os.name != "nt":
+        assert ffmpeg.stat().st_mode & stat.S_IXUSR
+
+
+def test_extract_tools_rejects_an_archive_missing_a_tool(tmp_path: Path):
+    win = ffmpeg_assets("windows")[0]
+    archive = _zip(tmp_path / "w.zip", {"pkg/bin/ffmpeg.exe": b"x", "pkg/LICENSE.txt": b"GPL"})
+    with pytest.raises(ValueError):
+        extract_tools(archive, win, tmp_path / "tools")
+
+
+def test_verify_sha256(tmp_path: Path):
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"abc")
+    verify_sha256(f, hashlib.sha256(b"abc").hexdigest())
+    with pytest.raises(ValueError):
+        verify_sha256(f, "0" * 64)
+
+
+def test_serve_points_numba_cache_into_the_data_dir(tmp_path: Path, monkeypatch):
+    import uvicorn
+
+    import main
+
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, *a, **k: None)
+    monkeypatch.delenv("TEAMTRAU_CACHE_DIR", raising=False)
+    monkeypatch.delenv("NUMBA_CACHE_DIR", raising=False)
+    data = tmp_path / "data"
+    res = CliRunner().invoke(main.cli, ["serve", "--port", "8798", "--data-dir", str(data)])
+    assert res.exit_code == 0, res.output
+    assert os.environ.get("NUMBA_CACHE_DIR") == str(data / "numba-cache")
+    assert (data / "numba-cache").is_dir()
+
+    monkeypatch.setenv("NUMBA_CACHE_DIR", str(tmp_path / "mine"))
+    res = CliRunner().invoke(main.cli, ["serve", "--port", "8798", "--data-dir", str(data)])
+    assert res.exit_code == 0, res.output
+    assert os.environ["NUMBA_CACHE_DIR"] == str(tmp_path / "mine")
+    monkeypatch.delenv("TEAMTRAU_CACHE_DIR", raising=False)
+
+
+def test_frozen_engine_never_runs_the_resolve_worker_with_itself(monkeypatch):
+    from src.dispatchers.resolve_dispatcher import ResolveDispatcher
+
+    monkeypatch.delenv("AUTOEDIT_RESOLVE_PYTHON", raising=False)
+    assert ResolveDispatcher._worker_interpreters()[-1] == [sys.executable]
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert [sys.executable] not in ResolveDispatcher._worker_interpreters()
+
+
+def test_spec_uses_the_shared_exclusions_and_ships_the_resolve_worker_source():
+    spec = (ROOT / "release" / "teamtrau-engine.spec").read_text(encoding="utf-8")
+    assert "EXCLUDED_MODULES" in spec
+    assert "resolve_worker.py" in spec
+    assert "teamtrau_engine.py" in spec
 ```
