@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import BaseModel, Field
 
@@ -397,6 +397,7 @@ class PipelineConfig(BaseModel):
     mcp_port: int = Field(default=8000)
 
     # NVENC Render Settings
+    hw_encoder: Literal["auto", "nvenc", "videotoolbox", "qsv", "amf", "none"] = Field(default="auto")
     nvenc_preset: str = Field(default="p5")  # p7 = slowest/best; p5 is ~2x faster at near-identical quality
     nvenc_cq: int = Field(default=18)
     nvenc_hwdecode: bool = Field(default=True)  # NVDEC (-hwaccel cuda); frames stay in system memory

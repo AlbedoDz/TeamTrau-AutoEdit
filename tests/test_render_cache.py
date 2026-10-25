@@ -31,12 +31,12 @@ def _has(cmd: list[str], pair: list[str]) -> bool:
 
 def test_intra_only_h264_args():
     s = DeliverSettings(canvas_width=1920, canvas_height=1080, fps=60.0, master="h264")
-    r = NvencRenderer(PipelineConfig(), settings=s, intra_only=True)
+    r = NvencRenderer(PipelineConfig(hw_encoder="nvenc"), settings=s, intra_only=True)
     _, nv = r.master_encoder_args(s, True)
     assert _has(nv, ["-g", "0"]) and _has(nv, ["-bf", "0"])
     _, cpu = r.master_encoder_args(s, False)
     assert _has(cpu, ["-g", "1"]) and _has(cpu, ["-bf", "0"])
-    _, plain = NvencRenderer(PipelineConfig(), settings=s).master_encoder_args(s, True)
+    _, plain = NvencRenderer(PipelineConfig(hw_encoder="nvenc"), settings=s).master_encoder_args(s, True)
     assert "-g" not in plain
 
 

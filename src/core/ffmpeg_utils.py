@@ -129,6 +129,12 @@ NVENC_ERROR_MARKERS: tuple[str, ...] = (
     "cannot load nvcuda",
     "openencodesessionex",
     "nvidia",
+    "amf",
+    "amd gpu",
+    "mfx",
+    "qsv",
+    "videotoolbox",
+    "compression session",
 )
 
 

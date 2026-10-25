@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- feat(engine): renderer hardware encoder ladder (VideoToolbox, QSV, AMF) from platform_caps
 - build(engine): Windows sidecar bundles the shared ffmpeg build (tools 314 MB -> 192 MB); FfmpegAsset.libraries copies matching DLLs
 - feat(engine): PyInstaller lite sidecar build with pinned ffmpeg and smoke test
 - test(engine): HDR tone-map test measures luma with the ffmpeg CLI (opencv-python decodes 10-bit PQ differently per OS)

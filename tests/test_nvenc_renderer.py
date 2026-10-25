@@ -44,15 +44,15 @@ def test_nvenc_renderer_validates_empty_inputs():
 
 def test_segments_are_frame_exact(sample_scenes):
     """Beat cuts are quantised to whole frames so long timelines never drift."""
-    cfg = PipelineConfig(fps=30.0, enable_teaser=False)
+    cfg = PipelineConfig(hw_encoder="nvenc", fps=30.0, enable_teaser=False)
     segs = NvencRenderer(cfg).build_segments(sample_scenes, [0.0, 0.517, 1.033, 3.0])
     assert sum(s.frames for s in segs) == 90
     assert [s.frames for s in segs] == [16, 15, 59]
 
 
 def test_nvenc_encoder_args_use_config():
-    cfg = PipelineConfig(nvenc_preset="p7", nvenc_cq=18, nvenc_bitrate="60M")
-    enc, args = NvencRenderer(cfg).encoder_args(use_nvenc=True)
+    cfg = PipelineConfig(hw_encoder="nvenc", nvenc_preset="p7", nvenc_cq=18, nvenc_bitrate="60M")
+    enc, args = NvencRenderer(cfg).encoder_args(use_hw=True)
     assert enc == "hevc_nvenc"
     assert args[args.index("-preset") + 1] == "p7"
     assert args[args.index("-cq") + 1] == "18"
@@ -60,22 +60,22 @@ def test_nvenc_encoder_args_use_config():
 
 
 def test_cpu_fallback_encoder_is_libx265():
-    enc, args = NvencRenderer(PipelineConfig()).encoder_args(use_nvenc=False)
+    enc, args = NvencRenderer(PipelineConfig()).encoder_args(use_hw=False)
     assert enc == "libx265"
     assert "libx265" in args
 
 
 def test_preview_uses_fast_h264_at_540p():
-    cfg = PipelineConfig(canvas_width=1920, canvas_height=1080)
+    cfg = PipelineConfig(hw_encoder="nvenc", canvas_width=1920, canvas_height=1080)
     r = NvencRenderer(cfg)
     assert r.canvas_size(preview=True) == (960, 540)
-    enc, _ = r.encoder_args(use_nvenc=True, preview=True)
+    enc, _ = r.encoder_args(use_hw=True, preview=True)
     assert enc == "h264_nvenc"
 
 
 def test_segment_command_fast_seeks_each_clip(sample_scenes):
     """Each segment seeks its own input instead of trimming from frame 0."""
-    cfg = PipelineConfig(enable_teaser=False)
+    cfg = PipelineConfig(hw_encoder="nvenc", enable_teaser=False)
     r = NvencRenderer(cfg)
     seg = r.build_segments(sample_scenes, [0.0, 1.5, 3.0])[1]
     cmd = r.build_segment_command("ffmpeg", seg, Path("seg.mkv"), True, with_audio=False)
@@ -96,7 +96,7 @@ def test_teaser_adds_leading_segments(sample_scenes):
 
 
 def test_sections_drive_scene_selection(sample_scenes):
-    cfg = PipelineConfig(enable_teaser=False)
+    cfg = PipelineConfig(hw_encoder="nvenc", enable_teaser=False)
     sections = [
         SongSection(SongSectionType.INTRO, 0.0, 2.0, 2.0, 0.2, is_climax=False),
         SongSection(SongSectionType.DROP, 2.0, 4.0, 2.0, 0.9, is_climax=True),
@@ -130,12 +130,12 @@ def test_concat_command_mixes_soundtrack_and_copies_video():
 
 def test_default_nvenc_preset_is_p5_and_p7_selectable():
     assert PipelineConfig().nvenc_preset == "p5"
-    _, args = NvencRenderer(PipelineConfig(nvenc_preset="p7")).encoder_args(use_nvenc=True)
+    _, args = NvencRenderer(PipelineConfig(hw_encoder="nvenc", nvenc_preset="p7")).encoder_args(use_hw=True)
     assert args[args.index("-preset") + 1] == "p7"
 
 
 def _one_segment(sample_scenes):
-    cfg = PipelineConfig(fps=30.0, enable_teaser=False)
+    cfg = PipelineConfig(hw_encoder="nvenc", fps=30.0, enable_teaser=False)
     seg = NvencRenderer(cfg).build_segments(sample_scenes, [0.0, 2.0])[0]
     return cfg, seg
 
@@ -176,6 +176,7 @@ def _settings(**kw) -> DeliverSettings:
 
 
 def _renderer(settings: DeliverSettings | None = None, **cfg) -> NvencRenderer:
+    cfg.setdefault("hw_encoder", "nvenc")
     cfg.setdefault("fps", settings.fps if settings else 30.0)
     if settings:
         cfg.setdefault("canvas_width", settings.canvas_width)

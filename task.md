@@ -353,6 +353,7 @@
   - [x] P5.0: Engine portability core (`src/core/platform_paths.py`, OS data dir, `--data-dir`/`--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, Qt-free imports, declared deps)
   - [x] P5.1: GitHub Actions Engine CI (`.github/workflows/engine-ci.yml`, `tests/test_engine_ci_p51.py`)
   - [x] P5.3: PyInstaller lite engine sidecar (`release/sidecar.py`, `release/teamtrau-engine.spec`, `release/smoke_sidecar.py`, pinned ffmpeg with SHA-256, numba cache in data dir, `tests/test_sidecar_p53.py`)
+  - [x] P5.5: Renderer hardware encoder ladder (`src/dispatchers/encoder_ladder.py`, VideoToolbox / QSV / AMF, `hw_encoder` setting, CPU fallback for every family, `tests/test_encoder_ladder_p55.py`, `tests/integration/test_encoder_ladder_real_p55.py`)
 
 
 
