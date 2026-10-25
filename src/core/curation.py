@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+import threading
+import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from src.core.config import PipelineConfig
-from src.core.service import find_soundtrack
+from src.core.service import JobCallbacks, find_soundtrack
 from src.core.stage_options import apply_staged_options
 from src.core.types import EditTimeline, PipelineExecutionResult, ScoredScene
 
@@ -104,6 +106,9 @@ def run_curation(
     output_dir: Path,
     top_n: int = TOP_N_DEFAULT,
     timeout: float | None = None,
+    callbacks: JobCallbacks | None = None,
+    cancel_event: threading.Event | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> tuple[CurationSession, dict[str, Any]]:
     """Execute rough-cut curation and defect pruning on source footage.
 
@@ -119,15 +124,50 @@ def run_curation(
     if genre is not None:
         apply_staged_options(cfg, genre=genre)
 
-    handle = adapter.submit_job(
-        input_dir=input_path,
-        soundtrack=None,
-        output_dir=out_path,
-        config=cfg,
-        stage="rough_cut",
-    )
-    if not handle.wait(timeout):
-        raise TimeoutError("Rough-cut curation job timed out")
+    if config_overrides:
+        from src.engine_api.options import apply_config_overrides
+
+        cfg = apply_config_overrides(cfg, config_overrides, stage="curate")
+
+    submit_kwargs: dict[str, Any] = {
+        "input_dir": input_path,
+        "soundtrack": None,
+        "output_dir": out_path,
+        "config": cfg,
+        "stage": "rough_cut",
+    }
+    if callbacks is not None:
+        submit_kwargs["callbacks"] = callbacks
+
+    if cancel_event is not None:
+        submit_kwargs["run_async"] = True
+        handle = adapter.submit_job(**submit_kwargs)
+        t0 = time.monotonic()
+        while True:
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Curation cancelled")
+            wait_slice = 0.2
+            if timeout is not None:
+                elapsed = time.monotonic() - t0
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    handle.cancel()
+                    raise TimeoutError("Rough-cut curation job timed out")
+                wait_slice = min(wait_slice, remaining)
+            if handle.wait(wait_slice):
+                break
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Curation cancelled")
+            if timeout is not None and (time.monotonic() - t0) >= timeout:
+                handle.cancel()
+                raise TimeoutError("Rough-cut curation job timed out")
+    else:
+        handle = adapter.submit_job(**submit_kwargs)
+        if not handle.wait(timeout):
+            raise TimeoutError("Rough-cut curation job timed out")
+
     result = handle.result
     if not result.success:
         raise RuntimeError(result.error_message or "Rough-cut curation failed")
@@ -156,6 +196,9 @@ def assemble_sequence(
     selected_ids: list[str] | None = None,
     cadence: str | None = None,
     timeout: float | None = None,
+    callbacks: JobCallbacks | None = None,
+    cancel_event: threading.Event | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a cadence-driven sequence timeline from curated shots and soundtrack.
 
@@ -179,6 +222,11 @@ def assemble_sequence(
     if cadence is not None:
         apply_staged_options(session.config, cadence=cadence)
 
+    if config_overrides:
+        from src.engine_api.options import apply_config_overrides
+
+        session.config = apply_config_overrides(session.config, config_overrides, stage="assemble")
+
     submit_kw: dict[str, Any] = {
         "input_dir": session.input_dir,
         "soundtrack": st,
@@ -190,9 +238,38 @@ def assemble_sequence(
     if session.result and session.result.edit_timelines and "rough_cut" in session.result.edit_timelines:
         submit_kw["existing_timelines"] = {"rough_cut": session.result.edit_timelines["rough_cut"]}
 
-    handle = adapter.submit_job(**submit_kw)
-    if not handle.wait(timeout):
-        raise TimeoutError("Sequence assembly job timed out")
+    if callbacks is not None:
+        submit_kw["callbacks"] = callbacks
+
+    if cancel_event is not None:
+        submit_kw["run_async"] = True
+        handle = adapter.submit_job(**submit_kw)
+        t0 = time.monotonic()
+        while True:
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Sequence assembly cancelled")
+            wait_slice = 0.2
+            if timeout is not None:
+                elapsed = time.monotonic() - t0
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    handle.cancel()
+                    raise TimeoutError("Sequence assembly job timed out")
+                wait_slice = min(wait_slice, remaining)
+            if handle.wait(wait_slice):
+                break
+            if cancel_event.is_set():
+                handle.cancel()
+                raise InterruptedError("Sequence assembly cancelled")
+            if timeout is not None and (time.monotonic() - t0) >= timeout:
+                handle.cancel()
+                raise TimeoutError("Sequence assembly job timed out")
+    else:
+        handle = adapter.submit_job(**submit_kw)
+        if not handle.wait(timeout):
+            raise TimeoutError("Sequence assembly job timed out")
+
     res = handle.result
     if not res.success:
         raise RuntimeError(res.error_message or "Sequence assembly failed")

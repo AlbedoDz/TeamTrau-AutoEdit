@@ -56,6 +56,7 @@ from src.core.ffmpeg_utils import (
     run_tool,
 )
 from src.core.media_info import MediaInfo, probe_media
+from src.core.platform_caps import get_caps
 from src.core.timebase import frame_rate_fraction
 from src.core.types import (
     DeliverColor,
@@ -67,6 +68,7 @@ from src.core.types import (
     SentenceSegment,
     SongSection,
 )
+from src.dispatchers.encoder_ladder import hw_video_args, pick_hw_encoder
 from src.dispatchers.watermark_helper import build_watermark_filter_lines
 from src.modules.edit_timeline import build_edit_timeline, retarget_timeline
 from src.modules.subtitle_export import (
@@ -335,10 +337,33 @@ class NvencRenderer:
         self.intra_only = intra_only
         self.config = config
         self.nvenc_available = check_nvenc_available()
+        pref = config.hw_encoder
+        if pref == "none":
+            self.hw_encoders: dict[str, str | None] = {"h264": None, "hevc": None}
+        elif pref == "nvenc":
+            self.hw_encoders = {"h264": "h264_nvenc", "hevc": "hevc_nvenc"}
+        else:
+            caps = get_caps()
+            self.hw_encoders = {
+                "h264": pick_hw_encoder("h264", caps.h264_encoders, pref),
+                "hevc": pick_hw_encoder("hevc", caps.hevc_encoders, pref),
+            }
         self.settings = settings
         # Set by render_segments for ``color == "passthrough"`` from the actual sources.
         self._passthrough_ten_bit = False
         self._passthrough_info: MediaInfo | None = None
+
+    @property
+    def hardware_available(self) -> bool:
+        """Whether any hardware encoder is selected or forced via hw_encoder='nvenc'."""
+        return self.config.hw_encoder == "nvenc" or any(
+            v is not None for v in self.hw_encoders.values()
+        )
+
+    def _nvenc_ok(self) -> bool:
+        return self.config.hw_encoder == "nvenc" or (
+            self.config.hw_encoder == "auto" and self.nvenc_available
+        )
 
     # ------------------------------------------------------------------
     # Timeline -> segments
@@ -419,24 +444,48 @@ class NvencRenderer:
             return _even(w * PREVIEW_HEIGHT / h), PREVIEW_HEIGHT
         return w, h
 
-    def encoder_args(self, use_nvenc: bool, preview: bool = False) -> tuple[str, list[str]]:
+    def encoder_args(self, use_hw: bool, preview: bool = False) -> tuple[str, list[str]]:
         """Legacy encoder selection (settings-less masters and the 540p preview)."""
         cfg = self.config
         pix = ["-pix_fmt", cfg.nvenc_pix_fmt]
         if preview:
-            if use_nvenc:
-                return "h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", *pix]
+            if use_hw:
+                enc = self.hw_encoders.get("h264") or ("h264_nvenc" if self._nvenc_ok() else None)
+                if enc == "h264_nvenc":
+                    return "h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "30", *pix]
+                if enc is not None:
+                    return enc, hw_video_args(
+                        enc,
+                        cq=30,
+                        bitrate=None,
+                        maxrate=None,
+                        bufsize=None,
+                        ten_bit=False,
+                        intra_only=self.intra_only,
+                    )
             return "libx264", ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", *pix]
-        if use_nvenc:
-            return "hevc_nvenc", [
-                "-c:v", "hevc_nvenc",
-                "-preset", cfg.nvenc_preset,
-                "-cq", str(cfg.nvenc_cq),
-                "-b:v", cfg.nvenc_bitrate,
-                "-maxrate", cfg.nvenc_maxrate,
-                "-bufsize", cfg.nvenc_bufsize,
-                *pix,
-            ]
+        if use_hw:
+            enc = self.hw_encoders.get("hevc") or ("hevc_nvenc" if self._nvenc_ok() else None)
+            if enc == "hevc_nvenc":
+                return "hevc_nvenc", [
+                    "-c:v", "hevc_nvenc",
+                    "-preset", cfg.nvenc_preset,
+                    "-cq", str(cfg.nvenc_cq),
+                    "-b:v", cfg.nvenc_bitrate,
+                    "-maxrate", cfg.nvenc_maxrate,
+                    "-bufsize", cfg.nvenc_bufsize,
+                    *pix,
+                ]
+            if enc is not None:
+                return enc, hw_video_args(
+                    enc,
+                    cq=cfg.nvenc_cq,
+                    bitrate=cfg.nvenc_bitrate,
+                    maxrate=cfg.nvenc_maxrate,
+                    bufsize=cfg.nvenc_bufsize,
+                    ten_bit=False,
+                    intra_only=self.intra_only,
+                )
         return "libx265", [
             "-c:v", "libx265",
             "-preset", cfg.cpu_encoder_preset,
@@ -448,7 +497,7 @@ class NvencRenderer:
     def master_encoder_args(
         self,
         settings: DeliverSettings | None,
-        use_nvenc: bool,
+        use_hw: bool,
         preview: bool = False,
         ten_bit: bool | None = None,
     ) -> tuple[str, list[str]]:
@@ -460,7 +509,7 @@ class NvencRenderer:
         ``settings is None`` or ``preview`` -> the legacy encoder_args.
         """
         if settings is None or preview:
-            return self.encoder_args(use_nvenc, preview)
+            return self.encoder_args(use_hw, preview)
         cfg = self.config
         master = settings.master
         tags = color_tag_args(settings.color, self._passthrough_info)
@@ -480,15 +529,30 @@ class NvencRenderer:
             )
         pix = "yuv420p10le" if (ten_bit and master == "hevc") else "yuv420p"
         if master == "h264":
-            if use_nvenc:
-                nv_args = [
-                    "-c:v", "h264_nvenc", "-preset", cfg.nvenc_preset, "-profile:v", "high",
-                    "-cq", str(cfg.nvenc_cq), "-b:v", cfg.nvenc_bitrate, "-maxrate", cfg.nvenc_maxrate,
-                    "-bufsize", cfg.nvenc_bufsize, "-pix_fmt", pix, *tags,
-                ]
-                if self.intra_only:
-                    nv_args += ["-g", "0", "-bf", "0"]
-                return "h264_nvenc", nv_args
+            if use_hw:
+                enc = self.hw_encoders.get("h264") or ("h264_nvenc" if self._nvenc_ok() else None)
+                if enc == "h264_nvenc":
+                    nv_args = [
+                        "-c:v", "h264_nvenc", "-preset", cfg.nvenc_preset, "-profile:v", "high",
+                        "-cq", str(cfg.nvenc_cq), "-b:v", cfg.nvenc_bitrate, "-maxrate", cfg.nvenc_maxrate,
+                        "-bufsize", cfg.nvenc_bufsize, "-pix_fmt", pix, *tags,
+                    ]
+                    if self.intra_only:
+                        nv_args += ["-g", "0", "-bf", "0"]
+                    return "h264_nvenc", nv_args
+                if enc is not None:
+                    return enc, [
+                        *hw_video_args(
+                            enc,
+                            cq=cfg.nvenc_cq,
+                            bitrate=cfg.nvenc_bitrate,
+                            maxrate=cfg.nvenc_maxrate,
+                            bufsize=cfg.nvenc_bufsize,
+                            ten_bit=False,
+                            intra_only=self.intra_only,
+                        ),
+                        *tags,
+                    ]
             cpu_args = [
                 "-c:v", "libx264", "-preset", cfg.cpu_encoder_preset, "-crf", str(cfg.nvenc_cq),
                 "-pix_fmt", pix, *tags,
@@ -497,20 +561,35 @@ class NvencRenderer:
                 cpu_args += ["-g", "1", "-bf", "0"]
             return "libx264", cpu_args
         # hevc
-        if use_nvenc:
-            return "hevc_nvenc", [
-                "-c:v", "hevc_nvenc", "-preset", cfg.nvenc_preset,
-                "-profile:v", "main10" if ten_bit else "main",
-                "-cq", str(cfg.nvenc_cq), "-b:v", cfg.nvenc_bitrate, "-maxrate", cfg.nvenc_maxrate,
-                "-bufsize", cfg.nvenc_bufsize, "-pix_fmt", pix, *tags,
-            ]
+        if use_hw:
+            enc = self.hw_encoders.get("hevc") or ("hevc_nvenc" if self._nvenc_ok() else None)
+            if enc == "hevc_nvenc":
+                return "hevc_nvenc", [
+                    "-c:v", "hevc_nvenc", "-preset", cfg.nvenc_preset,
+                    "-profile:v", "main10" if ten_bit else "main",
+                    "-cq", str(cfg.nvenc_cq), "-b:v", cfg.nvenc_bitrate, "-maxrate", cfg.nvenc_maxrate,
+                    "-bufsize", cfg.nvenc_bufsize, "-pix_fmt", pix, *tags,
+                ]
+            if enc is not None:
+                return enc, [
+                    *hw_video_args(
+                        enc,
+                        cq=cfg.nvenc_cq,
+                        bitrate=cfg.nvenc_bitrate,
+                        maxrate=cfg.nvenc_maxrate,
+                        bufsize=cfg.nvenc_bufsize,
+                        ten_bit=bool(ten_bit),
+                        intra_only=self.intra_only,
+                    ),
+                    *tags,
+                ]
         return "libx265", [
             "-c:v", "libx265", "-preset", cfg.cpu_encoder_preset, "-crf", str(cfg.nvenc_cq),
             "-x265-params", "log-level=error:repeat-headers=1", "-pix_fmt", pix, *tags,
         ]
 
-    def _encoder(self, use_nvenc: bool, preview: bool) -> tuple[str, list[str]]:
-        return self.master_encoder_args(self.settings, use_nvenc, preview, self.ten_bit(preview))
+    def _encoder(self, use_hw: bool, preview: bool) -> tuple[str, list[str]]:
+        return self.master_encoder_args(self.settings, use_hw, preview, self.ten_bit(preview))
 
     # -- geometry ------------------------------------------------------
     def _geometry_filters(self, seg: RenderSegment, w: int, h: int, src: str, out: str) -> list[str]:
@@ -714,7 +793,7 @@ class NvencRenderer:
         ffmpeg_bin: str,
         unit: _Unit,
         out_path: Path,
-        use_nvenc: bool,
+        use_hw: bool,
         with_audio: bool,
         preview: bool = False,
         hwdecode: bool = False,
@@ -724,6 +803,7 @@ class NvencRenderer:
         fps = self.fps_fraction
         wm = self._watermark_path()
         probe_colour = self.settings is not None and not preview
+        enc, enc_args = self._encoder(use_hw, preview)
 
         cmd = [ffmpeg_bin, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
         has_audio: list[bool] = []
@@ -734,7 +814,7 @@ class NvencRenderer:
             src_dur = min(seg.available, float(n_src / fps) * seg.speed)
             has_audio.append(with_audio and has_audio_stream(seg.source_path))
             infos.append(probe_media(seg.source_path) if probe_colour else None)
-            if hwdecode and use_nvenc:
+            if hwdecode and enc.endswith("_nvenc"):
                 # NVDEC decode; no -hwaccel_output_format, so frames are downloaded to system
                 # memory and every CPU filter (scale/crop/zoompan/overlay/...) keeps working.
                 cmd += ["-hwaccel", "cuda"]
@@ -749,7 +829,6 @@ class NvencRenderer:
             unit, canvas, with_audio, has_audio, wm_idx, infos, preview, subtitle_file
         )
         cmd += ["-filter_complex", graph, "-map", "[vseg]"]
-        _enc, enc_args = self._encoder(use_nvenc, preview)
         cmd += enc_args
         cmd += ["-r", _fps_str(fps)]
         if with_audio:
@@ -763,13 +842,13 @@ class NvencRenderer:
         ffmpeg_bin: str,
         seg: RenderSegment,
         out_path: Path,
-        use_nvenc: bool,
+        use_hw: bool,
         with_audio: bool,
         preview: bool = False,
         hwdecode: bool = False,
     ) -> list[str]:
         unit = _Unit((_Slice(seg, seg.frames, kb_total=seg.frames),), 0, seg.frames)
-        return self._unit_command(ffmpeg_bin, unit, out_path, use_nvenc, with_audio, preview, hwdecode)
+        return self._unit_command(ffmpeg_bin, unit, out_path, use_hw, with_audio, preview, hwdecode)
 
     def _ducking_ratio(self) -> float:
         """Sidechain ratio giving ~``ducking_attenuation_db`` of music reduction under speech.
@@ -892,6 +971,7 @@ class NvencRenderer:
         other = NvencRenderer.__new__(NvencRenderer)
         other.config = cfg
         other.nvenc_available = self.nvenc_available
+        other.hw_encoders = dict(self.hw_encoders)
         other.settings = settings if settings is not None else self.settings
         other.intra_only = self.intra_only if (other.settings is not None and other.settings.master == "h264") else False
         other._passthrough_ten_bit = False
@@ -947,7 +1027,7 @@ class NvencRenderer:
 
         has_soundtrack = soundtrack_path is not None and Path(soundtrack_path).exists()
         with_audio = (not has_soundtrack) or bool(self.config.keep_video_audio)
-        use_nvenc = self.nvenc_available and not force_cpu
+        use_hw = (self.hardware_available or self._nvenc_ok()) and not force_cpu
 
         if active is not None and active.color == "passthrough":
             infos = [probe_media(s.source_path) for s in segments]
@@ -973,16 +1053,17 @@ class NvencRenderer:
         try:
             while True:
                 seg_paths = [work_dir / f"seg_{i:05d}{seg_suffix}" for i in range(len(units))]
-                hwdec = {"on": bool(self.config.nvenc_hwdecode) and use_nvenc}
+                chosen_enc, _ = self._encoder(use_hw, preview)
+                hwdec = {"on": bool(self.config.nvenc_hwdecode) and use_hw and chosen_enc.endswith("_nvenc")}
                 done = 0
                 lock = threading.Lock()
 
-                def render_one(i: int, nvenc: bool = use_nvenc) -> None:
+                def render_one(i: int, hw: bool = use_hw) -> None:
                     nonlocal done
                     if cancel_event is not None and cancel_event.is_set():
                         raise InterruptedError("Rendering cancelled by user.")
                     cmd = self._unit_command(
-                        ffmpeg_bin, units[i], seg_paths[i], nvenc, with_audio, preview,
+                        ffmpeg_bin, units[i], seg_paths[i], hw, with_audio, preview,
                         hwdecode=hwdec["on"], subtitle_file=subtitle_file,
                     )
                     rc, err = self._run(cmd, cancel_event, job_handle)
@@ -992,7 +1073,7 @@ class NvencRenderer:
                         logger.warning("NVDEC decode failed (%s). Retrying with software decode.", err[-160:])
                         hwdec["on"] = False
                         cmd = self._unit_command(
-                            ffmpeg_bin, units[i], seg_paths[i], nvenc, with_audio, preview,
+                            ffmpeg_bin, units[i], seg_paths[i], hw, with_audio, preview,
                             subtitle_file=subtitle_file,
                         )
                         rc, err = self._run(cmd, cancel_event, job_handle)
@@ -1015,16 +1096,20 @@ class NvencRenderer:
                             pool.shutdown(wait=True, cancel_futures=True)
                             raise
                 except RenderError as exc:
-                    if use_nvenc and is_hw_encoder_error(exc.stderr):
-                        logger.warning("NVENC failed (%s). Re-rendering on CPU encoder.", exc.stderr[-200:])
-                        use_nvenc = False
+                    if use_hw and is_hw_encoder_error(exc.stderr):
+                        logger.warning(
+                            "Hardware encoder %s failed (%s). Re-rendering on CPU encoder.",
+                            chosen_enc,
+                            exc.stderr[-200:],
+                        )
+                        use_hw = False
                         for p in work_dir.glob("seg_*"):
                             p.unlink(missing_ok=True)
                         continue
                     raise
                 break
 
-            encoder, _ = self._encoder(use_nvenc, preview)
+            encoder, _ = self._encoder(use_hw, preview)
             list_file = work_dir / "concat.txt"
             list_file.write_text(
                 "".join(

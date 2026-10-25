@@ -65,6 +65,34 @@ def _hash_to_int(h: str) -> int | None:
         return None
 
 
+def normalize_composites(
+    scored: list[ScoredScene],
+    sharpness_weight: float,
+    aesthetic_weight: float,
+) -> None:
+    """Batch-normalize sharpness and aesthetic scores into composite_score in [0.0, 1.0].
+
+    Normalizes each metric independently with min-max. When a metric's range is <= 1e-6,
+    every scene receives 1.0 for that metric.
+    """
+    if not scored:
+        return
+
+    sharp_vals = [s.sharpness_score for s in scored]
+    aesth_vals = [s.aesthetic_score for s in scored]
+
+    min_s, max_s = min(sharp_vals), max(sharp_vals)
+    min_a, max_a = min(aesth_vals), max(aesth_vals)
+
+    range_s = max_s - min_s
+    range_a = max_a - min_a
+
+    for s in scored:
+        norm_s = 1.0 if range_s <= 1e-6 else (s.sharpness_score - min_s) / range_s
+        norm_a = 1.0 if range_a <= 1e-6 else (s.aesthetic_score - min_a) / range_a
+        s.composite_score = sharpness_weight * norm_s + aesthetic_weight * norm_a
+
+
 class VisualScorer:
     """Evaluates sharpness, composition, and visual appeal across scene candidates."""
 
@@ -83,6 +111,7 @@ class VisualScorer:
 
         try:
             import torch
+
             if not torch.cuda.is_available():
                 logger.info("PyTorch build has no CUDA; using OpenCV aesthetic engine")
                 return
@@ -113,9 +142,11 @@ class VisualScorer:
         if hasattr(self, "_torch_transforms"):
             del self._torch_transforms
         import gc
+
         gc.collect()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 logger.info("Evicted VisualScorer PyTorch model from CUDA VRAM.")
@@ -127,7 +158,11 @@ class VisualScorer:
     ) -> ScoredScene:
         """Sample keyframes and compute sharpness, aesthetic, and composite scores."""
         frames = self._scene_frames(scene, keyframes)
-        metrics = self._metrics_from_frames(frames, self._compute_aesthetic_batch(frames)) if frames else None
+        metrics = (
+            self._metrics_from_frames(frames, self._compute_aesthetic_batch(frames))
+            if frames
+            else None
+        )
         return self._scored_from_metrics(scene, metrics)
 
     def _scene_frames(self, scene: SceneCut, keyframes: KeyframeStore | None) -> list[np.ndarray]:
@@ -271,7 +306,9 @@ class VisualScorer:
                 results.update(fut.result())
                 done += futures[fut]
                 if progress_callback:
-                    progress_callback(min(100.0, done / total * 100.0), f"Scored scene {done}/{total}")
+                    progress_callback(
+                        min(100.0, done / total * 100.0), f"Scored scene {done}/{total}"
+                    )
                 if cancel_event and cancel_event.is_set():
                     logger.info("Visual scoring cancelled by user.")
                     break
@@ -284,21 +321,13 @@ class VisualScorer:
             return []
 
         # Normalization across batch to [0.0, 1.0]
-        sharp_vals = [s.sharpness_score for s in scored_list]
-        aesth_vals = [s.aesthetic_score for s in scored_list]
-
-        min_s, max_s = min(sharp_vals), max(sharp_vals)
-        min_a, max_a = min(aesth_vals), max(aesth_vals)
-
-        range_s = (max_s - min_s) if (max_s - min_s) > 1e-6 else 1.0
-        range_a = (max_a - min_a) if (max_a - min_a) > 1e-6 else 1.0
+        normalize_composites(
+            scored_list,
+            sharpness_weight=self.config.sharpness_weight,
+            aesthetic_weight=self.config.aesthetic_weight,
+        )
 
         for s in scored_list:
-            norm_s = (s.sharpness_score - min_s) / range_s
-            norm_a = (s.aesthetic_score - min_a) / range_a
-            s.composite_score = (
-                self.config.sharpness_weight * norm_s + self.config.aesthetic_weight * norm_a
-            )
             s.speed = self.calculate_speed_for_score(
                 s.composite_score,
                 max_speed=self.config.max_speed_multiplier,
@@ -332,7 +361,9 @@ class VisualScorer:
         for sc in scenes:
             by_clip[sc.clip_path].append(sc)
         for path, items in by_clip.items():
-            entry = cache.load("visual", path, cache.make_key(path, **self._cache_params(from_store)))
+            entry = cache.load(
+                "visual", path, cache.make_key(path, **self._cache_params(from_store))
+            )
             if not entry:
                 continue
             for sc in items:
@@ -424,7 +455,9 @@ class VisualScorer:
         h, w = bgr_img.shape[:2]
         if w > 1920:
             scale = 1920.0 / w
-            bgr_img = cv2.resize(bgr_img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            bgr_img = cv2.resize(
+                bgr_img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+            )
 
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
 

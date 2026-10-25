@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from src.core.config import PipelineConfig
+from src.core.platform_caps import detect_os
+from src.core.platform_paths import fusionscript_name
 from src.dispatchers.resolve_worker import run_dispatch
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ class ResolveDispatcher:
     def _setup_environment(self) -> None:
         """Configure Windows environment variables and sys.path for DaVinciResolveScript."""
         script_module_dir = str(self.config.resolve_script_path.resolve())
-        dll_path = str(self.config.resolve_exe_path.parent / "fusionscript.dll")
+        dll_path = str(self.config.resolve_exe_path.parent / fusionscript_name(detect_os()))
 
         if "RESOLVE_SCRIPT_API" not in os.environ:
             os.environ["RESOLVE_SCRIPT_API"] = str(self.config.resolve_script_path.parent)
@@ -140,7 +142,8 @@ class ResolveDispatcher:
         launcher = shutil.which("py")
         if launcher:
             cands += [[launcher, f"-3.{minor}"] for minor in (13, 12, 11, 10)]
-        cands.append([sys.executable])
+        if not getattr(sys, "frozen", False):
+            cands.append([sys.executable])
         return cands
 
     def _dispatch_in_subprocess(self, payload: dict[str, Any]) -> dict[str, Any] | None:

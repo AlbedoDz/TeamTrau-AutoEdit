@@ -15,16 +15,25 @@ dependencies = [
     "click>=8.1.7",
     "numpy>=1.24.0",
     "opencv-python>=4.9.0",
-    "pytest>=8.0.0",
-    "ruff>=0.4.0",
     "ffmpeg-python>=0.2.0",
     "ultralytics>=8.0.0",
     "faster-whisper>=1.0.0",
     "openai>=1.0.0",
     "mcp>=2.0.0",
+    "starlette>=1.8.0",
+    "uvicorn>=0.54.0",
     "pyside6>=6.7.0",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+sidecar = [
+    "pyinstaller>=6.22.3",
 ]
 
 # NVIDIA GPUs: take torch/torchvision CUDA 12.6 builds on Windows and Linux (PyPI ships

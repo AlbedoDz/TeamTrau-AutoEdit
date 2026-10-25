@@ -1,0 +1,72 @@
+name: Engine CI
+
+# Linux on every push; Windows and macOS only for pull requests to main and manual runs
+# (private-repo Actions minutes: Windows counts 2x, macOS 10x).
+on:
+  push:
+    branches: [main, feature/studio-engine]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+          enable-cache: true
+
+      # Ubuntu's ffmpeg 6.1 differs from the 8.x builds the engine is developed and shipped with
+      # (MXF frame rate, ProRes colour tags, zscale tone mapping), so use the same 8.1 line.
+      - name: Install ffmpeg 8.1 and Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+          curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf /tmp/ffmpeg.tar.xz -C "$RUNNER_TEMP/ffmpeg" --strip-components=1
+          echo "$RUNNER_TEMP/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      # The lock pins CUDA 12.6 torch on Windows/Linux (~2.5 GB). CI has no GPU, so install
+      # everything else from the lock and the same torch version from the CPU index.
+      - name: Install dependencies (CPU torch)
+        if: runner.os != 'macOS'
+        run: |
+          uv sync --locked --no-install-package torch --no-install-package torchvision
+          uv pip install "torch==2.14.1" "torchvision==0.29.1" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        if: runner.os == 'macOS'
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run --no-sync ruff check src tests main.py
+
+      - name: Pytest
+        run: uv run --no-sync pytest tests -q -p no:cacheprovider

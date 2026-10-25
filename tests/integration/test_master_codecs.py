@@ -63,6 +63,17 @@ def _frame(path: Path, index: int) -> np.ndarray:
         cap.release()
 
 
+def _ffmpeg_luma(path: Path, index: int) -> float:
+    """Mean 8-bit luma of frame ``index`` as decoded and converted by the ffmpeg CLI."""
+    raw = subprocess.run(
+        [FFMPEG, "-v", "error", "-i", str(path), "-vf", rf"select=eq(n\,{index})", "-frames:v", "1",
+         "-pix_fmt", "gray", "-f", "rawvideo", "-"],
+        capture_output=True, check=True, timeout=60,
+    ).stdout
+    assert raw, f"cannot read frame {index} of {path}"
+    return float(np.frombuffer(raw, np.uint8).mean())
+
+
 def _frame_count(path: Path) -> int:
     cap = cv2.VideoCapture(str(path))
     try:
@@ -409,8 +420,9 @@ def test_hdr_source_is_tone_mapped_for_rec709_master(tmp_path):
     v = stream_info(res.output_path, "video")
     assert v["pix_fmt"] == "yuv420p" and v["color_transfer"] == "bt709" and v["color_space"] == "bt709"
     # Naive tag-only conversion would leave PQ mid-grey (~ luma 126); tone-mapping maps ~92 nits to a bright SDR grey.
-    sdr_luma = float(cv2.cvtColor(_frame(res.output_path, 5), cv2.COLOR_BGR2GRAY).mean())
-    pq_luma = float(cv2.cvtColor(_frame(hdr, 5), cv2.COLOR_BGR2GRAY).mean())
+    # Measured with the ffmpeg CLI: opencv-python's bundled decoder converts 10-bit PQ differently per OS.
+    sdr_luma = _ffmpeg_luma(res.output_path, 5)
+    pq_luma = _ffmpeg_luma(hdr, 5)
     assert sdr_luma > pq_luma + 25, (sdr_luma, pq_luma)
 
 

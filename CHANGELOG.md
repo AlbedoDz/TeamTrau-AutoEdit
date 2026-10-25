@@ -1,5 +1,15 @@
 ## [Unreleased]
 
+- feat(engine): renderer hardware encoder ladder (VideoToolbox, QSV, AMF) from platform_caps
+- build(engine): Windows sidecar bundles the shared ffmpeg build (tools 314 MB -> 192 MB); FfmpegAsset.libraries copies matching DLLs
+- feat(engine): PyInstaller lite sidecar build with pinned ffmpeg and smoke test
+- test(engine): HDR tone-map test measures luma with the ffmpeg CLI (opencv-python decodes 10-bit PQ differently per OS)
+- fix(engine): NVENC availability is confirmed with a one-frame test encode (distro ffmpeg lists NVENC without a GPU); CI uses ffmpeg 8.1 on Linux; platform_caps test is host-independent
+- ci(engine): GitHub Actions engine CI (Linux on every push; Windows and macOS on PRs to main and manual runs), CPU torch at the locked version, ffmpeg and headless Qt
+- feat(engine): portability core (OS data dir, tools dir, private token, Resolve paths, Qt-free imports)
+- feat(engine-api): shot details, advanced pipeline options and AI settings
+- fix(teamtrau): engine-written projects open with their media (reuse existing workspace media IDs and links)
+
 ### Summary of this push (2026-10-24): Studio v3 engine service + NVIDIA CUDA torch
 
 - **NVIDIA GPU acceleration:**
@@ -19,6 +29,11 @@
   - Review polish.
 - **Plans:** Studio v3 spec, Phase 1 plan, Phase 2/4 plan with locked tests, and orchestration notes.
 
+- fix(scoring): normalise composites without zeroing single or uniform batches
+- feat(engine-api): deliver and agent job runners
+- feat(integrations): FreeCut writer carries curated take data (no placeholder sidecar values)
+- feat(engine-api): classify, soundtrack, preflight and assemble job runners
+- feat(engine-api): curation sessions, presets endpoint, curate progress and cancel
 - build(deps): CUDA 12.6 torch/torchvision via uv index (Windows/Linux); faster-whisper on GPU
 - fix(render-cache): strip audio only for the built-in renderer, not by sniffing test fakes
 - feat(render-cache): studio manifest item signatures, workspace cache dir, video-only segments

@@ -1326,6 +1326,15 @@ class StudioBackendAdapter:
                 )
                 ranked_scenes.append(sc_scene)
 
+            if ranked_scenes:
+                from src.modules.visual_scorer import normalize_composites
+
+                normalize_composites(
+                    ranked_scenes,
+                    sharpness_weight=config.sharpness_weight,
+                    aesthetic_weight=config.aesthetic_weight,
+                )
+
             if callbacks and callbacks.on_scene_discovered:
                 for sc in ranked_scenes:
                     callbacks.on_scene_discovered(sc)

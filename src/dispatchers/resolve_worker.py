@@ -19,13 +19,23 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Any
+
+_ROOT = str(Path(__file__).resolve().parents[2])
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from src.core.platform_caps import detect_os, resolve_paths  # noqa: E402
+from src.core.platform_paths import fusionscript_name  # noqa: E402
 
 EXIT_FUSION_IMPORT_FAILED = 3
 EXIT_NOT_CONNECTED = 4
 
-DEFAULT_SCRIPT_API = r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"
-DEFAULT_SCRIPT_LIB = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"
+_OS = detect_os()
+_PATHS = resolve_paths(_OS)
+DEFAULT_SCRIPT_API = str(_PATHS.api_dir)
+DEFAULT_SCRIPT_LIB = str(_PATHS.lib_path.with_name(fusionscript_name(_OS)))
 
 # Project "Mismatched resolution files" (Image Scaling) values, by AutoEdit fit mode. "auto" maps
 # to fit because the exporter's adjust-transform scale is relative to the fit-conformed size.

@@ -69,7 +69,8 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 2.3 Rebrand display strings, logo, theme tokens (`src/index.css`), landing page; keep internal ids.
 - 2.4 Vietnamese locale `vi` (+ English stays fallback).
 
-## Phase 3 — TeamTrau panels (parity with the PySide6 GUI)  *(detailed after G0)*
+## Phase 3 — TeamTrau panels (parity with the PySide6 GUI)
+**Rolling-wave plan: `2026-10-25-teamtrau-studio-v3-phase3.md` (P3.0a detailed; P3.0b–P3.6 detailed just in time).**
 - 3.1 `features/teamtrau` sidebar tab + typed engine client + job progress UI (SSE).
 - 3.2 Ingest & Roles (A-roll/B-roll/Music, classifier results, role override).
 - 3.3 Curation (golden takes grid with scores/defects, include/exclude, P/X/F hotkeys) → "Send to timeline" (S4 hand-off, one undo step).
@@ -84,12 +85,14 @@ Architect reviews the three reports and proposes GO / adjust / NO-GO for S1 (Fre
 - 4.2 Perf meter (shown / repeated / dropped, worst wait) + wire adaptive preview quality to real render scale; Full/½/¼ playback resolution.
 - 4.3 Meet spec §5 targets; benchmark script in CI-able form.
 
-## Phase 5 — Cross-platform release  *(detailed after G0)*
+## Phase 5 — Cross-platform release
+**Rolling-wave plan: `2026-10-25-teamtrau-studio-v3-phase5.md` (P5.0 detailed).**
 - 5.1 CI matrix windows/macos/ubuntu: pytest (CPU), Studio vitest, packaged smoke start.
 - 5.2 Packaging: electron-builder (NSIS/MSI, DMG signed+notarized, AppImage/deb) + PyInstaller engine sidecar + ffmpeg per OS.
 
 ## Phase 6 — Cherry-pick backlog (spec §4 list, in order)
 R128 meters + auto-ducking keyframes · command registry + UI automation for the agent · LUT + log→709 proxies · shortcut presets (Premiere/CapCut/Avid) · templates · OTIO/EDL export.
+Deferred from G3 (2026-10-25): multi-variant timelines + variant deliver list · VLM tagging UI · genre recommender banner · camera role · snap-error badge · probe columns in Ingest · curation card thumbnails · AI endpoint ping · auto-proxy on import (P4.3).
 Out of scope (owner, 2026-10-24): AI background removal / cutout, TTS voice cloning.
 
 ---
