@@ -1,5 +1,7 @@
 """platform_caps: OS / encoders / hwaccels / torch / Resolve paths (no real ffmpeg)."""
 
+from pathlib import PureWindowsPath
+
 import pytest
 
 from src.core import platform_caps as pc
@@ -127,6 +129,7 @@ def test_best_encoder_helpers():
 )
 def test_resolve_paths_per_os(os_name, lib_name):
     paths = pc.resolve_paths(os_name)
-    assert paths.lib_path.name == lib_name
-    assert paths.api_dir.name == "Scripting"
+    # The paths are built for os_name, not the host; Windows name rules accept both separators.
+    assert PureWindowsPath(str(paths.lib_path)).name == lib_name
+    assert PureWindowsPath(str(paths.api_dir)).name == "Scripting"
     assert len(paths.exe_candidates) >= 1

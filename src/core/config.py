@@ -229,13 +229,25 @@ def check_cuda_available() -> bool:
 
 @lru_cache(maxsize=1)
 def check_nvenc_available() -> bool:
-    """Verify if FFmpeg has hevc_nvenc hardware encoder available (probed once per process)."""
+    """Verify that hevc_nvenc can actually encode (probed once per process).
+
+    Distro ffmpeg builds list the NVENC encoders even on machines without an NVIDIA GPU,
+    so a listed encoder is confirmed with a one-frame test encode.
+    """
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
         return False
     try:
         res = run_tool([ffmpeg_bin, "-hide_banner", "-encoders"], timeout=10)
-        return "hevc_nvenc" in (res.stdout or "")
+        if "hevc_nvenc" not in (res.stdout or ""):
+            return False
+        trial = run_tool(
+            [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "color=black:s=256x256:d=0.1", "-frames:v", "1", "-c:v", "hevc_nvenc",
+             "-f", "null", "-"],
+            timeout=20,
+        )
+        return trial.returncode == 0
     except (FileNotFoundError, subprocess.SubprocessError):
         return False
 

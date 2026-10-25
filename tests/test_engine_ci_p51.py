@@ -58,7 +58,8 @@ def test_installs_cpu_torch_at_the_locked_version():
 def test_ffmpeg_on_every_os_and_headless_qt():
     job = _load()["jobs"]["test"]
     text = _run_text(job)
-    assert "apt-get install" in text and "ffmpeg" in text and "libegl1" in text
+    assert "apt-get install" in text and "libegl1" in text
+    assert "ffmpeg-n8.1-latest-linux64" in text and "GITHUB_PATH" in text
     assert "brew install ffmpeg" in text
     assert "choco install ffmpeg" in text
     assert job["env"]["QT_QPA_PLATFORM"] == "offscreen"

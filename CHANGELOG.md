@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- fix(engine): NVENC availability is confirmed with a one-frame test encode (distro ffmpeg lists NVENC without a GPU); CI uses ffmpeg 8.1 on Linux; platform_caps test is host-independent
 - ci(engine): GitHub Actions engine CI (Linux on every push; Windows and macOS on PRs to main and manual runs), CPU torch at the locked version, ffmpeg and headless Qt
 - feat(engine): portability core (OS data dir, tools dir, private token, Resolve paths, Qt-free imports)
 - feat(engine-api): shot details, advanced pipeline options and AI settings
