@@ -57,9 +57,6 @@ target-version = "py311"
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/test_portability_p50.py" = ["F401"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

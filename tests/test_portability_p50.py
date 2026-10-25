@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 from src.core.config import PipelineConfig
