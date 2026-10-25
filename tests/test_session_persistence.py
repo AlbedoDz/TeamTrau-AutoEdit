@@ -128,5 +128,5 @@ def test_default_project_name_format():
     from datetime import datetime
 
     when = datetime(2026, 10, 25, 22, 30)
-    assert default_project_name(Path("D:/Cuoi A"), "Rough cut", when=when) == "Cuoi A – Rough cut – 2026-10-25 22:30"
-    assert default_project_name(Path("D:/X"), "Sequence (punchy)", when=when) == "X – Sequence (punchy) – 2026-10-25 22:30"
+    assert default_project_name(Path("D:/Cuoi A"), "Rough cut", when=when) == "Cuoi A – Rough cut – 2026-10-25 22h30"
+    assert default_project_name(Path("D:/X"), "Sequence (punchy)", when=when) == "X – Sequence (punchy) – 2026-10-25 22h30"

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def default_project_name(input_dir: Path, label: str, when: datetime | None = None) -> str:
     """Name a generated project after its footage folder, what it is and when it was made."""
-    stamp = (when or datetime.now()).strftime("%Y-%m-%d %H:%M")
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d %Hh%M")  # no ":", names become file names
     return f"{Path(input_dir).name or input_dir} – {label} – {stamp}"
 
 

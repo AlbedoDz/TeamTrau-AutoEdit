@@ -37,6 +37,7 @@ from src.core.types import (
 )
 from src.dispatchers.nvenc_renderer import NvencRenderer
 from src.dispatchers.resolve_dispatcher import ResolveDispatcher
+from src.integrations.freecut_writer import sanitize_workspace_filename
 from src.modules.audio_analyzer import AudioAnalysisResult, AudioAnalyzer
 from src.modules.duration_packer import DurationPacker
 from src.modules.edit_timeline import (
@@ -848,7 +849,8 @@ class StudioBackendAdapter:
         except Exception as pf_err:
             logger.warning("NLE preflight report failed: %s", pf_err)
 
-        name = base_name or f"{edit_tl.name}"
+        # Output files are named after the timeline/project; names may hold ":" or "/" (2026-10-25 23:58).
+        name = sanitize_workspace_filename(base_name or edit_tl.name)
         nle_formats = {f for f in formats if f != "mp4"}
         if resolve or dry_run_resolve:
             nle_formats.add("fcpxml")
