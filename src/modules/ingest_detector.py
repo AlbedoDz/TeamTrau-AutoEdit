@@ -153,7 +153,7 @@ class IngestDetector:
     ) -> Path:
         """Execute fast FFmpeg pass to convert VFR footage to Constant Frame Rate (CFR).
 
-        Uses fast encoding: -c:v libx264 -preset ultrafast -crf 17 -vsync cfr -r {target_fps}.
+        Uses fast encoding: -c:v libx264 -preset ultrafast -crf 17 -fps_mode cfr -r {target_fps}.
         Output is cached under ``config.cache_dir/cfr`` keyed by path+size+mtime and written
         atomically (temp file then rename) so interrupted runs never poison the cache.
         """
@@ -198,7 +198,8 @@ class IngestDetector:
             "ultrafast",
             "-crf",
             "17",
-            "-vsync",
+            # -fps_mode replaces -vsync (deprecated in ffmpeg 5.1, removed in 9.0).
+            "-fps_mode",
             "cfr",
             "-r",
             str(target_fps),

@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- fix(engine): CFR normalisation uses -fps_mode (ffmpeg 9 removed -vsync); cadence grid keeps a first bar a few ULPs below zero (macOS arm64); burn-in tests skip when ffmpeg lacks libass
 - feat(engine): renderer hardware encoder ladder (VideoToolbox, QSV, AMF) from platform_caps
 - build(engine): Windows sidecar bundles the shared ffmpeg build (tools 314 MB -> 192 MB); FfmpegAsset.libraries copies matching DLLs
 - feat(engine): PyInstaller lite sidecar build with pinned ffmpeg and smoke test
