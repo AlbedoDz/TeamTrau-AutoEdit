@@ -2012,3 +2012,231 @@ describe('buildAgentTranscript', () => {
 ## Gate G3 (owner): feature parity checklist
 
 The architect prepares `docs/teamtrau/G3-parity.md` from the PySide6 inventory (scene grid, inspector, export panel, agent console, media browser). It marks each feature as Done (with the Studio panel), Partial or Missing, with screenshots. The owner signs off before the PySide6 GUI is frozen (spec S7).
+
+
+---
+
+## P3.7 — Close the G3 gaps that matter to daily editing (owner decision 2026-10-25: P3.7 before freezing PySide6)
+
+From `docs/superpowers/G3-parity.md`:
+- **In scope:** bulk include/exclude, the scene badges and inspector details, advanced pipeline options, AI endpoint settings, and one-click Run All.
+- **Deferred to Phase 6:** multi-variant timelines, VLM tagging UI, the genre recommender, and camera role.
+
+### P3.7a — Engine: shot details, advanced options, AI settings (Engine repo, branch `feature/studio-engine`)
+
+**API**
+```python
+# src/engine_api/sessions.py
+def session_to_dict(session, detail: bool = False) -> dict   # detail=False output unchanged (P3.0a locked test)
+
+# src/engine_api/options.py (new)
+ADVANCED_OPTIONS: dict[str, dict]   # key -> {"stages": {"curate"|"assemble"}, "type": "bool"|"float"|"enum", "min"/"max" | "values"}
+def apply_config_overrides(cfg: PipelineConfig, overrides: Mapping | None, stage: Literal["curate", "assemble"]) -> PipelineConfig
+def describe_options() -> {"curate": [{key, type, default, min?, max?, values?}], "assemble": [...]}
+
+# src/engine_api/ai_settings.py (new)
+class AiSettingsStore:
+    def __init__(self, path: Path) -> None
+    def get(self) -> {"provider", "base_url", "model", "has_api_key"}     # never the key
+    def secret(self) -> str | None
+    def set(self, update: dict) -> dict                                    # returns get()
+def agent_config_from_settings(store: AiSettingsStore) -> PipelineConfig  # agent_provider/base_url/model/api_key set
+
+# app.create_app(..., ai_settings: AiSettingsStore | None = None)
+```
+
+**Rules**
+- **Shot details**
+  - `session_to_dict(detail=True)` adds `"details": {shot_id: {is_long_shot, defects_count, has_dead_air, requires_deflicker, trimmed_sec, golden_window, scored_by, vlm}}`.
+  - Sources: `metadata.is_long_shot` (default False), `metadata.defects_count` (default 0), `metadata.has_dead_air or is_dead_air`, `golden.requires_deflicker` (default False), `golden.trimmed_sec` (default 0.0), `metadata.golden_window`, and `metadata.scored_by`.
+  - `vlm` is `{description, tags, mood, pacing, key_moment}` read from the `vlm_*` keys when any of them exists, otherwise `None`.
+  - `GET /v1/sessions/{id}?detail=1` returns it.
+- **Option whitelist (exactly these keys)**
+  - **curate:** `min_take_duration_sec` (float 0.5–10), `max_scene_len_sec` (float 2–120), and the bools `enable_shake_pruning`, `enable_focus_guard`, `enable_occlusion_guard`, `enable_exposure_clipping_guard`, `enable_head_tail_trim`, `enable_dead_air_detection`.
+  - **assemble:** the bools `enable_smart_reframing`, `enable_ken_burns`, `enable_speed_ramping`, `enable_teaser`, `watermark_enabled`; `teaser_duration` (float 1–30); `duration_mode` (enum `fixed` / `footage_driven` / `full_track`).
+- **`apply_config_overrides`**
+  - It validates the key and stage, then the type (`bool` must be a real bool; `float` accepts int or float but not bool, within range; `enum` must be one of the values). Any violation raises `ValueError`.
+  - It returns a **copy** (`model_copy(update=...)`). An empty or `None` override returns the config unchanged.
+- **Runner wiring**
+  - `run_curation(..., config_overrides=None)` applies the curate overrides after the genre is applied.
+  - `assemble_sequence(..., config_overrides=None)` applies the assemble overrides to `session.config` **before** any adapter call.
+  - The `curate` and `assemble` runners pass `params.get("config_overrides")`.
+- **`GET /v1/presets`** adds `"advanced": describe_options()`; each default is the `PipelineConfig()` value.
+- **AI settings**
+  - Settings are persisted atomically as JSON at the given path. The default path is `PipelineConfig().cache_dir / "ai_settings.json"`, which `main.py serve` passes.
+  - The allowed fields are `provider` (auto, openrouter, deepseek, openai, ollama, lm_studio, custom), `base_url`, `model` and `api_key`. An empty `api_key` clears it. Any other field or provider raises `ValueError`.
+  - `GET /v1/settings/ai` and `PUT /v1/settings/ai` (auth) never include the key. A non-object body or a `ValueError` returns 400.
+  - The default agent runner builds its controller from `agent_config_from_settings(store)`. The P3.0d `controller_factory` override keeps working.
+  - The API key is never logged.
+
+**Files**
+- `src/engine_api/{sessions,options,ai_settings,app,runners}.py`
+- `src/core/curation.py`
+- `main.py` (serve wiring)
+- `tests/test_engine_p37a.py` (LOCKED)
+
+**Related suites:** `tests/test_engine_sessions.py`, `tests/test_engine_runners_p30b.py`, `tests/test_engine_runners_p30d.py`, `tests/test_engine_api.py`, `tests/test_curation_core.py`.
+
+**Contract test — `tests/test_engine_p37a.py`:**
+```python
+"""P3.7a: shot details, advanced pipeline options and AI settings for the Studio panels."""
+
+import json
+import threading
+from pathlib import Path
+
+import pytest
+from starlette.testclient import TestClient
+
+from src.core import curation
+from src.core.config import PipelineConfig
+from src.engine_api.ai_settings import AiSettingsStore, agent_config_from_settings
+from src.engine_api.app import create_app
+from src.engine_api.options import ADVANCED_OPTIONS, apply_config_overrides
+from src.engine_api.runners import make_assemble_runner, make_curate_runner
+from src.engine_api.sessions import SessionStore, session_to_dict
+from tests.curation_fakes import FakeAdapter, pipeline_result, scene, timeline
+
+TOKEN = "q" * 32
+H = {"Authorization": f"Bearer {TOKEN}"}
+DETAIL_KEYS = {"is_long_shot", "defects_count", "has_dead_air", "requires_deflicker", "trimmed_sec",
+               "golden_window", "scored_by", "vlm"}
+
+
+def _result():
+    a = scene(0, "a_roll", q=0.9)
+    a.metadata.update({"is_long_shot": True, "defects_count": 2, "scored_by": "mobilenet",
+                       "golden": {"source_in": 0.5, "source_out": 3.5, "trimmed_sec": 1.0,
+                                  "requires_deflicker": True, "defects": []},
+                       "golden_window": {"span": [0.0, 4.0], "window": [0.5, 3.5]},
+                       "vlm_description": "a man talks", "vlm_tags": ["talk"], "vlm_mood": "calm"})
+    b = scene(1, "b_roll", q=0.4)
+    b.metadata["has_dead_air"] = True
+    return pipeline_result([a, b], timelines={"rough_cut": timeline("rough_cut", "rough_cut")})
+
+
+def _session(tmp_path: Path, store: SessionStore | None = None):
+    sess, _ = curation.run_curation(FakeAdapter(_result()), tmp_path, None, tmp_path / "out")
+    if store is not None:
+        store.put(sess)
+    return sess
+
+
+def test_session_details_are_opt_in(tmp_path: Path):
+    sess = _session(tmp_path)
+    assert set(session_to_dict(sess)) == {"session_id", "input_dir", "takes", "shots"}
+    d = session_to_dict(sess, detail=True)
+    assert set(d) == {"session_id", "input_dir", "takes", "shots", "details"}
+    assert set(d["details"]) == {"A01", "B01"}
+    a, b = d["details"]["A01"], d["details"]["B01"]
+    assert set(a) == DETAIL_KEYS and set(b) == DETAIL_KEYS
+    assert (a["is_long_shot"], a["defects_count"], a["requires_deflicker"], a["trimmed_sec"]) == (True, 2, True, 1.0)
+    assert a["golden_window"] == {"span": [0.0, 4.0], "window": [0.5, 3.5]} and a["scored_by"] == "mobilenet"
+    assert a["vlm"] == {"description": "a man talks", "tags": ["talk"], "mood": "calm", "pacing": None,
+                        "key_moment": None}
+    assert (b["has_dead_air"], b["is_long_shot"], b["defects_count"], b["trimmed_sec"]) == (True, False, 0, 0.0)
+    assert b["vlm"] is None and b["golden_window"] is None
+    json.dumps(d)
+
+
+def test_session_details_over_http(tmp_path: Path):
+    store = SessionStore()
+    sess = _session(tmp_path, store)
+    c = TestClient(create_app(token=TOKEN, runners={}, sessions=store))
+    plain = c.get(f"/v1/sessions/{sess.session_id}", headers=H).json()
+    assert "details" not in plain
+    full = c.get(f"/v1/sessions/{sess.session_id}?detail=1", headers=H).json()
+    assert full["details"]["B01"]["has_dead_air"] is True
+
+
+def test_apply_config_overrides_validates_and_copies():
+    base = PipelineConfig()
+    cfg = apply_config_overrides(base, {"enable_ken_burns": False, "teaser_duration": 4.0,
+                                        "duration_mode": "full_track"}, stage="assemble")
+    assert (cfg.enable_ken_burns, cfg.teaser_duration, cfg.duration_mode) == (False, 4.0, "full_track")
+    assert base.enable_ken_burns is True and base.duration_mode == "fixed"
+    cur = apply_config_overrides(base, {"min_take_duration_sec": 2.0, "enable_shake_pruning": False},
+                                 stage="curate")
+    assert (cur.min_take_duration_sec, cur.enable_shake_pruning) == (2.0, False)
+    for bad in ({"no_such_option": 1}, {"enable_ken_burns": "no"}, {"teaser_duration": 100.0},
+                {"duration_mode": "forever"}, {"min_take_duration_sec": 2.0}):
+        with pytest.raises(ValueError):
+            apply_config_overrides(base, bad, stage="assemble")
+    assert apply_config_overrides(base, {}, stage="curate") == base
+
+
+def test_presets_publish_advanced_options():
+    c = TestClient(create_app(token=TOKEN, runners={}))
+    adv = c.get("/v1/presets", headers=H).json()["advanced"]
+    assert set(adv) == {"curate", "assemble"}
+    for stage, items in adv.items():
+        keys = {i["key"] for i in items}
+        assert keys == {k for k, spec in ADVANCED_OPTIONS.items() if stage in spec["stages"]}
+        for i in items:
+            assert set(i) >= {"key", "type", "default"}
+            assert i["type"] in {"bool", "float", "enum"}
+            assert i["default"] == getattr(PipelineConfig(), i["key"])
+
+
+def test_runners_apply_overrides_before_submitting(tmp_path: Path):
+    store = SessionStore()
+    curate_adapter = FakeAdapter(_result())
+    make_curate_runner(store, adapter_factory=lambda: curate_adapter)(
+        {"input_dir": str(tmp_path), "workspace": str(tmp_path / "ws"),
+         "config_overrides": {"min_take_duration_sec": 2.0}}, lambda e: None, threading.Event())
+    assert curate_adapter.calls[-1][1]["config"].min_take_duration_sec == 2.0
+
+    sess = _session(tmp_path, store)
+    song = tmp_path / "song.wav"
+    song.write_bytes(b"x")
+    asm = FakeAdapter(pipeline_result([], timelines={"master": timeline("master", "music")}))
+    make_assemble_runner(store, adapter_factory=lambda: asm)(
+        {"session_id": sess.session_id, "workspace": str(tmp_path / "ws"), "soundtrack": str(song),
+         "config_overrides": {"enable_ken_burns": False}}, lambda e: None, threading.Event())
+    assert asm.calls[-1][1]["config"].enable_ken_burns is False
+
+    untouched = FakeAdapter()
+    with pytest.raises(ValueError):
+        make_assemble_runner(store, adapter_factory=lambda: untouched)(
+            {"session_id": sess.session_id, "workspace": str(tmp_path / "ws"), "soundtrack": str(song),
+             "config_overrides": {"enable_ken_burns": "nope"}}, lambda e: None, threading.Event())
+    assert untouched.calls == []
+
+
+def test_ai_settings_store_never_reveals_the_key(tmp_path: Path):
+    path = tmp_path / "ai.json"
+    store = AiSettingsStore(path)
+    assert store.get() == {"provider": "auto", "base_url": None, "model": "deepseek/deepseek-chat",
+                           "has_api_key": False}
+    store.set({"provider": "openai", "model": "gpt-4o", "api_key": "sk-secret"})
+    again = AiSettingsStore(path)
+    assert again.get() == {"provider": "openai", "base_url": None, "model": "gpt-4o", "has_api_key": True}
+    assert "sk-secret" not in json.dumps(again.get())
+    assert again.secret() == "sk-secret"
+    again.set({"api_key": ""})
+    assert again.get()["has_api_key"] is False and again.get()["provider"] == "openai"
+    with pytest.raises(ValueError):
+        again.set({"provider": "skynet"})
+    with pytest.raises(ValueError):
+        again.set({"temperature": 2})
+
+
+def test_ai_settings_over_http_and_agent_config(tmp_path: Path):
+    store = AiSettingsStore(tmp_path / "ai.json")
+    c = TestClient(create_app(token=TOKEN, runners={}, ai_settings=store))
+    assert c.get("/v1/settings/ai").status_code == 401
+    r = c.put("/v1/settings/ai", headers=H, json={"provider": "deepseek", "api_key": "dk-1"})
+    assert r.status_code == 200 and r.json()["has_api_key"] is True and "dk-1" not in r.text
+    assert c.put("/v1/settings/ai", headers=H, json={"provider": "x"}).status_code == 400
+    assert c.put("/v1/settings/ai", headers=H, json=[1]).status_code == 400
+    assert c.get("/v1/settings/ai", headers=H).json()["provider"] == "deepseek"
+
+    cfg = agent_config_from_settings(store)
+    assert (cfg.agent_provider, cfg.agent_api_key, cfg.agent_model) == ("deepseek", "dk-1", "deepseek/deepseek-chat")
+```
+**Expected red:** `ModuleNotFoundError: No module named 'src.engine_api.ai_settings'`.
+
+**Commit:** `feat(engine-api): shot details, advanced pipeline options and AI settings`.
+
+### P3.7b — Studio: bulk curation, badges, inspector, Advanced options, AI settings, Run All
+This task is detailed with locked tests after P3.7a lands.
