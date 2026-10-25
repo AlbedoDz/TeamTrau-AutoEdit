@@ -347,6 +347,7 @@
   - [x] P3.4: Sequence panel (soundtrack analysis, beat-grid ruler overlay, cadence assemble) & P3.4-fix (engine-written projects open with media)
   - [x] P3.5: Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder
   - [x] P3.6: Agent console: prompt input, streamed thoughts, collapsible tool cards, heuristic badge, cancel, history
+  - [x] P3.7a: Shot details, advanced options, AI settings (Engine repo)
 
 
 

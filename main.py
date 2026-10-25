@@ -19,6 +19,7 @@ from src.core.config import (
 )
 from src.core.service import StudioBackendAdapter
 from src.core.stage_options import CADENCE_NAMES, apply_staged_options
+from src.engine_api.ai_settings import AiSettingsStore
 from src.engine_api.app import build_server_config, create_app
 from src.engine_api.sessions import SessionStore
 from src.modules.ingest_detector import IngestDetector
@@ -866,8 +867,9 @@ def serve_cmd(port: int, token_file: Path | None) -> None:
     click.echo(f"Engine token file: {token_path}")
     click.echo(f"Starting TeamTrau Engine API on http://127.0.0.1:{port}...")
 
+    ai_settings = AiSettingsStore(PipelineConfig().cache_dir / "ai_settings.json")
     sessions = SessionStore()
-    app = create_app(token=token, sessions=sessions)
+    app = create_app(token=token, sessions=sessions, ai_settings=ai_settings)
     server_cfg = build_server_config(app, port=port)
     server = uvicorn.Server(server_cfg)
     server.run()

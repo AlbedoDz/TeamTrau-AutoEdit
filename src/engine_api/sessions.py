@@ -57,7 +57,7 @@ def shot_to_dict(shot_id: str, sc: ScoredScene) -> dict[str, Any]:
     }
 
 
-def session_to_dict(session: CurationSession) -> dict[str, Any]:
+def session_to_dict(session: CurationSession, detail: bool = False) -> dict[str, Any]:
     """Serialize a CurationSession to a JSON-safe dictionary with shots in natural order."""
     def _natural_key(item: tuple[str, ScoredScene]) -> tuple[str, int, str]:
         sid = item[0]
@@ -69,12 +69,54 @@ def session_to_dict(session: CurationSession) -> dict[str, Any]:
     sorted_shots = sorted(session.shots.items(), key=_natural_key)
     serialized_shots = [shot_to_dict(sid, sc) for sid, sc in sorted_shots]
 
-    return {
+    data: dict[str, Any] = {
         "session_id": session.session_id,
         "input_dir": str(session.input_dir),
         "takes": len(session.shots),
         "shots": serialized_shots,
     }
+
+    if detail:
+        details: dict[str, dict[str, Any]] = {}
+        vlm_keys = ("vlm_description", "vlm_tags", "vlm_mood", "vlm_pacing", "vlm_key_moment")
+        for sid, sc in sorted_shots:
+            meta = sc.metadata or {}
+            golden_raw = meta.get("golden") if isinstance(meta.get("golden"), dict) else {}
+            gw = meta.get("golden_window")
+            if isinstance(gw, dict):
+                golden_window: dict[str, Any] | None = dict(gw)
+            else:
+                golden_window = None
+
+            if any(k in meta for k in vlm_keys):
+                raw_tags = meta.get("vlm_tags")
+                vlm = {
+                    "description": meta.get("vlm_description"),
+                    "tags": list(raw_tags) if isinstance(raw_tags, (list, tuple)) else raw_tags,
+                    "mood": meta.get("vlm_mood"),
+                    "pacing": meta.get("vlm_pacing"),
+                    "key_moment": meta.get("vlm_key_moment"),
+                }
+            else:
+                vlm = None
+
+            details[sid] = {
+                "is_long_shot": bool(meta.get("is_long_shot", False)),
+                "defects_count": int(meta.get("defects_count", 0)),
+                "has_dead_air": bool(
+                    meta.get("has_dead_air", False)
+                    or getattr(sc, "is_dead_air", False)
+                    or meta.get("is_dead_air", False)
+                ),
+                "requires_deflicker": bool(golden_raw.get("requires_deflicker", False)),
+                "trimmed_sec": float(golden_raw.get("trimmed_sec", 0.0)),
+                "golden_window": golden_window,
+                "scored_by": meta.get("scored_by"),
+                "vlm": vlm,
+            }
+        data["details"] = details
+
+    return data
 
 
 class SessionStore:

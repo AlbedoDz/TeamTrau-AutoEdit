@@ -17,11 +17,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from src.core.config import PipelineConfig
 from src.core.genre_presets import GENRE_PRESETS, ROUGH_CUT_PRESET
 from src.core.platform_caps import PlatformCaps, get_caps
 from src.core.stage_options import CADENCE_NAMES, GENRE_KEYS
 from src.core.types import DeliverColor, DeliverFitMode, DeliverMaster, DeliverSubtitles
+from src.engine_api.ai_settings import AiSettingsStore
 from src.engine_api.jobs import JobRegistry, JobRunner
+from src.engine_api.options import describe_options
 from src.engine_api.runners import default_runners
 from src.engine_api.sessions import SessionStore, session_to_dict
 
@@ -67,6 +70,7 @@ def create_app(
     registry: JobRegistry | None = None,
     max_body_bytes: int = 1_000_000,
     sessions: SessionStore | None = None,
+    ai_settings: AiSettingsStore | None = None,
 ) -> Starlette:
     """Create and configure Starlette Engine API service application.
 
@@ -77,6 +81,7 @@ def create_app(
         registry: JobRegistry instance (created if None).
         max_body_bytes: Maximum allowed request body size in bytes (default: 1 MB).
         sessions: SessionStore instance for curation sessions (created if None).
+        ai_settings: AiSettingsStore instance for AI provider settings (created if None).
 
     Returns:
         Configured Starlette application instance.
@@ -85,7 +90,14 @@ def create_app(
         raise ValueError("token must not be empty or whitespace")
 
     _sessions: SessionStore = SessionStore() if sessions is None else sessions
-    _runners: Mapping[str, JobRunner] = default_runners(_sessions) if runners is None else runners
+    _ai_settings: AiSettingsStore = (
+        AiSettingsStore(PipelineConfig().cache_dir / "ai_settings.json")
+        if ai_settings is None
+        else ai_settings
+    )
+    _runners: Mapping[str, JobRunner] = (
+        default_runners(_sessions, ai_settings=_ai_settings) if runners is None else runners
+    )
     _registry: JobRegistry = JobRegistry() if registry is None else registry
 
     async def health_endpoint(request: Request) -> Response:
@@ -115,6 +127,7 @@ def create_app(
                 "subtitles": list(get_args(DeliverSubtitles)),
                 "color": list(get_args(DeliverColor)),
             },
+            "advanced": describe_options(),
         }
         return JSONResponse(data)
 
@@ -123,7 +136,39 @@ def create_app(
         session = _sessions.get(session_id)
         if session is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
-        return JSONResponse(session_to_dict(session))
+        detail = request.query_params.get("detail") in {"1", "true", "True"}
+        return JSONResponse(session_to_dict(session, detail=detail))
+
+    async def get_ai_settings_endpoint(request: Request) -> Response:
+        return JSONResponse(_ai_settings.get())
+
+    async def put_ai_settings_endpoint(request: Request) -> Response:
+        cl_str = request.headers.get("content-length")
+        if cl_str is not None:
+            try:
+                if int(cl_str) > max_body_bytes:
+                    return JSONResponse({"error": "request body too large"}, status_code=413)
+            except ValueError:
+                pass
+
+        body = await request.body()
+        if len(body) > max_body_bytes:
+            return JSONResponse({"error": "request body too large"}, status_code=413)
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        if not isinstance(data, dict):
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+
+        try:
+            result = _ai_settings.set(data)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        return JSONResponse(result, status_code=200)
 
     async def patch_session_endpoint(request: Request) -> Response:
         session_id = request.path_params.get("id", "")
@@ -249,6 +294,8 @@ def create_app(
         Route("/v1/presets", presets_endpoint, methods=["GET"]),
         Route("/v1/sessions/{id}", get_session_endpoint, methods=["GET"]),
         Route("/v1/sessions/{id}", patch_session_endpoint, methods=["PATCH"]),
+        Route("/v1/settings/ai", get_ai_settings_endpoint, methods=["GET"]),
+        Route("/v1/settings/ai", put_ai_settings_endpoint, methods=["PUT"]),
         Route("/v1/jobs/{kind}", submit_job_endpoint, methods=["POST"]),
         Route("/v1/jobs/{id}/events", get_job_events_endpoint, methods=["GET"]),
         Route("/v1/jobs/{id}/cancel", cancel_job_endpoint, methods=["POST"]),

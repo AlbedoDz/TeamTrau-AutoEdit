@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- feat(engine-api): shot details, advanced pipeline options and AI settings
 - fix(teamtrau): engine-written projects open with their media (reuse existing workspace media IDs and links)
 
 ### Summary of this push (2026-10-24): Studio v3 engine service + NVIDIA CUDA torch

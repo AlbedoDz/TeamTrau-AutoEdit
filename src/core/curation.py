@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,6 +108,7 @@ def run_curation(
     timeout: float | None = None,
     callbacks: JobCallbacks | None = None,
     cancel_event: threading.Event | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> tuple[CurationSession, dict[str, Any]]:
     """Execute rough-cut curation and defect pruning on source footage.
 
@@ -122,6 +123,11 @@ def run_curation(
 
     if genre is not None:
         apply_staged_options(cfg, genre=genre)
+
+    if config_overrides:
+        from src.engine_api.options import apply_config_overrides
+
+        cfg = apply_config_overrides(cfg, config_overrides, stage="curate")
 
     submit_kwargs: dict[str, Any] = {
         "input_dir": input_path,
@@ -192,6 +198,7 @@ def assemble_sequence(
     timeout: float | None = None,
     callbacks: JobCallbacks | None = None,
     cancel_event: threading.Event | None = None,
+    config_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a cadence-driven sequence timeline from curated shots and soundtrack.
 
@@ -214,6 +221,11 @@ def assemble_sequence(
 
     if cadence is not None:
         apply_staged_options(session.config, cadence=cadence)
+
+    if config_overrides:
+        from src.engine_api.options import apply_config_overrides
+
+        session.config = apply_config_overrides(session.config, config_overrides, stage="assemble")
 
     submit_kw: dict[str, Any] = {
         "input_dir": session.input_dir,

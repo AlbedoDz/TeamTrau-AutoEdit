@@ -20,6 +20,7 @@ from src.core.service import (
     find_soundtrack,
 )
 from src.core.types import ALL_DELIVER_FORMATS, DeliverSettings
+from src.engine_api.ai_settings import AiSettingsStore
 from src.engine_api.jobs import JobRunner
 from src.engine_api.sessions import SessionStore, session_to_dict
 from src.integrations.freecut_reader import read_freecut_project
@@ -140,6 +141,7 @@ def make_curate_runner(
         top_n = int(params.get("top_n", 12))
         project_name = str(params.get("project_name", "Curated Rough Cut"))
         out_dir = Path(params.get("output_dir", workspace / ".curation_tmp"))
+        config_overrides = params.get("config_overrides")
 
         def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
             emit({"type": "progress", "pct": total_pct, "msg": msg})
@@ -155,6 +157,7 @@ def make_curate_runner(
             top_n=top_n,
             callbacks=callbacks,
             cancel_event=cancel_event,
+            config_overrides=config_overrides,
         )
 
         rough_tl = None
@@ -319,6 +322,7 @@ def make_assemble_runner(
         cadence = params.get("cadence")
         selected_ids = params.get("selected_ids")
         project_name = str(params.get("project_name", "Assembled Sequence"))
+        config_overrides = params.get("config_overrides")
 
         def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
             emit({"type": "progress", "pct": total_pct, "msg": msg})
@@ -334,6 +338,7 @@ def make_assemble_runner(
             cadence=cadence,
             callbacks=callbacks,
             cancel_event=cancel_event,
+            config_overrides=config_overrides,
         )
 
         timeline_id = assemble_res["timeline_id"]
@@ -484,6 +489,7 @@ def make_deliver_runner(
 
 def make_agent_runner(
     controller_factory: Callable[[], Any] | None = None,
+    ai_settings: AiSettingsStore | None = None,
 ) -> JobRunner:
     """Create an agent job runner that executes an autonomous reasoning/tool-calling loop."""
 
@@ -524,9 +530,11 @@ def make_agent_runner(
         if controller_factory is not None:
             controller = controller_factory()
         else:
+            from src.engine_api.ai_settings import agent_config_from_settings
             from src.modules.agent_controller import AutoEditAgentController
 
-            controller = AutoEditAgentController()
+            cfg = agent_config_from_settings(ai_settings) if ai_settings is not None else None
+            controller = AutoEditAgentController(config=cfg)
 
         result = controller.run(
             prompt,
@@ -555,7 +563,10 @@ def make_agent_runner(
     return runner
 
 
-def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner]:
+def default_runners(
+    sessions: SessionStore | None = None,
+    ai_settings: AiSettingsStore | None = None,
+) -> dict[str, JobRunner]:
     """Return dictionary of default engine job runners."""
     store = sessions if sessions is not None else SessionStore()
     return {
@@ -567,5 +578,5 @@ def default_runners(sessions: SessionStore | None = None) -> dict[str, JobRunner
         "preflight": make_preflight_runner(),
         "assemble": make_assemble_runner(store),
         "deliver": make_deliver_runner(),
-        "agent": make_agent_runner(),
+        "agent": make_agent_runner(ai_settings=ai_settings),
     }
