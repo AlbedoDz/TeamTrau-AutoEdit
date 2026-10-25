@@ -345,6 +345,7 @@
   - [x] P3.3: Curation panel (golden-takes grid, P/X hotkeys, "Send to timeline" as ONE undo step)
   - [x] P3.0e: Curation score fix + short-clip diagnosis (composite normalisation, diagnosis table)
   - [x] P3.4: Sequence panel (soundtrack analysis, beat-grid ruler overlay, cadence assemble) & P3.4-fix (engine-written projects open with media)
+  - [x] P3.5: Deliver panel: DeliverSettings form, pre-flight report, deliver job with progress, open output folder
 
 
 
