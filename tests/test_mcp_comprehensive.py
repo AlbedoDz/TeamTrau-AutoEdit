@@ -101,7 +101,7 @@ def test_tool_generate_mcp_config():
     assert ag_cfg["client"] == "antigravity"
     assert "mcpServers" in ag_cfg["config"]
     assert "teamtrau-autoedit" in ag_cfg["config"]["mcpServers"]
-    assert ag_cfg["config"]["mcpServers"]["teamtrau-autoedit"]["command"].endswith("python.exe")
+    assert Path(ag_cfg["config"]["mcpServers"]["teamtrau-autoedit"]["command"]).name.startswith("python")
 
     # Claude Desktop config
     claude_cfg = generate_mcp_config(client_name="claude_desktop", transport="stdio")

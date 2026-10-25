@@ -15,16 +15,22 @@ dependencies = [
     "click>=8.1.7",
     "numpy>=1.24.0",
     "opencv-python>=4.9.0",
-    "pytest>=8.0.0",
-    "ruff>=0.4.0",
     "ffmpeg-python>=0.2.0",
     "ultralytics>=8.0.0",
     "faster-whisper>=1.0.0",
     "openai>=1.0.0",
     "mcp>=2.0.0",
+    "starlette>=1.8.0",
+    "uvicorn>=0.54.0",
     "pyside6>=6.7.0",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
 ]
 
 # NVIDIA GPUs: take torch/torchvision CUDA 12.6 builds on Windows and Linux (PyPI ships
@@ -50,6 +56,9 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_portability_p50.py" = ["F401"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

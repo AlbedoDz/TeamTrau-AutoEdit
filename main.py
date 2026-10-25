@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -17,6 +18,8 @@ from src.core.config import (
     check_cuda_available,
     check_nvenc_available,
 )
+from src.core.platform_caps import detect_os
+from src.core.platform_paths import prepend_tool_dir, resolve_data_dir
 from src.core.service import StudioBackendAdapter
 from src.core.stage_options import CADENCE_NAMES, apply_staged_options
 from src.engine_api.ai_settings import AiSettingsStore
@@ -846,10 +849,40 @@ def curate_cmd(
     "--token-file",
     type=click.Path(path_type=Path),
     default=None,
-    help="Path to token file (default: <cache_dir>/engine_token).",
+    help="Path to token file (default: <data_dir>/engine_token).",
 )
-def serve_cmd(port: int, token_file: Path | None) -> None:
+@click.option(
+    "--data-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help="Engine data directory for token, settings, and cache.",
+)
+@click.option(
+    "--tools-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    help="Directory containing bundled ffmpeg/ffprobe binaries to prepend to PATH.",
+)
+def serve_cmd(
+    port: int,
+    token_file: Path | None,
+    data_dir: Path | None,
+    tools_dir: Path | None,
+) -> None:
     """Run the TeamTrau Engine API loopback service."""
+    if tools_dir is not None:
+        prepend_tool_dir(Path(tools_dir), os.environ)
+
+    resolved_data = resolve_data_dir(
+        str(data_dir) if data_dir is not None else None,
+        os.environ,
+        detect_os(),
+        Path.home(),
+    )
+    cache_path = resolved_data / "cache"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    os.environ["TEAMTRAU_CACHE_DIR"] = str(cache_path)
+
     if token_file is not None:
         token_path = Path(token_file)
         if not token_path.is_file():
@@ -858,16 +891,21 @@ def serve_cmd(port: int, token_file: Path | None) -> None:
         if not token:
             raise click.BadParameter(f"Token file is empty: {token_path}")
     else:
-        cfg = PipelineConfig()
-        token_path = cfg.cache_dir / "engine_token"
+        token_path = resolved_data / "engine_token"
         token_path.parent.mkdir(parents=True, exist_ok=True)
-        token = secrets.token_urlsafe(24)
-        token_path.write_text(token, encoding="utf-8")
+        token = secrets.token_urlsafe(32)
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("utf-8"))
+        finally:
+            os.close(fd)
+        if os.name != "nt":
+            os.chmod(token_path, 0o600)
 
     click.echo(f"Engine token file: {token_path}")
     click.echo(f"Starting TeamTrau Engine API on http://127.0.0.1:{port}...")
 
-    ai_settings = AiSettingsStore(PipelineConfig().cache_dir / "ai_settings.json")
+    ai_settings = AiSettingsStore(resolved_data / "ai_settings.json")
     sessions = SessionStore()
     app = create_app(token=token, sessions=sessions, ai_settings=ai_settings)
     server_cfg = build_server_config(app, port=port)

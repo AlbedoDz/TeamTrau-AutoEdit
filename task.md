@@ -335,7 +335,7 @@
   - [x] P4.3: Playback meter & benchmark
   - [x] P4.4: RTX GPU preference in Electron & diagnosis
   - [x] P4.5: Fix player pooled-element resume & verification
-- [/] Phase 27: TeamTrau Studio v3 — Phase 3 Panels in Studio (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase3.md`)
+- [x] Phase 27: TeamTrau Studio v3 — Phase 3 Panels in Studio (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase3.md`)
   - [x] P3.0a: Curation sessions over the engine API (SessionStore, /v1/presets, /v1/sessions/{id}, curate progress & cancel)
   - [x] P3.0b: Panel job runners: classify, analyze_soundtrack, preflight, assemble (from session + include/exclude)
   - [x] P3.0c: FreeCut writer carries curated take data (no placeholder sidecar values)
@@ -349,6 +349,8 @@
   - [x] P3.6: Agent console: prompt input, streamed thoughts, collapsible tool cards, heuristic badge, cancel, history
   - [x] P3.7a: Shot details, advanced options, AI settings (Engine repo)
   - [x] P3.7b: Studio: bulk curation, badges and inspector, Advanced options, AI settings, Run All (Studio repo)
+- [/] Phase 28: TeamTrau Studio v3 — Phase 5 Cross-Platform Release (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase5.md`)
+  - [x] P5.0: Engine portability core (`src/core/platform_paths.py`, OS data dir, `--data-dir`/`--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, Qt-free imports, declared deps)
 
 
 

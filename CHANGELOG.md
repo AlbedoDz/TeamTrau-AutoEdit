@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- feat(engine): portability core (OS data dir, tools dir, private token, Resolve paths, Qt-free imports)
 - feat(engine-api): shot details, advanced pipeline options and AI settings
 - fix(teamtrau): engine-written projects open with their media (reuse existing workspace media IDs and links)
 

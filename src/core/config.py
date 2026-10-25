@@ -10,6 +10,7 @@ from typing import Final
 from pydantic import BaseModel, Field
 
 from src.core.ffmpeg_utils import run_tool
+from src.core.platform_caps import detect_os, resolve_paths
 from src.core.timebase import frame_rate_fraction  # noqa: F401  (re-exported)
 from src.core.types import RenderPreset, WatermarkPosition, WorkflowMode
 
@@ -169,36 +170,38 @@ DEFAULT_PRESET_NAME: Final[str] = "1080p30"
 
 
 def find_default_resolve_script_path() -> Path:
-    """Discover DaVinci Resolve Scripting module path on Windows."""
-    candidates = [
-        Path(
-            os.environ.get(
-                "RESOLVE_SCRIPT_API",
-                r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting",
-            )
+    """Discover DaVinci Resolve Scripting module path for the current OS."""
+    os_name = detect_os()
+    paths = resolve_paths(os_name)
+    default_modules = paths.api_dir / "Modules"
+    env_api = os.environ.get("RESOLVE_SCRIPT_API")
+    candidates: list[Path] = []
+    if env_api:
+        candidates.append(Path(env_api) / "Modules")
+    candidates.append(default_modules)
+    if os_name == "windows":
+        candidates.append(
+            Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Developer\Scripting\Modules")
         )
-        / "Modules",
-        Path(
-            r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules"
-        ),
-        Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Developer\Scripting\Modules"),
-    ]
     for p in candidates:
         if p.exists() and (p / "DaVinciResolveScript.py").exists():
             return p
-    return candidates[1]
+    return default_modules
 
 
 def find_default_resolve_exe() -> Path:
-    """Discover DaVinci Resolve executable on Windows."""
-    candidates = [
-        Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"),
-        Path(r"C:\Program Files\Blackmagic Design\DaVinci Resolve Studio\Resolve.exe"),
-    ]
+    """Discover DaVinci Resolve executable for the current OS."""
+    candidates = resolve_paths(detect_os()).exe_candidates
     for p in candidates:
         if p.exists():
             return p
     return candidates[0]
+
+
+def _default_cache_dir() -> Path:
+    """Return default cache directory, honoring TEAMTRAU_CACHE_DIR when set."""
+    env_cache = os.environ.get("TEAMTRAU_CACHE_DIR")
+    return Path(env_cache) if env_cache else Path(".cache/autoedit")
 
 
 def check_cuda_available() -> bool:
@@ -306,7 +309,7 @@ class PipelineConfig(BaseModel):
 
     # Parallel Ingestion & Cache Optimization (Kaizen)
     max_workers: int = Field(default=4)
-    cache_dir: Path = Field(default=Path(".cache/autoedit"))
+    cache_dir: Path = Field(default_factory=_default_cache_dir)
     enable_cache: bool = Field(default=True)
 
     # Dead-Air & Freeze Detection (mazsola2k/ai-video-editor logic)
