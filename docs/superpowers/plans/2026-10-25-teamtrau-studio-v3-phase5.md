@@ -46,7 +46,7 @@
 | Task | Repo | What | Detailed |
 |---|---|---|---|
 | **P5.0** | Engine | Portability core: OS data dir + `serve --data-dir/--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, fusionscript name, no Qt on import, declared deps, portable test fix | **yes (below)** |
-| P5.1 | Engine | CI matrix (GitHub Actions: ubuntu/windows/macos): CPU torch, ffmpeg per OS, `gui` marker deselected, ruff + pytest | next |
+| P5.1 | Engine | CI (`.github/workflows/engine-ci.yml`, contract `tests/test_engine_ci_p51.py`): Linux on every push, Windows + macOS on PRs to main and manual runs (owner choice: Actions minutes); CPU torch at the locked version; ffmpeg per OS; Qt offscreen (GUI tests run, no marker). Written by the architect; failures found by the first runs become P5.1b | done (architect) |
 | **P5.2** | Studio | Shell portability: fixed `app://teamtrau` origin (persistence bug confirmed), packaged-engine launch branch, engine-missing warning, macOS activate, GPU auto off Windows; CI: push on `teamtrau/main` plus an `electron-shell` OS matrix | **yes (below)** |
 | P5.3 | Engine | PyInstaller **onedir** "lite" sidecar per OS + bundled ffmpeg (licence-checked) + smoke test (start binary → `/v1/health` → a proxy job) | later |
 | P5.4 | Studio | electron-builder config (NSIS / dmg+zip / AppImage+deb), `extraResources` engine, exclude source maps, tag-triggered packaging workflow, unsigned artifacts | later |
