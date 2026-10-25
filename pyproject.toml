@@ -32,6 +32,9 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
 ]
+sidecar = [
+    "pyinstaller>=6.22.3",
+]
 
 # NVIDIA GPUs: take torch/torchvision CUDA 12.6 builds on Windows and Linux (PyPI ships
 # CPU-only Windows wheels). cu126 bundles cuBLAS 12 / cuDNN 9, which faster-whisper's

@@ -142,7 +142,8 @@ class ResolveDispatcher:
         launcher = shutil.which("py")
         if launcher:
             cands += [[launcher, f"-3.{minor}"] for minor in (13, 12, 11, 10)]
-        cands.append([sys.executable])
+        if not getattr(sys, "frozen", False):
+            cands.append([sys.executable])
         return cands
 
     def _dispatch_in_subprocess(self, payload: dict[str, Any]) -> dict[str, Any] | None:

@@ -351,6 +351,8 @@
   - [x] P3.7b: Studio: bulk curation, badges and inspector, Advanced options, AI settings, Run All (Studio repo)
 - [/] Phase 28: TeamTrau Studio v3 — Phase 5 Cross-Platform Release (`docs/superpowers/plans/2026-10-25-teamtrau-studio-v3-phase5.md`)
   - [x] P5.0: Engine portability core (`src/core/platform_paths.py`, OS data dir, `--data-dir`/`--tools-dir`, `TEAMTRAU_CACHE_DIR`, `0600` token, Resolve paths via `platform_caps`, Qt-free imports, declared deps)
+  - [x] P5.1: GitHub Actions Engine CI (`.github/workflows/engine-ci.yml`, `tests/test_engine_ci_p51.py`)
+  - [x] P5.3: PyInstaller lite engine sidecar (`release/sidecar.py`, `release/teamtrau-engine.spec`, `release/smoke_sidecar.py`, pinned ffmpeg with SHA-256, numba cache in data dir, `tests/test_sidecar_p53.py`)
 
 
 

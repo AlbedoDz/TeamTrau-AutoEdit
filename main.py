@@ -883,6 +883,11 @@ def serve_cmd(
     cache_path.mkdir(parents=True, exist_ok=True)
     os.environ["TEAMTRAU_CACHE_DIR"] = str(cache_path)
 
+    default_numba_cache = resolved_data / "numba-cache"
+    default_numba_cache.mkdir(parents=True, exist_ok=True)
+    numba_cache_dir = Path(os.environ.setdefault("NUMBA_CACHE_DIR", str(default_numba_cache)))
+    numba_cache_dir.mkdir(parents=True, exist_ok=True)
+
     if token_file is not None:
         token_path = Path(token_file)
         if not token_path.is_file():
