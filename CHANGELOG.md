@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- feat(engine-api): curation sessions are saved to `{workspace}/.teamtrau/sessions/{id}.json` when curated, edited or assembled, and read back by a restarted engine (`?workspace=` on GET/PATCH `/v1/sessions/{id}`, assemble jobs); take edits also update the media `cache/ai/teamtrau.json` sidecars; generated projects are named `<footage folder> – Rough cut|Sequence (<cadence>) – <date time>` instead of `Curated Rough Cut` / `Assembled Sequence`
 - fix(engine): CFR normalisation uses -fps_mode (ffmpeg 9 removed -vsync); cadence grid keeps a first bar a few ULPs below zero (macOS arm64); burn-in tests skip when ffmpeg lacks libass
 - feat(engine): renderer hardware encoder ladder (VideoToolbox, QSV, AMF) from platform_caps
 - build(engine): Windows sidecar bundles the shared ffmpeg build (tools 314 MB -> 192 MB); FfmpegAsset.libraries copies matching DLLs

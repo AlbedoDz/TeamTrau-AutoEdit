@@ -136,6 +136,136 @@ def probe_file_stats(file_path: Path, default_fps: float = 30.0) -> dict[str, An
     }
 
 
+def _index_workspace_media(media_dir_root: Path) -> tuple[dict[Path, str], dict[Path, dict[str, Any]]]:
+    """Map each linked source path in the workspace to its media id and metadata."""
+    path_to_media_id: dict[Path, str] = {}
+    path_to_meta: dict[Path, dict[str, Any]] = {}
+    if not media_dir_root.is_dir():
+        return path_to_media_id, path_to_meta
+    for existing_dir in sorted(media_dir_root.iterdir()):
+        if not existing_dir.is_dir() or not existing_dir.name.startswith("m-"):
+            continue
+        link_file = existing_dir / "source.link.json"
+        if not link_file.exists():
+            continue
+        try:
+            link_info = json.loads(link_file.read_text(encoding="utf-8"))
+            link_path_str = link_info.get("path")
+            if not link_path_str:
+                continue
+            src_p = Path(link_path_str).resolve()
+            if src_p in path_to_media_id:
+                continue
+            path_to_media_id[src_p] = existing_dir.name
+            meta_file = existing_dir / "metadata.json"
+            if meta_file.exists():
+                try:
+                    path_to_meta[src_p] = json.loads(meta_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return path_to_media_id, path_to_meta
+
+
+def _takes_by_source(shots: Mapping[str, ScoredScene]) -> dict[Path, list[dict[str, Any]]]:
+    """Group curated takes by their source file, in natural shot-id order."""
+    shots_by_source: dict[Path, list[dict[str, Any]]] = {}
+    for shot_id, sc in shots.items():
+        orig_or_clip = getattr(sc.scene, "original_path", None) or sc.scene.clip_path
+        src_path = Path(orig_or_clip).resolve()
+
+        meta = sc.metadata or {}
+        golden_raw = meta.get("golden")
+        if isinstance(golden_raw, dict):
+            defects = list(golden_raw.get("defects") or [])
+            golden = {k: v for k, v in golden_raw.items() if k != "defects"}
+        else:
+            golden = None
+            defects = []
+
+        role_conf = meta.get("role_confidence")
+        if role_conf is not None:
+            role_conf = float(role_conf)
+
+        shots_by_source.setdefault(src_path, []).append({
+            "shot_id": str(shot_id),
+            "start": float(sc.scene.start_time),
+            "end": float(sc.scene.end_time),
+            "composite": float(sc.composite_score),
+            "sharpness": float(sc.sharpness_score),
+            "aesthetic": float(sc.aesthetic_score),
+            "content_role": meta.get("content_role"),
+            "role_confidence": role_conf,
+            "included": bool(meta.get("included", True)),
+            "golden": golden,
+            "defects": defects,
+        })
+
+    for takes_list in shots_by_source.values():
+        takes_list.sort(
+            key=lambda t: [
+                (0, int(c)) if c.isdigit() else (1, c.lower())
+                for c in re.split(r"(\d+)", t["shot_id"])
+            ]
+        )
+    return shots_by_source
+
+
+def _take_sidecar(
+    media_id: str,
+    source: Path,
+    takes: list[dict[str, Any]],
+    now_ms: int,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """The ``cache/ai/teamtrau.json`` document for one media: its takes and best-take summary."""
+    score: float | None = None
+    is_golden = False
+    if takes:
+        best_take = max(takes, key=lambda t: t["composite"])
+        role = best_take["content_role"]
+        score = best_take["composite"]
+        is_golden = any(t["golden"] is not None for t in takes)
+    return {
+        "schemaVersion": 1,
+        "kind": "teamtrau",
+        "mediaId": media_id,
+        "service": "teamtrau-curate",
+        "model": "teamtrau-v3",
+        "params": {},
+        "createdAt": now_ms,
+        "updatedAt": now_ms,
+        "data": {
+            "sourcePath": str(source),
+            "role": role,
+            "score": score,
+            "is_golden": is_golden,
+            "takes": takes,
+        },
+    }
+
+
+def update_take_sidecars(workspace: Path, shots: Mapping[str, ScoredScene]) -> int:
+    """Rewrite the take sidecars of media already in the workspace after takes were edited.
+
+    Returns the number of sidecars written; sources without a media entry are skipped.
+    """
+    media_dir_root = Path(workspace).resolve() / "media"
+    path_to_media_id, _ = _index_workspace_media(media_dir_root)
+    now_ms = int(time.time() * 1000)
+    written = 0
+    for source, takes in _takes_by_source(shots).items():
+        media_id = path_to_media_id.get(source)
+        if media_id is None:
+            continue
+        ai_dir = media_dir_root / media_id / "cache" / "ai"
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(ai_dir / "teamtrau.json", _take_sidecar(media_id, source, takes, now_ms))
+        written += 1
+    return written
+
+
 def write_freecut_project(
     timeline: EditTimeline,
     workspace: Path,
@@ -199,77 +329,12 @@ def write_freecut_project(
     media_dir_root = workspace / "media"
     media_dir_root.mkdir(parents=True, exist_ok=True)
 
-    path_to_media_id: dict[Path, str] = {}
-    path_to_meta: dict[Path, dict[str, Any]] = {}
     media_links: list[dict[str, Any]] = []
 
-    # Pre-populate from existing workspace media so multiple projects share stable media IDs
-    if media_dir_root.is_dir():
-        for existing_dir in sorted(media_dir_root.iterdir()):
-            if not existing_dir.is_dir() or not existing_dir.name.startswith("m-"):
-                continue
-            link_file = existing_dir / "source.link.json"
-            if link_file.exists():
-                try:
-                    link_info = json.loads(link_file.read_text(encoding="utf-8"))
-                    link_path_str = link_info.get("path")
-                    if link_path_str:
-                        src_p = Path(link_path_str).resolve()
-                        if src_p not in path_to_media_id:
-                            path_to_media_id[src_p] = existing_dir.name
-                            meta_file = existing_dir / "metadata.json"
-                            if meta_file.exists():
-                                try:
-                                    path_to_meta[src_p] = json.loads(
-                                        meta_file.read_text(encoding="utf-8")
-                                    )
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+    # Existing workspace media, so multiple projects share stable media IDs
+    path_to_media_id, path_to_meta = _index_workspace_media(media_dir_root)
 
-    shots_by_source: dict[Path, list[dict[str, Any]]] = {}
-    if shots:
-        for shot_id, sc in shots.items():
-            orig_or_clip = getattr(sc.scene, "original_path", None) or sc.scene.clip_path
-            src_path = Path(orig_or_clip).resolve()
-
-            meta = sc.metadata or {}
-            golden_raw = meta.get("golden")
-            if isinstance(golden_raw, dict):
-                defects = list(golden_raw.get("defects") or [])
-                golden = {k: v for k, v in golden_raw.items() if k != "defects"}
-            else:
-                golden = None
-                defects = []
-
-            included = bool(meta.get("included", True))
-            role_conf = meta.get("role_confidence")
-            if role_conf is not None:
-                role_conf = float(role_conf)
-
-            take = {
-                "shot_id": str(shot_id),
-                "start": float(sc.scene.start_time),
-                "end": float(sc.scene.end_time),
-                "composite": float(sc.composite_score),
-                "sharpness": float(sc.sharpness_score),
-                "aesthetic": float(sc.aesthetic_score),
-                "content_role": meta.get("content_role"),
-                "role_confidence": role_conf,
-                "included": included,
-                "golden": golden,
-                "defects": defects,
-            }
-            shots_by_source.setdefault(src_path, []).append(take)
-
-        for takes_list in shots_by_source.values():
-            takes_list.sort(
-                key=lambda t: [
-                    (0, int(c)) if c.isdigit() else (1, c.lower())
-                    for c in re.split(r"(\d+)", t["shot_id"])
-                ]
-            )
+    shots_by_source = _takes_by_source(shots) if shots else {}
 
     def register_media(file_path: Path, is_soundtrack: bool = False) -> str:
         resolved_path = Path(file_path).resolve()
@@ -290,34 +355,9 @@ def write_freecut_project(
                 item_media_dir = media_dir_root / existing_mid
                 ai_dir = item_media_dir / "cache" / "ai"
                 ai_dir.mkdir(parents=True, exist_ok=True)
-                takes = shots_by_source.get(resolved_path, [])
-                if takes:
-                    best_take = max(takes, key=lambda t: t["composite"])
-                    role = best_take["content_role"]
-                    score = best_take["composite"]
-                    is_golden = any(t["golden"] is not None for t in takes)
-                else:
-                    role = None
-                    score = None
-                    is_golden = False
-                    takes = []
-                sidecar_json = {
-                    "schemaVersion": 1,
-                    "kind": "teamtrau",
-                    "mediaId": existing_mid,
-                    "service": "teamtrau-curate",
-                    "model": "teamtrau-v3",
-                    "params": {},
-                    "createdAt": now_ms,
-                    "updatedAt": now_ms,
-                    "data": {
-                        "sourcePath": str(resolved_path),
-                        "role": role,
-                        "score": score,
-                        "is_golden": is_golden,
-                        "takes": takes,
-                    },
-                }
+                sidecar_json = _take_sidecar(
+                    existing_mid, resolved_path, shots_by_source.get(resolved_path, []), now_ms
+                )
                 _write_json_atomic(ai_dir / "teamtrau.json", sidecar_json)
 
             return existing_mid
@@ -409,44 +449,13 @@ def write_freecut_project(
             metadata_json["contentHash"] = proxy_key
         _write_json_atomic(item_media_dir / "metadata.json", metadata_json)
 
-        if is_soundtrack:
-            role: str | None = "music"
-            score: float | None = None
-            is_golden = False
-            takes: list[dict[str, Any]] = []
-        else:
-            takes = shots_by_source.get(resolved_path, [])
-            if takes:
-                best_take = max(takes, key=lambda t: t["composite"])
-                role = best_take["content_role"]
-                score = best_take["composite"]
-                is_golden = any(t["golden"] is not None for t in takes)
-            else:
-                role = None
-                score = None
-                is_golden = False
-                takes = []
-
         # TeamTrau AI analysis sidecar: cache/ai/teamtrau.json
         ai_dir = item_media_dir / "cache" / "ai"
         ai_dir.mkdir(parents=True, exist_ok=True)
-        sidecar_json = {
-            "schemaVersion": 1,
-            "kind": "teamtrau",
-            "mediaId": media_id,
-            "service": "teamtrau-curate",
-            "model": "teamtrau-v3",
-            "params": {},
-            "createdAt": now_ms,
-            "updatedAt": now_ms,
-            "data": {
-                "sourcePath": str(resolved_path),
-                "role": role,
-                "score": score,
-                "is_golden": is_golden,
-                "takes": takes,
-            },
-        }
+        takes = [] if is_soundtrack else shots_by_source.get(resolved_path, [])
+        sidecar_json = _take_sidecar(
+            media_id, resolved_path, takes, now_ms, role="music" if is_soundtrack else None
+        )
         _write_json_atomic(ai_dir / "teamtrau.json", sidecar_json)
 
         media_links.append({
