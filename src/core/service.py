@@ -37,6 +37,7 @@ from src.core.types import (
 )
 from src.dispatchers.nvenc_renderer import NvencRenderer
 from src.dispatchers.resolve_dispatcher import ResolveDispatcher
+from src.integrations.freecut_writer import sanitize_workspace_filename
 from src.modules.audio_analyzer import AudioAnalysisResult, AudioAnalyzer
 from src.modules.duration_packer import DurationPacker
 from src.modules.edit_timeline import (
@@ -848,7 +849,8 @@ class StudioBackendAdapter:
         except Exception as pf_err:
             logger.warning("NLE preflight report failed: %s", pf_err)
 
-        name = base_name or f"{edit_tl.name}"
+        # Output files are named after the timeline/project; names may hold ":" or "/" (2026-10-25 23:58).
+        name = sanitize_workspace_filename(base_name or edit_tl.name)
         nle_formats = {f for f in formats if f != "mp4"}
         if resolve or dry_run_resolve:
             nle_formats.add("fcpxml")
@@ -1083,6 +1085,24 @@ class StudioBackendAdapter:
                         logger.warning("VFR check/normalization warning for %s: %s", rf.name, vfr_err)
                     normalized_raw.append(rf)
                 raw_files = normalized_raw
+
+        # Analysis decodes 1920-wide copies made on the GPU (NVDEC/NVENC) instead of 4K originals;
+        # timelines and renders keep the originals. Cached, so a re-run costs nothing.
+        if config.analysis_proxy and raw_files:
+            from src.modules.analysis_proxy import prepare_analysis_proxies
+
+            def _proxy_prog(i: int, n: int, name: str) -> None:
+                _notify_progress(2.0 + 8.0 * (i - 1) / max(1, n), 1, f"Preparing GPU analysis copies ({i}/{n}): {name}")
+
+            made = prepare_analysis_proxies(
+                raw_files, Path(config.cache_dir), config.analysis_proxy_width, _proxy_prog
+            )
+            if made:
+                logger.info(
+                    "Analysis proxies ready for %d file(s) (%s)",
+                    len(made),
+                    ", ".join(sorted({m.encoder for m in made})),
+                )
 
         def _ingest_prog(pct: float, msg: str) -> None:
             _notify_progress(pct, 1, msg)

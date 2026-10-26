@@ -17,8 +17,13 @@ worker_sources = [
     (str(ROOT / "src" / "core" / "ffmpeg_utils.py"), "src/core"),
     (str(ROOT / "src" / "core" / "__init__.py"), "src/core"),
 ]
+# YuNet face detector model and its MIT license, read by src.modules.media_classifier.
+model_assets = [
+    (str(ROOT / "src" / "modules" / "assets" / "face_detection_yunet_2023mar.onnx"), "src/modules/assets"),
+    (str(ROOT / "src" / "modules" / "assets" / "face_detection_yunet_LICENSE.txt"), "src/modules/assets"),
+]
 
-datas = collect_data_files("librosa", excludes=["**/__pycache__"]) + worker_sources
+datas = collect_data_files("librosa", excludes=["**/__pycache__"]) + worker_sources + model_assets
 hiddenimports = collect_submodules("src", filter=lambda n: not n.startswith("src.ui"))
 
 a = Analysis(

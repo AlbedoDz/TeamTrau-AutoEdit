@@ -22,6 +22,7 @@ from scenedetect import AdaptiveDetector, SceneManager, open_video
 from src.core.config import PipelineConfig
 from src.core.ffmpeg_utils import ffprobe_json, run_tool, stream_rotation
 from src.core.types import ActiveSegment, SceneCut, VideoMetadata
+from src.modules.analysis_proxy import analysis_path
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class IngestDetector:
         metadata = metadata or self.probe_video(video_path)
         min_scene_len_frames = max(1, int(self.config.min_scene_len_sec * metadata.fps))
 
-        video = open_video(str(video_path))
+        video = open_video(str(analysis_path(video_path)))
         scene_manager = SceneManager()
         scene_manager.add_detector(
             AdaptiveDetector(
@@ -344,7 +345,12 @@ class IngestDetector:
 
             has_audio = has_audio_stream(video_path)
 
-        cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_path)]
+        # Video from the analysis proxy (freezedetect scales to 320 px anyway), audio from the
+        # original (proxies carry no sound).
+        video_src = analysis_path(video_path)
+        cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_src)]
+        if has_audio and video_src != video_path:
+            cmd += ["-i", str(video_path), "-map", "0:v:0", "-map", "1:a:0"]
         if has_audio:
             cmd += ["-af", self._silence_filter()]
         else:
@@ -378,7 +384,7 @@ class IngestDetector:
         if not ffmpeg_bin:
             return []
         cmd = [
-            ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(video_path),
+            ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(analysis_path(video_path)),
             "-an", "-vf", self._freeze_filter(), "-f", "null", "-",
         ]  # fmt: skip
         try:
@@ -496,7 +502,7 @@ class IngestDetector:
         from the previous keyframe every time and were ~5x slower on long-GOP footage.
         """
         metadata = metadata or self.probe_video(video_path)
-        cap = cv2.VideoCapture(str(video_path))
+        cap = cv2.VideoCapture(str(analysis_path(video_path)))
         if not cap.isOpened():
             return [
                 ActiveSegment(

@@ -8,6 +8,7 @@ import hmac
 import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
+from pathlib import Path
 from typing import Any, get_args
 
 import uvicorn
@@ -131,9 +132,14 @@ def create_app(
         }
         return JSONResponse(data)
 
+    def _workspace_query(request: Request) -> Path | None:
+        """Optional ``?workspace=`` that lets a restarted engine read a saved session back."""
+        raw = request.query_params.get("workspace")
+        return Path(raw) if raw else None
+
     async def get_session_endpoint(request: Request) -> Response:
         session_id = request.path_params.get("id", "")
-        session = _sessions.get(session_id)
+        session = _sessions.get(session_id, workspace=_workspace_query(request))
         if session is None:
             return JSONResponse({"error": "session not found"}, status_code=404)
         detail = request.query_params.get("detail") in {"1", "true", "True"}
@@ -200,7 +206,7 @@ def create_app(
             return JSONResponse({"error": "'shots' must be a JSON object"}, status_code=400)
 
         try:
-            updated = _sessions.patch(session_id, shots_data)
+            updated = _sessions.patch(session_id, shots_data, workspace=_workspace_query(request))
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except ValueError as exc:

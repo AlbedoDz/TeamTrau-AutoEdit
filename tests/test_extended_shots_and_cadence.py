@@ -528,3 +528,20 @@ def test_teaser_length_follows_config_and_is_uneven(
     for t in clip_times(tl, fps)[: n + 1]:
         assert min(abs(t / beat - round(t / beat)) * beat, 1.0) <= 0.5 / float(rate) + 1e-6
     assert all(x >= beat - 1.0 / fps for x in lens)
+
+
+def test_section_pool_borrows_unused_footage_before_repeating(tmp_path: Path) -> None:
+    # The buildup prefers mid-motion scenes but has only 6 s of them for a 32 s section; the
+    # high-motion footage (120 s, more than the 90 s track) must fill it before anything repeats.
+    pool = [
+        scene(tmp_path / "mid_a.mp4", 0.0, 3.0, motion=0.6),
+        scene(tmp_path / "mid_b.mp4", 0.0, 3.0, motion=0.55),
+    ] + [scene(tmp_path / f"high_{i}.mp4", 0.0, 20.0, motion=0.95) for i in range(6)]
+    tl = build(cfg(), pool)
+    used: dict[Path, list[tuple[float, float]]] = {}
+    for c in tl.clips:
+        span = (c.source_in, c.source_in + c.frames / tl.fps * c.speed)
+        for a, b in used.get(c.source_path, []):
+            assert span[1] <= a + 1e-3 or span[0] >= b - 1e-3, (c.label, span, (a, b))
+        used.setdefault(c.source_path, []).append(span)
+    assert {p.name for p in used} >= {"mid_a.mp4", "mid_b.mp4"}  # the section's own pool still goes first

@@ -19,6 +19,7 @@ import numpy as np
 from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig
 from src.core.types import SceneVLMAnalysis, ScoredScene
+from src.modules.analysis_proxy import analysis_path
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,7 @@ class VLMAssistant:
         if not p.exists():
             return None
         try:
-            cap = cv2.VideoCapture(str(p))
+            cap = cv2.VideoCapture(str(analysis_path(p)))
             try:
                 cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp_sec * 1000.0))
                 ret, frame = cap.read()

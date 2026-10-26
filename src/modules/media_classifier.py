@@ -7,6 +7,7 @@ and Ambient B-roll (mixed or low-SNR sound) for automated curation and selects s
 import logging
 import math
 import shutil
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -21,43 +22,39 @@ from src.core.ontology import ContentRole, role_folder_of
 
 logger = logging.getLogger(__name__)
 
-_FACE_CASCADE: Any = None
-_CASCADE_LOADED: bool = False
+# YuNet face detector (OpenCV FaceDetectorYN). OpenCV 5 removed the Haar CascadeClassifier.
+# Model: opencv_zoo face_detection_yunet_2023mar.onnx (MIT, see assets/face_detection_yunet_LICENSE.txt).
+YUNET_MODEL = Path(__file__).parent / "assets" / "face_detection_yunet_2023mar.onnx"
+_FACE_INPUT_WIDTH = 640  # frames are scaled down first; the area ratio does not depend on scale
+_FACE_SCORE_THRESHOLD = 0.7
+_FACE_DETECTOR: Any = None
+_DETECTOR_LOADED: bool = False
+# One detector instance (setInputSize changes it per frame); classify_batch runs threads.
+_DETECTOR_LOCK = threading.Lock()
 
 
-def _get_face_cascade() -> Any:
-    global _FACE_CASCADE, _CASCADE_LOADED
-    if not _CASCADE_LOADED:
-        _CASCADE_LOADED = True
-        cascade_cls = getattr(cv2, "CascadeClassifier", None)
-        if cascade_cls is None:
-            logger.warning(
-                "Face detector unavailable: cv2 has no CascadeClassifier in this OpenCV build"
-            )
-            _FACE_CASCADE = None
+def _get_face_detector() -> Any:
+    global _FACE_DETECTOR, _DETECTOR_LOADED
+    if not _DETECTOR_LOADED:
+        _DETECTOR_LOADED = True
+        factory = getattr(getattr(cv2, "FaceDetectorYN", None), "create", None)
+        if factory is None:
+            logger.warning("Face detector unavailable: cv2 has no FaceDetectorYN in this OpenCV build")
             return None
-        data_dir = getattr(cv2.data, "haarcascades", "")
-        xml_path = data_dir + "haarcascade_frontalface_default.xml"
-        if not Path(xml_path).is_file():
-            logger.warning("Face detector unavailable: cascade file missing (%s)", xml_path)
-            _FACE_CASCADE = None
+        if not YUNET_MODEL.is_file():
+            logger.warning("Face detector unavailable: model file missing (%s)", YUNET_MODEL)
             return None
         try:
-            clf = cascade_cls(xml_path)
-            if clf.empty():
-                logger.warning("Face detector unavailable: empty cascade loaded from %s", xml_path)
-                _FACE_CASCADE = None
-            else:
-                _FACE_CASCADE = clf
+            _FACE_DETECTOR = factory(str(YUNET_MODEL), "", (320, 320), _FACE_SCORE_THRESHOLD, 0.3, 5000)
         except Exception as exc:
-            logger.warning("Face detector unavailable: failed to load cascade: %s", exc)
-            _FACE_CASCADE = None
-    return _FACE_CASCADE
+            logger.warning("Face detector unavailable: failed to load %s: %s", YUNET_MODEL, exc)
+            _FACE_DETECTOR = None
+    return _FACE_DETECTOR
 
 
 def face_detector_available() -> bool:
-    """Return True if Haar cascade face detector is loaded and available."""
-    return _get_face_cascade() is not None
+    """Return True if the YuNet face detector is loaded and available."""
+    return _get_face_detector() is not None
 
 
 @dataclass(frozen=True)
@@ -172,8 +169,8 @@ def face_area_ratio(frames: list[np.ndarray]) -> float:
     if not frames:
         return 0.0
 
-    cascade = _get_face_cascade()
-    if cascade is None:
+    detector = _get_face_detector()
+    if detector is None:
         return 0.0
 
     max_ratio = 0.0
@@ -183,14 +180,21 @@ def face_area_ratio(frames: list[np.ndarray]) -> float:
         h, w = frame.shape[:2]
         if h <= 0 or w <= 0:
             continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if w > _FACE_INPUT_WIDTH:
+            h = max(1, round(h * _FACE_INPUT_WIDTH / w))
+            w = _FACE_INPUT_WIDTH
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         try:
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+            with _DETECTOR_LOCK:
+                detector.setInputSize((w, h))
+                _, faces = detector.detect(frame)
         except Exception:
-            faces = ()
+            faces = None
         frame_area = float(w * h)
-        for _fx, _fy, fw, fh in faces:
-            ratio = float(fw * fh) / frame_area
+        for face in faces if faces is not None else ():
+            ratio = float(face[2] * face[3]) / frame_area
             if ratio > max_ratio:
                 max_ratio = ratio
 

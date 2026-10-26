@@ -69,6 +69,8 @@ output/
 *.pt
 *.pth
 *.onnx
+# Small models the engine ships (YuNet face detector)
+!src/modules/assets/*.onnx
 *.pkl
 
 # IDE / OS
