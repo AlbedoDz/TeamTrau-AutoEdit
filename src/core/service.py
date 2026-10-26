@@ -1086,6 +1086,24 @@ class StudioBackendAdapter:
                     normalized_raw.append(rf)
                 raw_files = normalized_raw
 
+        # Analysis decodes 1920-wide copies made on the GPU (NVDEC/NVENC) instead of 4K originals;
+        # timelines and renders keep the originals. Cached, so a re-run costs nothing.
+        if config.analysis_proxy and raw_files:
+            from src.modules.analysis_proxy import prepare_analysis_proxies
+
+            def _proxy_prog(i: int, n: int, name: str) -> None:
+                _notify_progress(2.0 + 8.0 * (i - 1) / max(1, n), 1, f"Preparing GPU analysis copies ({i}/{n}): {name}")
+
+            made = prepare_analysis_proxies(
+                raw_files, Path(config.cache_dir), config.analysis_proxy_width, _proxy_prog
+            )
+            if made:
+                logger.info(
+                    "Analysis proxies ready for %d file(s) (%s)",
+                    len(made),
+                    ", ".join(sorted({m.encoder for m in made})),
+                )
+
         def _ingest_prog(pct: float, msg: str) -> None:
             _notify_progress(pct, 1, msg)
 

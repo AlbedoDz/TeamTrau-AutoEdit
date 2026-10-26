@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- perf(engine): curation analyses footage wider than 1920 px through GPU-made analysis proxies (NVDEC decode, `scale_cuda`, NVENC; libx264 fallback), 1920 wide with the same frames and timestamps, cached per file. Every analysis pass already shrinks frames to at most 1920 px, so results match (same takes, windows and roles on 8 DJI 4K HEVC 10-bit clips; sharpness within 1 %) while a cold curation took 277 s instead of 946 s. Timelines, renders and exports keep the originals; crop maths uses the original size (`analysis_proxy`, `analysis_proxy_width` in the config)
 - fix(engine): face detection uses OpenCV's YuNet `FaceDetectorYN` with the bundled `face_detection_yunet_2023mar.onnx` (opencv_zoo, MIT); OpenCV 5 removed the Haar `CascadeClassifier`, so every clip reported `face_detector_unavailable` and A-roll detection relied on speech alone. The sidecar bundles the model and its smoke test fails without it
 - fix(engine): Deliver names output files through `sanitize_workspace_filename` (a project name with `:` or `/` made the master render and the FCPXML fail with WinError 87); generated project names use `23h58` instead of `23:58`
 - fix(engine): cadence allocation borrows unused footage from other scenes once a section's motion pool is used up, instead of alternating two shots and repeating them (a 24 s buildup with two mid-motion takes)
