@@ -223,31 +223,44 @@ class _ScenePicker:
     def _free(self, cand: ScoredScene) -> float:
         return self.planner.room(cand) / max(0.1, float(cand.speed or 1.0))
 
+    def _take_fit(self, key: str, slot_sec: float) -> tuple[ScoredScene, float] | None:
+        """Next scene of pool ``key`` (round-robin) with unused footage for the whole slot."""
+        pool = self.pools[key]
+        n = len(pool)
+        start = self.cursors[key]
+        fits: list[tuple[int, ScoredScene, float]] = []
+        for k in range(n):
+            cand = pool[(start + k) % n]
+            free = self._free(cand)
+            if free + _EPS >= slot_sec:
+                fits.append((k, cand, free))
+                if len(fits) == 2:
+                    break
+        if not fits:
+            return None
+        k, cand, free = fits[0]
+        if cand is self.last and len(fits) > 1:
+            k, cand, free = fits[1]
+        self.cursors[key] = start + k + 1
+        self.last = cand
+        return cand, free
+
     def pick(self, key: str, slot_sec: float, min_slot_sec: float) -> tuple[ScoredScene, float]:
         """Return (scene, free timeline seconds).
 
-        Resets the used footage once nothing can fill even the smallest slot (a repeat is then
-        unavoidable); the scene with the most free footage is used when nothing fits the slot.
+        The section's pool goes first; once its footage is used up, any other scene with unused
+        footage fills the slot (a long section with few matching scenes otherwise alternates two
+        shots). Used footage is reset only when no scene can fill even the smallest slot (a repeat
+        is then unavoidable); the scene with the most free footage is used when nothing fits.
         """
-        pool = self.pools[key]
-        n = len(pool)
         for attempt in range(2):
-            start = self.cursors[key]
-            fits: list[tuple[int, ScoredScene, float]] = []
-            for k in range(n):
-                cand = pool[(start + k) % n]
-                free = self._free(cand)
-                if free + _EPS >= slot_sec:
-                    fits.append((k, cand, free))
-                    if len(fits) == 2:
-                        break
-            if fits:
-                k, cand, free = fits[0]
-                if cand is self.last and len(fits) > 1:
-                    k, cand, free = fits[1]
-                self.cursors[key] = start + k + 1
-                self.last = cand
-                return cand, free
+            for k in (key, "default") if key != "default" else (key,):
+                hit = self._take_fit(k, slot_sec)
+                if hit is not None:
+                    return hit
+            pool = self.pools[key]
+            if self._free(max(pool, key=self._free)) + _EPS < min_slot_sec:
+                pool = self.pools["default"]
             best = max(pool, key=self._free)
             best_free = self._free(best)
             if attempt == 0 and best_free + _EPS < min_slot_sec:

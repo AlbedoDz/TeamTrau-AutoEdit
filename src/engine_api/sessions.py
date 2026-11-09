@@ -6,10 +6,13 @@ import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from src.core.curation import CurationSession
 from src.core.types import ScoredScene
+from src.engine_api.session_files import load_session, save_session
+from src.integrations.freecut_writer import update_take_sidecars
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +123,7 @@ def session_to_dict(session: CurationSession, detail: bool = False) -> dict[str,
 
 
 class SessionStore:
-    """Thread-safe LRU store for in-memory CurationSessions."""
+    """Thread-safe LRU store of CurationSessions; sessions with a workspace are also kept on disk."""
 
     def __init__(self, max_sessions: int = 8) -> None:
         if max_sessions < 1:
@@ -138,17 +141,36 @@ class SessionStore:
             self._sessions[sid] = session
             while len(self._sessions) > self.max_sessions:
                 self._sessions.popitem(last=False)
+            _save(session)
             return sid
 
-    def get(self, session_id: str) -> CurationSession | None:
-        """Retrieve session by id, refreshing its LRU recency, or None if not found."""
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session is not None:
-                self._sessions.move_to_end(session_id)
-            return session
+    def get(self, session_id: str, workspace: Path | None = None) -> CurationSession | None:
+        """Retrieve session by id, refreshing its LRU recency, or None if not found.
 
-    def patch(self, session_id: str, updates: Mapping[str, Mapping[str, Any]]) -> CurationSession:
+        A session missing from memory (the engine restarted, or LRU eviction) is read back from
+        ``workspace`` when one is given.
+        """
+        with self._lock:
+            return self._get_locked(session_id, workspace)
+
+    def _get_locked(self, session_id: str, workspace: Path | None) -> CurationSession | None:
+        session = self._sessions.get(session_id)
+        if session is None and workspace is not None:
+            session = load_session(workspace, session_id)
+            if session is not None:
+                self._sessions[session_id] = session
+                while len(self._sessions) > self.max_sessions:
+                    self._sessions.popitem(last=False)
+        if session is not None:
+            self._sessions.move_to_end(session_id)
+        return session
+
+    def patch(
+        self,
+        session_id: str,
+        updates: Mapping[str, Mapping[str, Any]],
+        workspace: Path | None = None,
+    ) -> CurationSession:
         """Patch shot fields in session. Validates all updates before mutating.
 
         Raises:
@@ -156,7 +178,7 @@ class SessionStore:
             ValueError: if any update is not a mapping, has invalid fields, or invalid values.
         """
         with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._get_locked(session_id, workspace)
             if session is None:
                 raise KeyError(f"Session '{session_id}' not found")
 
@@ -189,4 +211,17 @@ class SessionStore:
                     sc.metadata[field] = val
 
             self._sessions.move_to_end(session_id)
+            _save(session)
+            if session.workspace is not None:
+                try:
+                    update_take_sidecars(session.workspace, session.shots)
+                except OSError as exc:
+                    logger.warning("Cannot update take sidecars for session %s: %s", session_id, exc)
             return session
+
+
+def _save(session: CurationSession) -> None:
+    try:
+        save_session(session)
+    except OSError as exc:
+        logger.error("Cannot save curation session %s: %s", session.session_id, exc)

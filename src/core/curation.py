@@ -24,7 +24,7 @@ NLE_TARGETS: frozenset[str] = frozenset({"fcpxml", "premiere", "otio", "capcut"}
 
 @dataclass
 class CurationSession:
-    """In-memory session holding rough-cut results, shot mappings, and optional sequence."""
+    """Session holding rough-cut results, shot mappings, and optional sequence."""
 
     session_id: str
     input_dir: Path
@@ -33,6 +33,9 @@ class CurationSession:
     shots: dict[str, ScoredScene]  # "A01" / "B03" -> scene
     sequence: PipelineExecutionResult | None = None
     output_dir: Path | None = None
+    # Where the session is saved (``{workspace}/.teamtrau/sessions``) and the project it curated.
+    workspace: Path | None = None
+    project_id: str | None = None
 
 
 def _scene_duration(sc: ScoredScene) -> float:

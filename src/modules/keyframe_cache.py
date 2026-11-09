@@ -19,6 +19,7 @@ import numpy as np
 
 from src.core.config import PipelineConfig
 from src.core.types import SceneCut, ScoredScene
+from src.modules.analysis_proxy import analysis_path, source_size
 
 logger = logging.getLogger(__name__)
 
@@ -148,13 +149,15 @@ def _read_clip(
     lock: threading.Lock,
 ) -> tuple[dict[float, np.ndarray], tuple[int, int] | None]:
     """Sweep one clip once: sorted frame indices, sequential grab() over short gaps."""
-    cap = cv2.VideoCapture(str(path))
+    cap = cv2.VideoCapture(str(analysis_path(path)))
     if not cap.isOpened():
         return {}, None
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or default_fps
         src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Frames may come from the smaller analysis proxy; crop maths needs the original size.
+        orig = source_size(path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         # Apply the memory budget: keep the highest-priority (then earliest) timestamps.
@@ -201,7 +204,7 @@ def _read_clip(
             small = _downscale(frame, max_width)
             for ts in wanted[idx]:
                 out[ts] = small
-        return out, (src_w, src_h)
+        return out, orig or (src_w, src_h)
     finally:
         cap.release()
 

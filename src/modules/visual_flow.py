@@ -13,6 +13,7 @@ import numpy as np
 
 from src.core.config import PipelineConfig
 from src.core.types import ScoredScene
+from src.modules.analysis_proxy import analysis_path
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ def extract_frame_at_timestamp(
     if not video_path.is_file() or video_path.stat().st_size == 0:
         return None
 
-    cap = cv2.VideoCapture(str(video_path))
+    cap = cv2.VideoCapture(str(analysis_path(video_path)))
     if not cap.isOpened():
         return None
 

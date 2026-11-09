@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +32,12 @@ from src.modules.proxy_generator import ProxySpec, make_proxy
 from src.modules.render_cache import render_missing, write_manifest
 
 logger = logging.getLogger(__name__)
+
+
+def default_project_name(input_dir: Path, label: str, when: datetime | None = None) -> str:
+    """Name a generated project after its footage folder, what it is and when it was made."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d %Hh%M")  # no ":", names become file names
+    return f"{Path(input_dir).name or input_dir} – {label} – {stamp}"
 
 
 def run_proxies(
@@ -139,7 +146,7 @@ def make_curate_runner(
         workspace = Path(params["workspace"])
         genre = params.get("genre")
         top_n = int(params.get("top_n", 12))
-        project_name = str(params.get("project_name", "Curated Rough Cut"))
+        project_name = str(params.get("project_name") or default_project_name(input_dir, "Rough cut"))
         out_dir = Path(params.get("output_dir", workspace / ".curation_tmp"))
         config_overrides = params.get("config_overrides")
 
@@ -176,6 +183,8 @@ def make_curate_runner(
             shots=session.shots,
         )
 
+        session.workspace = workspace
+        session.project_id = project_id
         sessions.put(session)
         shots = session_to_dict(session)["shots"]
 
@@ -313,15 +322,16 @@ def make_assemble_runner(
         cancel_event: threading.Event,
     ) -> dict[str, Any]:
         session_id = str(params["session_id"])
-        session = sessions.get(session_id)
+        workspace = Path(params["workspace"])
+        session = sessions.get(session_id, workspace=workspace)
         if session is None:
             raise KeyError(f"Curation session not found: {session_id}")
 
-        workspace = Path(params["workspace"])
         soundtrack = Path(params["soundtrack"]) if params.get("soundtrack") else None
         cadence = params.get("cadence")
         selected_ids = params.get("selected_ids")
-        project_name = str(params.get("project_name", "Assembled Sequence"))
+        label = f"Sequence ({cadence})" if cadence else "Sequence"
+        project_name = str(params.get("project_name") or default_project_name(session.input_dir, label))
         config_overrides = params.get("config_overrides")
 
         def _on_progress(stage_pct: float, total_pct: float, msg: str) -> None:
@@ -358,6 +368,9 @@ def make_assemble_runner(
             project_name=project_name,
             shots=session.shots,
         )
+        if session.workspace is None:
+            session.workspace = workspace
+        sessions.put(session)  # keep the assembled sequence with the saved session
 
         return {
             "project_id": project_id,

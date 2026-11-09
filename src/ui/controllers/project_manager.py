@@ -20,15 +20,14 @@ from src.core.project_io import (
     deliver_settings_from_dict,
     edit_timeline_from_dict,
     edit_timeline_to_dict,
+    scored_scene_from_dict,
+    scored_scene_to_dict,
 )
 from src.core.types import (
     BeatMarker,
-    CropWindow,
     DeliverSettings,
     EditTimeline,
     PipelineExecutionResult,
-    SceneCut,
-    SceneVLMAnalysis,
     ScoredScene,
     SongSection,
     SongSectionType,
@@ -285,97 +284,14 @@ class ProjectManager:
     @staticmethod
     def serialize_scored_scene(scene: ScoredScene, is_included: bool = True) -> dict[str, Any]:
         """Convert ScoredScene and inclusion state to a serializable dictionary."""
-        crop_dict = None
-        if scene.crop_window:
-            crop_dict = {
-                "x": scene.crop_window.x,
-                "y": scene.crop_window.y,
-                "width": scene.crop_window.width,
-                "height": scene.crop_window.height,
-                "confidence": scene.crop_window.confidence,
-                "tracking_subject": scene.crop_window.tracking_subject,
-            }
-        vlm_dict = None
-        if scene.vlm_analysis:
-            vlm_dict = {
-                "scene_index": scene.vlm_analysis.scene_index,
-                "description": scene.vlm_analysis.description,
-                "tags": list(scene.vlm_analysis.tags),
-                "mood": scene.vlm_analysis.mood,
-                "suggested_pacing": scene.vlm_analysis.suggested_pacing,
-                "is_key_moment": scene.vlm_analysis.is_key_moment,
-                "confidence": scene.vlm_analysis.confidence,
-            }
-        return {
-            "clip_path": str(scene.scene.clip_path),
-            "start_time": scene.scene.start_time,
-            "end_time": scene.scene.end_time,
-            "start_frame": scene.scene.start_frame,
-            "end_frame": scene.scene.end_frame,
-            "duration": scene.scene.duration,
-            "original_path": str(scene.scene.original_path) if scene.scene.original_path else None,
-            "sharpness_score": scene.sharpness_score,
-            "aesthetic_score": scene.aesthetic_score,
-            "composite_score": scene.composite_score,
-            "motion_energy": scene.motion_energy,
-            "speed": scene.speed,
-            "camera_role": scene.camera_role,
-            "crop_window": crop_dict,
-            "vlm_analysis": vlm_dict,
-            "metadata": dict(scene.metadata),
-            "included": is_included,
-        }
+        return {**scored_scene_to_dict(scene), "included": is_included}
 
     @staticmethod
     def deserialize_scored_scene(d: dict[str, Any]) -> tuple[ScoredScene, bool]:
         """Reconstruct ScoredScene instance and inclusion state from dictionary."""
-        cut = SceneCut(
-            clip_path=Path(d["clip_path"]),
-            start_time=float(d["start_time"]),
-            end_time=float(d["end_time"]),
-            start_frame=int(d["start_frame"]),
-            end_frame=int(d["end_frame"]),
-            duration=float(d["duration"]),
-            original_path=Path(d["original_path"]) if d.get("original_path") else None,
-        )
-        crop_win = None
-        if d.get("crop_window"):
-            cw = d["crop_window"]
-            crop_win = CropWindow(
-                x=int(cw["x"]),
-                y=int(cw["y"]),
-                width=int(cw["width"]),
-                height=int(cw["height"]),
-                confidence=float(cw.get("confidence", 1.0)),
-                tracking_subject=cw.get("tracking_subject", "person"),
-            )
-        vlm = None
-        if d.get("vlm_analysis"):
-            va = d["vlm_analysis"]
-            vlm = SceneVLMAnalysis(
-                scene_index=int(va.get("scene_index", 0)),
-                description=str(va.get("description", "")),
-                tags=list(va.get("tags", [])),
-                mood=str(va.get("mood", "")),
-                suggested_pacing=str(va.get("suggested_pacing", "moderate")),
-                is_key_moment=bool(va.get("is_key_moment", False)),
-                confidence=float(va.get("confidence", 1.0)),
-            )
-        meta = dict(d.get("metadata", {}))
+        scene = scored_scene_from_dict(d)
         is_inc = bool(d.get("included", True))
-        meta["included"] = is_inc
-        scene = ScoredScene(
-            scene=cut,
-            sharpness_score=float(d.get("sharpness_score", 0.0)),
-            aesthetic_score=float(d.get("aesthetic_score", 0.0)),
-            composite_score=float(d.get("composite_score", 0.0)),
-            motion_energy=float(d.get("motion_energy", 0.5)),
-            speed=float(d.get("speed", 1.0)),
-            crop_window=crop_win,
-            vlm_analysis=vlm,
-            camera_role=str(d.get("camera_role", "cam_a")),
-            metadata=meta,
-        )
+        scene.metadata["included"] = is_inc
         return scene, is_inc
 
     @staticmethod

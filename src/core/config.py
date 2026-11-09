@@ -284,6 +284,9 @@ class PipelineConfig(BaseModel):
     auto_editor_motion_threshold: float = Field(default=0.05)
     auto_editor_margin: str = Field(default="0.2s")
     auto_normalize_vfr: bool = Field(default=True)
+    # Analyse footage wider than this through a GPU-made copy of that width (0/False: originals).
+    analysis_proxy: bool = Field(default=True)
+    analysis_proxy_width: int = Field(default=1920)
 
     # Audio & Rhythm Constants
     min_beat_interval: float = Field(default=0.4)

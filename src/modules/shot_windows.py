@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from src.core.analysis_cache import AnalysisCache
+from src.modules.analysis_proxy import analysis_path
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def _compute(
 ) -> QualityCurve | None:
     cap = None
     try:
-        cap = cv2.VideoCapture(str(p))
+        cap = cv2.VideoCapture(str(analysis_path(p)))
         if not cap.isOpened():
             return None
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)

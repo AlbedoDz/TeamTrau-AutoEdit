@@ -10,6 +10,9 @@ from src.core.types import (
     EditClip,
     EditTimeline,
     MusicalBarGrid,
+    SceneCut,
+    SceneVLMAnalysis,
+    ScoredScene,
     SongSection,
     SongSectionType,
 )
@@ -38,6 +41,76 @@ def _crop_from_dict(d: dict[str, Any] | None) -> CropWindow | None:
         height=int(d["height"]),
         confidence=float(d.get("confidence", 1.0)),
         tracking_subject=str(d.get("tracking_subject", "person")),
+    )
+
+
+def scored_scene_to_dict(scene: ScoredScene) -> dict[str, Any]:
+    """Serialize a ScoredScene (its cut, scores, crop, VLM tags and metadata) to plain JSON data."""
+    vlm = scene.vlm_analysis
+    return {
+        "clip_path": str(scene.scene.clip_path),
+        "start_time": scene.scene.start_time,
+        "end_time": scene.scene.end_time,
+        "start_frame": scene.scene.start_frame,
+        "end_frame": scene.scene.end_frame,
+        "duration": scene.scene.duration,
+        "original_path": str(scene.scene.original_path) if scene.scene.original_path else None,
+        "sharpness_score": scene.sharpness_score,
+        "aesthetic_score": scene.aesthetic_score,
+        "composite_score": scene.composite_score,
+        "motion_energy": scene.motion_energy,
+        "speed": scene.speed,
+        "camera_role": scene.camera_role,
+        "crop_window": _crop_to_dict(scene.crop_window),
+        "vlm_analysis": None
+        if vlm is None
+        else {
+            "scene_index": vlm.scene_index,
+            "description": vlm.description,
+            "tags": list(vlm.tags),
+            "mood": vlm.mood,
+            "suggested_pacing": vlm.suggested_pacing,
+            "is_key_moment": vlm.is_key_moment,
+            "confidence": vlm.confidence,
+        },
+        "metadata": dict(scene.metadata),
+    }
+
+
+def scored_scene_from_dict(d: dict[str, Any]) -> ScoredScene:
+    """Inverse of :func:`scored_scene_to_dict`."""
+    cut = SceneCut(
+        clip_path=Path(d["clip_path"]),
+        start_time=float(d["start_time"]),
+        end_time=float(d["end_time"]),
+        start_frame=int(d["start_frame"]),
+        end_frame=int(d["end_frame"]),
+        duration=float(d["duration"]),
+        original_path=Path(d["original_path"]) if d.get("original_path") else None,
+    )
+    vlm = None
+    if d.get("vlm_analysis"):
+        va = d["vlm_analysis"]
+        vlm = SceneVLMAnalysis(
+            scene_index=int(va.get("scene_index", 0)),
+            description=str(va.get("description", "")),
+            tags=list(va.get("tags", [])),
+            mood=str(va.get("mood", "")),
+            suggested_pacing=str(va.get("suggested_pacing", "moderate")),
+            is_key_moment=bool(va.get("is_key_moment", False)),
+            confidence=float(va.get("confidence", 1.0)),
+        )
+    return ScoredScene(
+        scene=cut,
+        sharpness_score=float(d.get("sharpness_score", 0.0)),
+        aesthetic_score=float(d.get("aesthetic_score", 0.0)),
+        composite_score=float(d.get("composite_score", 0.0)),
+        motion_energy=float(d.get("motion_energy", 0.5)),
+        speed=float(d.get("speed", 1.0)),
+        crop_window=_crop_from_dict(d.get("crop_window")),
+        vlm_analysis=vlm,
+        camera_role=str(d.get("camera_role", "cam_a")),
+        metadata=dict(d.get("metadata", {})),
     )
 
 

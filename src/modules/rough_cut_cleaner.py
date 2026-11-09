@@ -26,6 +26,7 @@ from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig
 from src.core.ontology import natural_sort_key
 from src.core.types import CleanedSegment, DefectSpan, DefectType, SceneCut
+from src.modules.analysis_proxy import analysis_path
 from src.modules.audio_normalizer import AudioNormalizer
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ class RoughCutCleaner:
     ) -> dict[str, Any] | None:
         """Decode the scene frame by frame and detect defects (the heavy, cacheable pass)."""
         # Open video capture
-        cap = cv2.VideoCapture(str(clip_path))
+        cap = cv2.VideoCapture(str(analysis_path(clip_path)))
         if not cap.isOpened():
             logger.warning("Failed to open video capture for: %s", clip_path)
             return None

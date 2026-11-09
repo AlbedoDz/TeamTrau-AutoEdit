@@ -13,6 +13,7 @@ import numpy as np
 from src.core.analysis_cache import AnalysisCache, scene_key
 from src.core.config import PipelineConfig, check_cuda_available
 from src.core.types import SceneCut, ScoredScene
+from src.modules.analysis_proxy import analysis_path
 from src.modules.keyframe_cache import KeyframeStore, scorer_timestamps
 
 logger = logging.getLogger(__name__)
@@ -430,7 +431,7 @@ class VisualScorer:
         self, video_path: Path, start_sec: float, end_sec: float, count: int
     ) -> list[np.ndarray]:
         """Extract evenly spaced keyframe images across the scene interval."""
-        cap = cv2.VideoCapture(str(video_path))
+        cap = cv2.VideoCapture(str(analysis_path(video_path)))
         if not cap.isOpened():
             return []
 

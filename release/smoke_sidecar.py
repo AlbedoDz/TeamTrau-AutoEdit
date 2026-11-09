@@ -231,6 +231,20 @@ def run_smoke(exe_path: Path, data_dir: Path | None = None) -> int:
             flush=True,
         )
 
+        classify_res, t_classify = _run_job(
+            base_url,
+            token,
+            "classify",
+            {"input_dir": str(mp4_path.parent)},
+            timeout_sec=120.0,
+        )
+        reasons = [r for f in classify_res.get("files") or [] for r in f.get("reasons") or []]
+        if not classify_res.get("files"):
+            raise RuntimeError(f"classify returned no files: {classify_res}")
+        if "face_detector_unavailable" in reasons:
+            raise RuntimeError("Face detector missing from the sidecar (YuNet model not bundled?)")
+        print(f"[smoke] classify completed in {t_classify:.2f}s (face detector loaded)", flush=True)
+
         numba_cache = resolved_data / "numba-cache"
         cache_files = list(numba_cache.rglob("*")) if numba_cache.is_dir() else []
         nbi_files = [p for p in cache_files if p.is_file()]
